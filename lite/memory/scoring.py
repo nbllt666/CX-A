@@ -126,7 +126,7 @@ def score_memories(
         time_score = decay.score(
             importance=importance,
             age_seconds=_age_seconds(cand, decay),
-            decay_type=cand.get("decay_type", "exponential"),
+            decay_type=cand.get("decay_type", "ebbinghaus_opt"),
             params=cand.get("decay_params"),
             reactivation_count=cand.get("reactivation_count", 0),
             emotion_score=cand.get("emotion_score", 0.0),

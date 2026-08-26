@@ -16,12 +16,17 @@
 不使用相对路径。
 """
 
+import logging
 import os
+import threading
 import time
 import uuid
 
 from .cloud_relay import CloudRelay
 from .discovery import LiteLanDiscovery
+
+#: 原生日志记录器
+LOGGER = logging.getLogger(__name__)
 
 #: 消息结构字段集合（对齐 CX-O §3.3，供跨版本互通断言）
 MSG_STRUCT = {"action", "request_id", "data"}
@@ -82,6 +87,9 @@ class LiteACP:
         self._handlers = {}
         #: 分组表：{group_id: {"members": [...], "created": ts}}
         self._groups = {}
+        #: 后台心跳清扫线程（daemon，可选启动）
+        self._heartbeat_thread = None
+        self._stop_evt = threading.Event()
 
     # ------------------------------------------------------------------ #
     # 内部：配置读取 / 启用闸门                                           #
@@ -174,6 +182,61 @@ class LiteACP:
         if _now() - record["last_seen"] > 2 * self.heartbeat_interval:
             return "offline"
         return "online"
+
+    # ------------------------------------------------------------------ #
+    # 心跳清扫：后台线程把超时 Agent 自动置 offline（对齐 CX-O 心跳循环）   #
+    # ------------------------------------------------------------------ #
+
+    def start_heartbeat(self):
+        """启动后台心跳清扫线程（幂等，daemon）。
+
+        每 ``heartbeat_interval`` 秒执行一次 :meth:`_heartbeat_tick`，把心跳超时
+        （>2×interval）未刷新的 Agent 状态刷新为 ``offline`` 并派发 ``offline`` 事件，
+        使「跨节点自动离线」真正落地。ACP 未启用时不启动。
+
+        :return: True 已启动 / 已在运行；False ACP 关闭拒绝启动
+        """
+        if not self._enabled:
+            return False
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return True
+        self._stop_evt.clear()
+        thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name="cxa-acp-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread = thread
+        thread.start()
+        LOGGER.info("ACP 心跳清扫线程已启动（interval=%ss）", self.heartbeat_interval)
+        return True
+
+    def stop_heartbeat(self):
+        """停止后台心跳线程（幂等，join 超时保护），不阻塞主流程。"""
+        self._stop_evt.set()
+        thread = self._heartbeat_thread
+        self._heartbeat_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(1.0, self.heartbeat_interval + 1.0))
+
+    def _heartbeat_loop(self):
+        """后台循环：等待 interval 秒后被唤醒执行一次清扫。"""
+        while not self._stop_evt.wait(self.heartbeat_interval):
+            try:
+                self._heartbeat_tick()
+            except Exception as exc:  # noqa: BLE001 - 清扫失败不 kill 线程
+                LOGGER.warning("ACP 心跳清扫失败：%s", exc)
+
+    def _heartbeat_tick(self):
+        """心跳清扫一次：把心跳超时且仍为 online 的 Agent 置 offline 并派发事件。"""
+        self._require_enabled()
+        threshold = 2 * self.heartbeat_interval
+        now = _now()
+        for agent_id, record in list(self.agents.items()):
+            if now - record["last_seen"] > threshold and record["status"] != "offline":
+                record["status"] = "offline"
+                LOGGER.info("ACP Agent %s 心跳超时，已置为 offline", agent_id)
+                self.handle("offline", {"agent_id": agent_id})
 
     # ------------------------------------------------------------------ #
     # 保留核心：消息路由                                                   #

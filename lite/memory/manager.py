@@ -15,10 +15,10 @@ from .scoring import _get_weights, score_memories
 from .storage import MemoryStore
 from .vector_store import InMemoryVectorStore
 
-# 分层阈值（对齐 CX-O 重要性分档与再激活语义的自定义合理默认）
+# 分层阈值（对齐 CX-O permaneent_threshold=0.95 与再激活语义）
 LONG_TERM_PROMOTE_IMPORTANCE = 0.60  # importance 达到该分数升 long_term
 LONG_TERM_PROMOTE_REACTIVATION = 3  # 再激活达到该次数升 long_term
-PERMANENT_PROMOTE_IMPORTANCE = 0.85  # importance 达到该分数升 permanent
+PERMANENT_PROMOTE_IMPORTANCE = 0.95  # importance 达到该分数升 permanent（对齐 config.memory.permanent_threshold）
 PERMANENT_PROMOTE_REACTIVATION = 10  # 再激活达到该次数升 permanent
 
 # 分层顺序（用于升降级判定）
@@ -31,18 +31,25 @@ DEDUP_THRESHOLD = 0.85
 class MemoryManager:
     """记忆管理器门面：存储 + 衰减 + 三维打分 + 去重 + 分层升降级。"""
 
-    def __init__(self, store=None, vector_store=None, db_path=None):
+    def __init__(self, store=None, vector_store=None, db_path=None, permanent_threshold=None):
         """初始化内存管理器。
 
         Args:
             store: 可选 MemoryStore 实例（缺省新建并按 db_path 指向默认库）。
             vector_store: 可选向量存储（缺省使用纯 Python 的 InMemoryVectorStore）。
             db_path: 存储数据库路径（store 未注入时使用）。
+            permanent_threshold: 永久晋级 importance 阈值（默认 0.95，对齐
+                config.memory.permanent_threshold 与 CX-O 语义）。
         """
         self.store = store or MemoryStore(db_path=db_path)
         self.vector_store = vector_store or InMemoryVectorStore()
         self.decay = DecayCalculator()
         self.dedup_threshold = DEDUP_THRESHOLD
+        self._permanent_threshold = (
+            float(permanent_threshold)
+            if permanent_threshold is not None
+            else PERMANENT_PROMOTE_IMPORTANCE
+        )
         self.store.create_table()
 
     # -------------------------------------------------------- 工具
@@ -74,7 +81,7 @@ class MemoryManager:
         type="short_term",
         importance=3,
         importance_score=None,
-        decay_type="exponential",
+        decay_type="ebbinghaus_opt",
         decay_params=None,
         reactivation_count=0,
         emotion_score=0.0,
@@ -91,7 +98,7 @@ class MemoryManager:
             type: 记忆类型（short_term / long_term / permanent）。
             importance: 重要性等级（1~5）。
             importance_score: 重要性分数（0~1，缺省按 importance/5.0 折算）。
-            decay_type: 衰减类型（exponential / two_stage 等）。
+            decay_type: 衰减类型（ebbinghaus_opt / two_stage 等）。
             embed_fn: 可选的嵌入函数（content -> 向量）；提供则同步向量化写入向量库。
         Returns:
             int|None: 新记忆 id；因去重跳过返回 None。
@@ -158,7 +165,7 @@ class MemoryManager:
         reac = int(mem.get("reactivation_count", 0))
         current = mem.get("type", "short_term")
         target = current
-        if importance >= PERMANENT_PROMOTE_IMPORTANCE or reac >= PERMANENT_PROMOTE_REACTIVATION:
+        if importance >= self._permanent_threshold or reac >= PERMANENT_PROMOTE_REACTIVATION:
             target = "permanent"
         elif importance >= LONG_TERM_PROMOTE_IMPORTANCE or reac >= LONG_TERM_PROMOTE_REACTIVATION:
             target = "long_term"

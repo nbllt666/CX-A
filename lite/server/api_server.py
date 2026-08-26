@@ -12,6 +12,16 @@
     POST   /api/computer/authorize  开启/撤销授权（body {enabled: bool}）
     POST   /api/computer/call       执行工具调用（body {tool, arguments}；未授权 403）
 
+配置与管理 API（记录在 `.trae/documents/20260826_模块0_差异审查登记与处理计划.md`）：
+    GET    /api/status              轻量系统状态（app / version / uptime）
+    GET    /api/settings            用户可读配置视图（不含 API Key）
+    PUT    /api/settings            更新可热更配置（白名单键；body 为补丁）
+    POST   /api/chat/messages       聊天发送（未启用守卫：明确提示走前端 Mock）
+    GET    /api/chat/history        聊天历史（未启用守卫：返回空列表 + 提示）
+
+> 管理面已收敛为纯 API：前端不再路由 Agents/Remote/Status，管理能力以上述端点
+> + /api/agents、/api/remote/* 外露，供另一 Agent 或管理工具调用。
+
 端口默认 8600（与前端 frontend/src/renderer/api.ts 的 API_PORT 约定一致）。
 支持命令行参数：-h/--host、-p/--port；Ctrl+C 优雅退出。
 所有 JSON 响应以 UTF-8 编码且 ensure_ascii=False，中文不做转义。
@@ -25,8 +35,15 @@ import argparse
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
+
+# 聊天服务未启用守卫错误码（前端本期走 Mock 演示，端点存在但明确提示）
+CHAT_SERVICE_DISABLED = "chat_service_disabled"
+
+# 云端 provider 白名单（与 lite/cloud/adapter.py 支持的 provider 对齐）
+CLOUD_PROVIDER_ALLOWLIST = ("deepseek", "tongyi", "openai", "moonshot")
 
 # ------------------------------------------------------------------ 路径推导
 # lite/server/api_server.py -> lite/server -> lite -> 项目根目录（逐级上溯 3 次）
@@ -115,19 +132,28 @@ def build_computer_deps(data_dir=None):
     return computer, authorizer, bridge
 
 
-def make_handler(store, pipeline, manager=None, remote=None, computer=None, authorizer=None, bridge=None):
-    """基于指定依赖构建处理器类（闭包绑定 store / pipeline / manager / remote / computer，便于测试隔离）。"""
+def make_handler(store, pipeline, manager=None, remote=None, computer=None, authorizer=None, bridge=None, config=None):
+    """基于指定依赖构建处理器类（闭包绑定 store / pipeline / manager / remote / computer，便于测试隔离）。
+
+    Args:
+        config: 可选 ConfigManager 实例（提供 /api/settings 读写；缺省新建，
+            默认读写项目根 data/config.json）。
+    """
     if manager is None:
         manager = AgentManager()
     if remote is None:
         remote = RemoteController()
     if bridge is None:
         computer, authorizer, bridge = build_computer_deps(DEFAULT_DATA_DIR)
+    if config is None:
+        config = ConfigManager(config_path=os.path.join(DEFAULT_DATA_DIR, "config.json"))
 
     class ApiHandler(BaseHTTPRequestHandler):
         """REST 请求处理器。单线程 HTTPServer 内串行执行，无共享状态竞争。"""
 
         server_version = "CXLiteAPI/0.1"
+        #: 服务进程启动时刻（/api/status 的 uptime 基准）
+        _STARTED_AT = time.monotonic()
         _store = store
         _pipeline = pipeline
         _manager = manager
@@ -135,6 +161,7 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
         _computer = computer
         _authorizer = authorizer
         _bridge = bridge
+        _config = config
 
         # ------------------------------------------------------------ 底层工具
         def log_message(self, fmt, *args):
@@ -159,14 +186,124 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                     out[key] = vals[0] or None
             return out
 
+        # ------------------------------------------------------------ 状态 / 设置 / 聊天守卫接口
+        def _handle_status(self):
+            """GET /api/status：轻量系统状态（供管理 API 健康探测 / 状态页占位）。"""
+            self._send_json(
+                {
+                    "status": "ok",
+                    "app": "CX-A/CX-Lite",
+                    "version": "0.1.0",
+                    "uptime_seconds": round(time.monotonic() - self._STARTED_AT, 2),
+                    "companion": True,
+                }
+            )
+
+        def _settings_view(self):
+            """组装用户可读配置视图（**不含 API Key**，避免敏感信息外泄）。"""
+            return {
+                "cloud": {
+                    "provider": self._config.get("cloud", "provider", "deepseek"),
+                    "base_url": self._config.get("cloud", "base_url", ""),
+                },
+                "tts": {"voice": self._config.get("tts", "voice", "cx-open")},
+                "local_llm": {"enabled": bool(self._config.get("local_llm", "enabled", False))},
+                "acp": {"enabled": bool(self._config.get("acp", "enabled", False))},
+                "remote": {"enabled": bool(self._config.get("remote", "enabled", False))},
+            }
+
+        def _handle_settings_get(self):
+            """GET /api/settings：返回脱敏配置视图（供前端设置页首帧对齐默认值）。"""
+            self._send_json(self._settings_view())
+
+        def _handle_settings_update(self):
+            """PUT /api/settings：应用白名单补丁并热更新落盘。
+
+            支持键：``cloud.provider``（须在 provider 白名单内）、``tts.voice``、
+            ``local_llm.enabled``。其余键被忽略并列入 ``ignored`` 返回，供调用方校正。
+            """
+            body = self._read_body_json()
+            ignored = []
+            applied = []
+
+            provider = body.get("cloud", {}).get("provider")
+            if provider is not None:
+                if provider in CLOUD_PROVIDER_ALLOWLIST:
+                    self._config.set("cloud", "provider", provider)
+                    applied.append("cloud.provider")
+                else:
+                    ignored.append(f"cloud.provider={provider!r}（不在白名单 {CLOUD_PROVIDER_ALLOWLIST}）")
+
+            voice = body.get("tts", {}).get("voice")
+            if voice is not None:
+                if isinstance(voice, str) and voice.strip():
+                    self._config.set("tts", "voice", voice.strip())
+                    applied.append("tts.voice")
+                else:
+                    ignored.append("tts.voice（必须为非空字符串）")
+
+            local_enabled = body.get("local_llm", {}).get("enabled")
+            if local_enabled is not None:
+                if isinstance(local_enabled, bool):
+                    self._config.set("local_llm", "enabled", local_enabled)
+                    applied.append("local_llm.enabled")
+                else:
+                    ignored.append("local_llm.enabled（必须为布尔）")
+
+            if applied:
+                try:
+                    self._config.save()
+                except OSError as exc:  # noqa: BLE001 - 落盘失败不影响内存生效
+                    self._send_json(
+                        {"ok": False, "error": "config_save_failed", "message": str(exc),
+                         "applied": applied, "ignored": ignored, "config": self._settings_view()},
+                        status=500,
+                    )
+                    return
+
+            self._send_json({"ok": True, "applied": applied, "ignored": ignored, "config": self._settings_view()})
+
+        def _handle_chat_send_guard(self):
+            """POST /api/chat/messages：聊天服务未启用守卫（避免直连误 404）。"""
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": CHAT_SERVICE_DISABLED,
+                    "message": "聊天服务未启用（本期前端走 Mock 演示），请接入 lite/cloud 云端适配后启用",
+                }
+            )
+
+        def _handle_chat_history_guard(self):
+            """GET /api/chat/history：聊天历史守卫（同样返回未启用提示 + 空列表）。"""
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": CHAT_SERVICE_DISABLED,
+                    "message": "聊天服务未启用（本期前端走 Mock 演示）",
+                    "messages": [],
+                }
+            )
+
         # ------------------------------------------------------------ 路由
         def do_GET(self):
-            """处理 GET：/api/health、/api/memories、/api/memories/search、/api/agents、/api/remote/status。"""
+            """处理 GET：/api/health、/api/status、/api/settings、/api/chat/history、记忆/Agent/远端接口。"""
             path = urlparse(self.path).path
             query = self._parse_query()
 
             if path == "/api/health":
                 self._send_json({"status": "ok"})
+                return
+
+            if path == "/api/status":
+                self._handle_status()
+                return
+
+            if path == "/api/settings":
+                self._handle_settings_get()
+                return
+
+            if path == "/api/chat/history":
+                self._handle_chat_history_guard()
                 return
 
             if path == "/api/remote/status":
@@ -192,8 +329,11 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
 
         def do_POST(self):
-            """处理 POST：/api/agents、/api/remote/control、/api/remote/push_config。"""
+            """处理 POST：/api/chat/messages、Agent/远端/电脑控制接口。"""
             path = urlparse(self.path).path
+            if path == "/api/chat/messages":
+                self._handle_chat_send_guard()
+                return
             if path == "/api/agents":
                 self._handle_agents_create()
                 return
@@ -212,8 +352,11 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
 
         def do_PUT(self):
-            """处理 PUT：/api/agents/{id} 更新指定 Agent。"""
+            """处理 PUT：/api/settings 更新配置；/api/agents/{id} 更新指定 Agent。"""
             path = urlparse(self.path).path
+            if path == "/api/settings":
+                self._handle_settings_update()
+                return
             agent_id = self._extract_agents_id(path)
             if agent_id is None:
                 self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
@@ -507,10 +650,15 @@ def create_app(data_dir=None):
     Returns:
         tuple: (store, pipeline, handler) -> (MemoryStore, MemoryRetrievalPipeline, ApiHandler)。
     """
+    data_dir = _resolve_data_dir(data_dir)
     store, pipeline, manager, remote = build_deps(data_dir)
     computer, authorizer, bridge = build_computer_deps(data_dir)
+    #: 配置实例与 remote 同源（同一 data_dir 下 config.json），供 /api/settings 读写，
+    #: 保证测试隔离（不触碰项目根运行时配置）。
+    config = ConfigManager(config_path=os.path.join(data_dir, "config.json"))
     handler = make_handler(
-        store, pipeline, manager, remote, computer=computer, authorizer=authorizer, bridge=bridge
+        store, pipeline, manager, remote,
+        computer=computer, authorizer=authorizer, bridge=bridge, config=config,
     )
     return store, pipeline, handler
 

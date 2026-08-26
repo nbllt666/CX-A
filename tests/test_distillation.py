@@ -7,7 +7,13 @@
 import pytest
 
 from lite.memory import DistillationPaused, MemoryDistiller
-from lite.memory.distillation import _estimate_tokens
+from lite.memory.distillation import (
+    QUALITY_REJECT_THRESHOLD,
+    S_DONE,
+    S_REJECT,
+    DistillStateError,
+    _estimate_tokens,
+)
 from lite.memory.storage import MemoryStore
 
 
@@ -145,3 +151,73 @@ def test_empty_messages_no_cloud_calls(store):
     assert added == []
     assert cloud.call_recorder == []
     assert store.list(type="long_term") == []
+
+
+# ---------------------------------------------------------------- 状态机 + 质量门
+def test_session_state_machine_done_flow(store):
+    """质量合格：会话终态 done，quality_score 达标，真实落库。"""
+    cloud = FakeCloud(response=['[{"content": "用户偏好阅读科幻小说", "importance": 5}]'])
+    distiller = _mk_distiller(cloud, store)
+    sessions = distiller.distill_with_sessions(
+        [{"role": "user", "content": "我喜欢看三体"}]
+    )
+    assert len(sessions) == 1
+    s = sessions[0]
+    assert s["state"] == S_DONE  # pending→extracting→quality_check→committing→done
+    assert s["quality_score"] >= QUALITY_REJECT_THRESHOLD
+    assert len(s["added"]) == 1
+    assert s["added"][0]["content"] == "用户偏好阅读科幻小说"
+    # 真实落库
+    assert len(store.list(type="long_term")) == 1
+
+
+def test_quality_gate_rejects_noise(store):
+    """质量门拒绝乱码/无事实内容：终态 rejected 且不落库。"""
+    cloud = FakeCloud(response=["### @@@   ♦♠♣ xx"])
+    distiller = _mk_distiller(cloud, store)
+    sessions = distiller.distill_with_sessions(
+        [{"role": "user", "content": "hello"}]
+    )
+    assert len(sessions) == 1
+    s = sessions[0]
+    assert s["state"] == S_REJECT
+    assert s["quality_score"] < QUALITY_REJECT_THRESHOLD
+    assert s["added"] == []
+    assert "低于阈值" in s["reason"]
+    assert store.list(type="long_term") == []
+
+
+def test_quality_gate_rejects_empty_output(store):
+    """云端返回空文本：质量分 0.0 被拒绝，不落库。"""
+    cloud = FakeCloud(response=["   "])
+    distiller = _mk_distiller(cloud, store)
+    sessions = distiller.distill_with_sessions(
+        [{"role": "user", "content": "hi"}]
+    )
+    assert sessions[0]["state"] == S_REJECT
+    assert sessions[0]["quality_score"] == 0.0
+    assert store.list(type="long_term") == []
+
+
+def test_heuristic_quality_score_deterministic():
+    """质量评分是确定性启发式：空/无事实 0 分，正常事实高分。"""
+    distiller = MemoryDistiller(cloud=object(), store=object())
+    assert distiller._heuristic_quality_score([], "") == 0.0
+    assert distiller._heuristic_quality_score([], "nothing") == 0.0
+    facts = [{"content": "用户偏好阅读科幻小说"}, {"content": "用户喜欢雨天出行"}]
+    score = distiller._heuristic_quality_score(facts, "- 用户偏好阅读科幻小说")
+    assert 0.5 <= score <= 0.8
+    # 过短事实占比过半 -> 降权
+    shorty = [{"content": "a"}, {"content": "b"}, {"content": "c"}]
+    assert distiller._heuristic_quality_score(shorty, "- a\n- b\n- c") < 0.3
+
+
+def test_invalid_state_transition_raises(store):
+    """状态机强制合法转移：pending 直接到 done 抛 DistillStateError。"""
+    distiller = _mk_distiller(FakeCloud(response=["- ok"]), store)
+    session = distiller._new_session("default")
+    with pytest.raises(DistillStateError):
+        distiller._set_state(session, S_DONE)  # pending -> done 非法
+    # 合法路径可推进
+    distiller._set_state(session, "extracting")
+    assert session["state"] == "extracting"

@@ -38,7 +38,7 @@ def test_add_auto_fills_defaults(store):
     row = store.get(mid)
     assert row["importance"] == 3
     assert row["importance_score"] == 0.6
-    assert row["decay_type"] == "exponential"
+    assert row["decay_type"] == "ebbinghaus_opt"
     assert row["reactivation_count"] == 0
     assert row["emotion_score"] == 0.0
     assert row["permanent"] == 0

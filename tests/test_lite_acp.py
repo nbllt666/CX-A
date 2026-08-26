@@ -120,6 +120,55 @@ def test_heartbeat_unknown_agent_returns_zero():
     assert acp.heartbeat("ghost") == 0.0
 
 
+def test_heartbeat_tick_marks_offline_and_emits_event(clock):
+    """心跳清扫 tick 把超时 Agent 置 offline 并派发 offline 事件；心跳可恢复。"""
+    acp = LiteACP(config=_config())  # interval=10 -> 阈值 20
+    events = []
+    acp.on("offline", lambda msg: events.append(msg))
+    acp.register_agent("alice")  # last_seen=t=1000
+
+    clock.advance(19)  # t=1019，未超阈值
+    acp._heartbeat_tick()
+    assert acp.status("alice") == "online"
+    assert events == []
+
+    clock.advance(3)  # t=1022，超过 20
+    acp._heartbeat_tick()
+    assert events == [{"agent_id": "alice"}]  # offline 事件已派发
+    assert acp.agents["alice"]["status"] == "offline"
+    assert acp.status("alice") == "offline"
+
+    # 心跳刷新后恢复 online，且不重复派发 offline
+    acp.heartbeat("alice")
+    assert acp.status("alice") == "online"
+    clock.advance(2)  # 自心跳过去 2s < 20
+    acp._heartbeat_tick()
+    assert acp.status("alice") == "online"
+    assert len(events) == 1
+
+
+def test_heartbeat_thread_lifecycle():
+    """start_heartbeat 启动 daemon 线程；stop_heartbeat 幂等停止；ACP 关闭时不启动。"""
+    acp = LiteACP(config=_config())  # interval=10
+    try:
+        assert acp.start_heartbeat() is True
+        assert acp._heartbeat_thread is not None and acp._heartbeat_thread.is_alive()
+        # 幂等：重复 start 不新建线程
+        assert acp.start_heartbeat() is True
+        assert acp._heartbeat_thread.is_alive()
+    finally:
+        acp.stop_heartbeat()
+    assert acp._heartbeat_thread is None or not acp._heartbeat_thread.is_alive()
+    # 停止后可再启动
+    try:
+        assert acp.start_heartbeat() is True
+    finally:
+        acp.stop_heartbeat()
+    # ACP 关闭时拒绝启动
+    acp_off = LiteACP(config=_config(enabled=False))
+    assert acp_off.start_heartbeat() is False
+
+
 # ------------------------------------------------------------------ #
 # 2. 消息路由结构                                                     #
 # ------------------------------------------------------------------ #

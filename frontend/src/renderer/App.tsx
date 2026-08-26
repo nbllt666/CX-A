@@ -1,6 +1,5 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
-import type { ReactNode } from 'react';
-import { getAppInfo, onModeSwitch } from './bridge';
+import { getAppInfo } from './bridge';
 import type { AppInfo } from './bridge';
 import TopBar from './components/TopBar';
 import Sidebar from './components/Sidebar';
@@ -8,68 +7,23 @@ import ChatPage from './pages/ChatPage';
 import PetPage from './pages/PetPage';
 import MemoriesPage from './pages/MemoriesPage';
 import SettingsPage from './pages/SettingsPage';
-import AgentsPage from './pages/AgentsPage';
-import RemotePage from './pages/RemotePage';
-import StatusPage from './pages/StatusPage';
 
-/** 视图面：伴侣面（普通用户）/ 管理面（高级管理） */
-export type Mode = 'companion' | 'management';
-export type View =
-  | 'chat'
-  | 'pet'
-  | 'memories'
-  | 'settings'
-  | 'agents'
-  | 'remote'
-  | 'status';
+/**
+ * 伴侣面视图。
+ *
+ * 管理面（Agents / Remote / Status）已按决策收敛为纯后端 API：
+ * 前端不再路由管理页，管理能力经 /api/agents、/api/remote/*、/api/status 外露，
+ * 供另一 Agent 或管理工具调用（见 .trae/documents/20260826_模块0_差异审查登记与处理计划.md）。
+ */
+export type View = 'chat' | 'pet' | 'memories' | 'settings';
 
-export const MODE_LABEL: Record<Mode, string> = {
-  companion: '伴侣面',
-  management: '管理面',
-};
-
-/** 每个面允许的路由 */
-export const MODE_ROUTES: Record<Mode, View[]> = {
-  companion: ['chat', 'pet', 'memories', 'settings'],
-  management: ['agents', 'remote', 'status'],
-};
-
-/** 每个面进入时的默认路由 */
-const MODE_DEFAULT: Record<Mode, View> = {
-  companion: 'chat',
-  management: 'agents',
-};
-
-/** 持久化键：当前视图面（localStorage，刷新保持） */
-const MODE_STORAGE_KEY = 'cx-a.mode';
-
-/** 读取持久化的模式；无/非法时返回 null。 */
-function readStoredMode(): Mode | null {
-  try {
-    const v = window.localStorage.getItem(MODE_STORAGE_KEY);
-    return v === 'companion' || v === 'management' ? v : null;
-  } catch {
-    return null;
-  }
-}
-
-/** 写入持久化模式；存储不可用（隐私模式等）时静默忽略，路由仍以 hash 保持。 */
-function writeStoredMode(mode: Mode): void {
-  try {
-    window.localStorage.setItem(MODE_STORAGE_KEY, mode);
-  } catch {
-    /* no-op */
-  }
-}
+const VIEWS: View[] = ['chat', 'pet', 'memories', 'settings'];
 
 interface RouterValue {
-  mode: Mode;
   view: View;
   appInfo: AppInfo | null;
-  /** 仅在当前面内切换路由 */
+  /** 在伴侣面内切换视图（hash 路由，不重启窗口） */
   navigate: (view: View) => void;
-  /** 伴侣面 ⇄ 管理面（同进程切换视图，不重启窗口） */
-  switchMode: (mode: Mode) => void;
 }
 
 const RouterContext = createContext<RouterValue | null>(null);
@@ -80,16 +34,10 @@ export function useRouter(): RouterValue {
   return ctx;
 }
 
-/** 从 hash 解析出 (mode, view)，非法回退到伴侣面/聊天 */
-function parseHash(hash: string): { mode: Mode; view: View } {
+/** 从 hash 解析出伴侣面视图；非法回退到 /chat */
+function parseHash(hash: string): View {
   const clean = hash.replace(/^#\/?/, '').split('.')[0] as View;
-  if ((MODE_ROUTES.management as View[]).includes(clean)) {
-    return { mode: 'management', view: clean };
-  }
-  if ((MODE_ROUTES.companion as View[]).includes(clean)) {
-    return { mode: 'companion', view: clean };
-  }
-  return { mode: 'companion', view: 'chat' };
+  return VIEWS.includes(clean) ? clean : 'chat';
 }
 
 function viewToHash(view: View): string {
@@ -97,16 +45,7 @@ function viewToHash(view: View): string {
 }
 
 export default function App() {
-  const [{ mode, view }, setRoute] = useState(() => {
-    // hash 为空（首次加载/直达根路径）时，优先还原上次持久化的模式到其默认页
-    const clean = window.location.hash.replace(/^#\/?/, '').split('.')[0];
-    if (!clean) {
-      const stored = readStoredMode();
-      const m: Mode = stored ?? 'companion';
-      return { mode: m, view: MODE_DEFAULT[m] };
-    }
-    return parseHash(window.location.hash);
-  });
+  const [view, setView] = useState<View>(() => parseHash(window.location.hash));
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
 
   // 读取应用信息（electron 下走桥，浏览器下走 mock）
@@ -120,56 +59,33 @@ export default function App() {
     };
   }, []);
 
-  // 路由与 hash 双向同步；模式变化同步持久化
+  // 路由与 hash 双向同步
   useEffect(() => {
-    const onHash = () => {
-      const next = parseHash(window.location.hash);
-      writeStoredMode(next.mode);
-      setRoute(next);
-    };
+    const onHash = () => setView(parseHash(window.location.hash));
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
 
-  // 非法 hash 路由回落：非空但不在任何面的 hash 归一化写回 /chat
+  // 非法 hash 路由回落：非空但不在伴侣面路由的 hash 归一化写回 /chat
   useEffect(() => {
     const clean = window.location.hash.replace(/^#\/?/, '').split('.')[0];
     if (!clean) return;
-    const inCompanion = (MODE_ROUTES.companion as View[]).includes(clean as View);
-    const inManagement = (MODE_ROUTES.management as View[]).includes(clean as View);
-    if (!inCompanion && !inManagement) {
+    if (!VIEWS.includes(clean as View)) {
       window.location.hash = viewToHash('chat');
     }
   }, []);
 
-  // 支持主进程（托盘等）触发的视图面切换
-  useEffect(() => {
-    return onModeSwitch((nextMode) => {
-      const target = MODE_ROUTES[nextMode][0];
-      writeStoredMode(nextMode);
-      window.location.hash = viewToHash(target);
-      setRoute({ mode: nextMode, view: target });
-    });
-  }, []);
-
   const router = useMemo<RouterValue>(
     () => ({
-      mode,
       view,
       appInfo,
       navigate(nextView) {
-        if (!(MODE_ROUTES[mode] as View[]).includes(nextView)) return;
+        if (!VIEWS.includes(nextView)) return;
         window.location.hash = viewToHash(nextView);
-        setRoute((prev) => ({ ...prev, view: nextView }));
-      },
-      switchMode(nextMode) {
-        const target = MODE_DEFAULT[nextMode];
-        writeStoredMode(nextMode);
-        window.location.hash = viewToHash(target);
-        setRoute({ mode: nextMode, view: target });
+        setView(nextView);
       },
     }),
-    [mode, view, appInfo],
+    [view, appInfo],
   );
 
   return (
@@ -195,12 +111,6 @@ function ViewRenderer({ view }: { view: View }) {
       return <MemoriesPage />;
     case 'settings':
       return <SettingsPage />;
-    case 'agents':
-      return <AgentsPage />;
-    case 'remote':
-      return <RemotePage />;
-    case 'status':
-      return <StatusPage />;
     default:
       return <ChatPage />;
   }

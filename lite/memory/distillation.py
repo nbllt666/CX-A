@@ -13,6 +13,7 @@
 """
 
 import json
+import uuid
 from typing import Dict, List
 
 from lite.cloud.adapter import CloudAdapter
@@ -25,6 +26,55 @@ class DistillationPaused(Exception):
     触发场景：记忆蒸馏执行前检测到云端主 LLM 离线（``cloud.is_online() == False``）。
     调用方捕获本异常后应将蒸馏任务标记为"暂停"，静默跳过当前批次，不向用户报错。
     """
+
+
+class DistillStateError(RuntimeError):
+    """蒸馏会话非法状态转移。"""
+
+
+# --------------------------------------------------------------------------- #
+# 蒸馏会话状态机（对齐 CX-O distillation_service 的 9 态语义，精简为 7 态）：#
+#   pending -> extracting -> quality_check -> committing -> done             #
+#                              |-> rejected（质量门拒绝，不落库）            #
+#   extracting/committing --异常--> failed                                   #
+# 与 CX-O 的对应：pending≈S_PREREAD、extracting≈S_EXTRACT、                  #
+#   quality_check≈S_STORAGE_DECISION 前的质量评估、committing≈落库、         #
+#   rejected≈S_REJECT、failed/done≈S_FINALIZE 收束。                        #
+# --------------------------------------------------------------------------- #
+S_PENDING = "pending"  # 待处理（任务创建）
+S_EXTRACT = "extracting"  # 提取中（云端归纳）
+S_QUALITY = "quality_check"  # 质量评估门（对齐 CX-O quality_score 判定）
+S_REJECT = "rejected"  # 质量不合格，拒绝落库（对齐 CX-O S_REJECT）
+S_COMMIT = "committing"  # 质量通过，正在落库
+S_FAILED = "failed"  # 异常失败（对齐 CX-O 失败收束）
+S_DONE = "done"  # 成功收束
+
+#: 合法状态转移表（拒绝/失败为终止态，均不继续）
+_TRANSITIONS = {
+    S_PENDING: (S_EXTRACT,),
+    S_EXTRACT: (S_QUALITY, S_FAILED),
+    S_QUALITY: (S_COMMIT, S_REJECT),
+    S_COMMIT: (S_DONE, S_FAILED),
+    S_REJECT: (),
+    S_FAILED: (),
+    S_DONE: (),
+}
+
+#: 质量拒绝阈值（对齐 CX-O rubric.quality_reject_threshold 默认 0.3）
+QUALITY_REJECT_THRESHOLD = 0.3
+
+
+def _is_normal_char(ch: str) -> bool:
+    """判断字符是否属「正常内容字符」：常见 ASCII（含 JSON 结构） / 中文 / 常用中文标点。
+
+    用于质量门的乱码检测：控制字符、高位区块符号（如 ♠♦）、Emoji 等视为异常。
+    """
+    o = ord(ch)
+    if 0x20 <= o <= 0x7E:  # 常见 ASCII（含 JSON 结构字符 []{}":, 等）
+        return True
+    if 0x4E00 <= o <= 0x9FFF or 0x3000 <= o <= 0x303F:  # 中文（CJK）与 CJK 标点区
+        return True
+    return ch in "，。、！？；：""''（）《》【】…—·"
 
 
 #: 蒸馏提示词（中文）：请云端 LLM 从给定对话中提取值得长期记住的事实。
@@ -74,6 +124,8 @@ class MemoryDistiller:
         """
         self._cloud = cloud
         self._store = store
+        #: 最近一次批量蒸馏的完整会话（含 rejected/failed，供诊断）
+        self.last_sessions: List[Dict] = []
 
     # ------------------------------------------------------------------ #
     # 公开接口                                                           #
@@ -85,21 +137,46 @@ class MemoryDistiller:
         agent_id: str = "default",
         chunk_token_estimate: int = 1800,
     ) -> List[Dict]:
-        """蒸馏一段超长对话，返回新增记忆清单。
+        """蒸馏一段超长对话，返回新增记忆清单（兼容原接口）。
 
-        流程：
+        流程（每 chunk 走状态机：pending→extracting→quality_check→committing→done，
+        质量门拒绝则→rejected 不落库）：
+
             1. 空消息直接返回空列表（不触发云端调用）；
             2. 离线保护：``cloud.is_online() == False`` 时抛 ``DistillationPaused``；
             3. 按「消息条数 / 估算 token」将消息切分为多个 chunk；
             4. 每块拼接蒸馏提示词后流式调用 ``cloud.chat``，拼接返回文本；
-            5. 解析云端返回（JSON 数组或行式列表）得到事实与重要度；
-            6. 逐条调用 ``store.add`` 落盘为 long_term 记忆（agent_id 归属）。
+            5. 质量门（回归启发式，阈值 0.3）：不合格→rejected，不落库；
+            6. 合格逐条 ``store.add`` 落盘为 long_term 记忆（agent_id 归属）。
 
         :param messages: OpenAI 兼容消息列表（[{role, content}, ...]）
         :param agent_id: 记忆归属的 agent 标识，默认 "default"
         :param chunk_token_estimate: 每块估算 token 上限，默认 1800
         :return: 新增记忆清单（含 id / type / content / importance / agent_id）
         :raises DistillationPaused: 云端离线时抛出，调用方捕获后暂停不报错
+        """
+        sessions = self.distill_with_sessions(messages, agent_id, chunk_token_estimate)
+        added: List[Dict] = []
+        for session in sessions:
+            added.extend(session.get("added") or [])
+        return added
+
+    def distill_with_sessions(
+        self,
+        messages: List[Dict],
+        agent_id: str = "default",
+        chunk_token_estimate: int = 1800,
+    ) -> List[Dict]:
+        """蒸馏并返回完整会话记录（每个 chunk 一个会话，含状态机状态与质量门结论）。
+
+        与 ``distill_long_conversation`` 同一主流程；返回结构为：
+
+        ``[{session_id, agent_id, state, quality_score, reason, facts, added, error}]``
+
+        其中 ``state`` 为终止态之一：``done``（已落库）/ ``rejected``（质量门拒绝）/
+        ``failed``（异常）。供管理 API 与测试核对状态机行为。
+
+        :raises DistillationPaused: 云端离线时抛出
         """
         if not messages:
             return []
@@ -109,11 +186,89 @@ class MemoryDistiller:
                 "云端主 LLM 当前离线，记忆蒸馏已暂停，请联网后重试。"
             )
 
-        added: List[Dict] = []
+        sessions: List[Dict] = []
         for chunk in self._split_messages(messages, chunk_token_estimate):
+            sessions.append(self._distill_chunk(chunk, agent_id))
+        self.last_sessions = sessions
+        return sessions
+
+    # ------------------------------------------------------------------ #
+    # 每个 chunk 的状态机执行                                             #
+    # ------------------------------------------------------------------ #
+
+    def _new_session(self, agent_id: str) -> Dict:
+        """新建一个蒸馏会话（初始态 pending）。"""
+        return {
+            "session_id": uuid.uuid4().hex,
+            "agent_id": agent_id,
+            "state": S_PENDING,
+            "quality_score": None,
+            "reason": "",
+            "facts": [],
+            "added": [],
+            "error": None,
+        }
+
+    def _set_state(self, session: Dict, next_state: str) -> None:
+        """按状态机转移表推进会话状态；非法转移抛 :class:`DistillStateError`。"""
+        current = session["state"]
+        if next_state not in _TRANSITIONS.get(current, ()):
+            raise DistillStateError(f"非法状态转移：{current} -> {next_state}")
+        session["state"] = next_state
+
+    @staticmethod
+    def _heuristic_quality_score(facts: List[Dict], raw_text: str) -> float:
+        """启发式质量评分（0~1，确定性，不额外消耗云端额度）。
+
+        判据（对齐 CX-O 质量门"极低质→拒绝"的方向）：
+        - 无事实或输出为空 -> 0.0（直接拒）；
+        - 每条事实 +0.2 分，封顶 0.8；
+        - 事实过短（<6 字符）占比过半 -> -0.3（疑似占位/噪声）；
+        - 非常用符号（乱码倾向）占比 >15% -> -0.4。
+        """
+        if not facts or not (raw_text or "").strip():
+            return 0.0
+        score = min(0.2 + 0.2 * len(facts), 0.8)
+        if facts:
+            short = sum(1 for f in facts if len(str(f.get("content") or "")) < 6)
+            if short / len(facts) > 0.5:
+                score *= 0.25  # 占位/过短事实占比过半：乘性降权，确保可被质量门拒绝
+        # 乱码倾向：仅统计「非常见符号」（控制字符 / 非 ASCII 非中文标点 / 高位区块），
+        # 常见 ASCII（含 JSON 结构字符 []{}":, 等）与中文均视为正常。
+        unusual = sum(
+            1 for ch in raw_text
+            if not _is_normal_char(ch)
+        )
+        if raw_text and unusual / max(1, len(raw_text)) > 0.15:
+            score *= 0.3  # 乱码占比过高：乘性降权
+        return max(0.0, min(1.0, score))
+
+    def _distill_chunk(self, chunk: List[Dict], agent_id: str) -> Dict:
+        """执行单个 chunk 的蒸馏状态机，返回终止态会话记录。"""
+        session = self._new_session(agent_id)
+        try:
+            # 1) 提取
+            self._set_state(session, S_EXTRACT)
             prompt_messages = self._build_prompt_messages(chunk)
             raw_text = self._stream_call(prompt_messages)
+            session["raw_text"] = raw_text
+
+            # 2) 质量门（对齐 CX-O：quality_score < 阈值 -> S_REJECT）
+            self._set_state(session, S_QUALITY)
             facts = self._parse_facts(raw_text)
+            quality = self._heuristic_quality_score(facts, raw_text)
+            session["quality_score"] = round(quality, 3)
+            session["facts"] = facts
+            if quality < QUALITY_REJECT_THRESHOLD:
+                session["reason"] = (
+                    f"质量分 {quality:.2f} 低于阈值 {QUALITY_REJECT_THRESHOLD:.2f}，"
+                    "拒绝落库（可能为乱码/占位/无事实）"
+                )
+                self._set_state(session, S_REJECT)
+                return session
+
+            # 3) 落库（真正持久化，对齐 CX-O 蒸馏必须落真实记忆的要求）
+            self._set_state(session, S_COMMIT)
             for fact in facts:
                 content = fact["content"]
                 importance = fact.get("importance") or 3
@@ -125,7 +280,7 @@ class MemoryDistiller:
                         "agent_id": agent_id,
                     }
                 )
-                added.append(
+                session["added"].append(
                     {
                         "id": mem_id,
                         "type": "long_term",
@@ -134,7 +289,16 @@ class MemoryDistiller:
                         "agent_id": agent_id,
                     }
                 )
-        return added
+            session["reason"] = f"质量分 {quality:.2f}，已落库 {len(session['added'])} 条"
+            self._set_state(session, S_DONE)
+            return session
+        except Exception as exc:  # noqa: BLE001 - 单 chunk 失败不阻断其余 chunk
+            session["error"] = str(exc)
+            try:
+                self._set_state(session, S_FAILED)
+            except DistillStateError:
+                session["state"] = S_FAILED
+            return session
 
     # ------------------------------------------------------------------ #
     # 私有辅助方法                                                       #

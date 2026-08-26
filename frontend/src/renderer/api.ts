@@ -32,13 +32,21 @@ export const API_ENDPOINTS = {
     delete: (id: string | number) => `${API_BASE}/memories/${id}`,
   },
   settings: {
+    /** 用户可读配置视图（GET，不含 API Key） */
     get: `${API_BASE}/settings`,
+    /** 更新可热更配置（PUT，白名单键：cloud.provider / tts.voice / local_llm.enabled） */
     update: `${API_BASE}/settings`,
   },
   management: {
+    /** 管理面已收敛为纯 API：前端不再路由这些端点；供另一 Agent / 管理工具调用 */
     agents: `${API_BASE}/agents`,
     remote: `${API_BASE}/remote/status`,
     status: `${API_BASE}/status`,
+  },
+  chatGuard: {
+    /** 聊天服务未启用守卫（避免直连误 404；本期前端走 Mock） */
+    send: `${API_BASE}/chat/messages`,
+    history: `${API_BASE}/chat/history`,
   },
   computer: {
     /** 电脑控制授权状态 */
@@ -124,6 +132,37 @@ export async function fetchAgents(params?: { enabled?: boolean }): Promise<Agent
 /** 软删除单条记忆。 */
 export async function deleteMemory(id: string | number): Promise<{ ok: boolean }> {
   return requestJson<{ ok: boolean }>(API_ENDPOINTS.memories.delete(id), { method: 'DELETE' });
+}
+
+/** 用户可读配置视图（对应 GET /api/settings，不含 API Key）。 */
+export interface SettingsView {
+  cloud: { provider: string; base_url?: string };
+  tts: { voice: string };
+  local_llm: { enabled: boolean };
+  acp: { enabled: boolean };
+  remote: { enabled: boolean };
+}
+
+/** 拉取配置视图（前端设置页首帧对齐后端默认值）。 */
+export async function fetchSettings(): Promise<SettingsView> {
+  return requestJson<SettingsView>(API_ENDPOINTS.settings.get);
+}
+
+/** 更新可热更配置（PUT /api/settings，白名单键：cloud.provider / tts.voice / local_llm.enabled）。 */
+export async function updateSettings(patch: Record<string, unknown>): Promise<SettingsView> {
+  const res = await fetch(API_ENDPOINTS.settings.update, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    throw new Error(`配置更新失败: ${res.status} ${res.statusText}`);
+  }
+  const data = (await res.json()) as { config?: SettingsView; error?: string };
+  if (!data.config) {
+    throw new Error(`配置更新失败: ${data.error ?? '未知错误'}`);
+  }
+  return data.config;
 }
 
 /** 电脑控制授权状态（对应当前 /api/computer/status 与 authorize 的返回）。 */

@@ -49,6 +49,35 @@ class NotAuthorizedBridge:
         raise NotAuthorizedError("本地授权未开启")
 
 
+class MockComputer:
+    """mock 直连 ComputerControl：记录调用并返回固定成功 dict。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def call_tool(self, tool, arguments):
+        self.calls.append((tool, dict(arguments)))
+        return {"success": True, "tool": tool, "result": {"mock": "direct"}}
+
+
+class MockAuthorizer:
+    """mock ControlAuthorizer：可配置授权/高危确认结果，记录审计。"""
+
+    def __init__(self, authorized=True, confirm_result=True):
+        self.authorized = authorized
+        self.confirm_result = confirm_result
+        self.audits = []
+
+    def is_authorized(self):
+        return self.authorized
+
+    def confirm(self, command):
+        return self.confirm_result
+
+    def audit(self, **kwargs):
+        self.audits.append(kwargs)
+
+
 class MockPipeline:
     """mock 检索管线：memory_search 应优先走 retrieve。"""
 
@@ -103,6 +132,55 @@ def test_computer_tools_uninjected_backend_error():
     res = reg.call("computer_screen_control", {})
     assert res["success"] is False
     assert "未注入" in res["error"]
+
+
+def test_computer_direct_without_authorizer_rejected():
+    """仅注入 computer、无 authorizer/bridge 时拒绝执行（装配禁令），不产生本机动作。"""
+    comp = MockComputer()
+    reg = BuiltinToolRegistry(computer=comp, config=_CONFIG_COMPUTER_ON)
+    res = reg.call("computer_run_command", {"command": "echo hi"})
+    assert res["success"] is False
+    assert res["authorized"] is False
+    assert "装配不完整" in res["error"]
+    assert comp.calls == []  # 未执行任何本机动作
+
+
+def test_computer_direct_authorizer_not_authorized():
+    """computer+authorizer 且授权关闭（默认）时拒绝，审计记录 NOT_AUTHORIZED。"""
+    comp = MockComputer()
+    auth = MockAuthorizer(authorized=False)
+    reg = BuiltinToolRegistry(computer=comp, authorizer=auth, config=_CONFIG_COMPUTER_ON)
+    res = reg.call("computer_screen_control", {"_k": 1})
+    assert res["success"] is False
+    assert res["error"] == "电脑控制未授权"
+    assert res["authorized"] is False
+    assert comp.calls == []
+    assert any("NOT_AUTHORIZED" in a["result_summary"] for a in auth.audits)
+
+
+def test_computer_direct_authorizer_success_and_audit():
+    """computer+authorizer 且授权开启时执行成功，且写入审计记录。"""
+    comp = MockComputer()
+    auth = MockAuthorizer(authorized=True)
+    reg = BuiltinToolRegistry(computer=comp, authorizer=auth, config=_CONFIG_COMPUTER_ON)
+    res = reg.call("computer_keyboard_control", {"text": "hello"})
+    assert res["success"] is True, res
+    assert comp.calls == [("computer_keyboard_control", {"text": "hello"})]
+    assert len(auth.audits) == 1
+    assert auth.audits[0]["authorized"] is True
+    assert "hello" in auth.audits[0]["arguments_summary"]
+
+
+def test_computer_run_command_needs_confirmation_direct():
+    """直连回退下运行指令未通过高危确认 -> NEEDS_CONFIRMATION，不执行。"""
+    comp = MockComputer()
+    auth = MockAuthorizer(authorized=True, confirm_result=False)
+    reg = BuiltinToolRegistry(computer=comp, authorizer=auth, config=_CONFIG_COMPUTER_ON)
+    res = reg.call("computer_run_command", {"command": "rm -rf /"})
+    assert res["success"] is False
+    assert res["error_code"] == "NEEDS_CONFIRMATION"
+    assert res["authorized"] is False
+    assert comp.calls == []
 
 
 # --------------------------------------------------------------------------- #

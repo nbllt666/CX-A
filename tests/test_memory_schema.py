@@ -46,7 +46,7 @@ EXPECTED_COLUMNS = {
 EXPECTED_DEFAULTS = {
     "importance": "3",
     "importance_score": "0.6",
-    "decay_type": "exponential",
+    "decay_type": "ebbinghaus_opt",
     "reactivation_count": "0",
     "emotion_score": "0.0",
     "permanent": "0",

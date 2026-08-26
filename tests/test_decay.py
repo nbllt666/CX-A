@@ -71,6 +71,18 @@ def test_exponential_and_two_stage_differ(calc):
     assert e > t
 
 
+def test_ebbinghaus_opt_canonical_and_alias_consistency(calc):
+    """独立枚举名 ebbinghaus_opt 与存量别名 exponential/ebbinghaus 行为一致（兼容读取）。"""
+    base = calc.score(importance=0.9, age_seconds=100 * DAY, decay_type="ebbinghaus_opt")
+    alias_exp = calc.score(importance=0.9, age_seconds=100 * DAY, decay_type="exponential")
+    alias_eb = calc.score(importance=0.9, age_seconds=100 * DAY, decay_type="ebbinghaus")
+    assert base == pytest.approx(alias_exp)
+    assert base == pytest.approx(alias_eb)
+    # two_stage 保持独立语义（与艾宾浩斯不同）
+    two = calc.score(importance=0.9, age_seconds=100 * DAY, decay_type="two_stage")
+    assert base != pytest.approx(two)
+
+
 def test_ebbinghaus_default_t50(calc):
     """t50 天处艾宾浩斯保留约 50%（T50=30 天；importance=0.9）。"""
     s = calc.score(importance=0.9, age_seconds=30 * DAY, decay_type="exponential")

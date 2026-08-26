@@ -1,11 +1,12 @@
 import React, { useRef, useState } from 'react';
 import { MOCK_CHAT_MESSAGES } from '../mock';
 import type { ChatMessage } from '../mock';
-import { API_ENDPOINTS, IS_BACKEND_READY } from '../api';
+import { IS_BACKEND_READY } from '../api';
 
 /**
  * 聊天页（/chat）：消息气泡 + 输入框 + 语音按钮占位。
- * 后端未就绪时以 mock 驱动；发送后走本地伪交互，后续接 API_ENDPOINTS.chat.
+ * 聊天服务本期走 Mock 演示（后端聊天端点 /api/chat/* 为未启用守卫），接入
+ * lite/cloud 云端适配后可切换真实发送。
  */
 export default function ChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>(MOCK_CHAT_MESSAGES);

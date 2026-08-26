@@ -91,10 +91,33 @@ def test_reactivation_promotes_to_long_term(mgr):
 
 
 def test_high_importance_promotes_to_permanent(mgr):
-    mid = mgr.add_memory("vip memory token", type="long_term", importance_score=0.9, embed_fn=_embed)
+    mid = mgr.add_memory("vip memory token", type="long_term", importance_score=0.96, embed_fn=_embed)
     m = mgr.promote(mid)
     assert m["type"] == "permanent"
     assert m["permanent"] in (True, 1)
+
+
+def test_permanent_threshold_aligned_to_095(mgr):
+    """永久晋级 importance 阈值对齐 permanent_threshold=0.95：0.94 不升、0.96 升。"""
+    mid_low = mgr.add_memory("edge low memory token", type="long_term", importance_score=0.94, embed_fn=_embed)
+    m_low = mgr.promote(mid_low)
+    assert m_low["type"] == "long_term"  # 0.94 < 0.95 不升 permanent
+
+    mid_high = mgr.add_memory("edge high memory token", type="long_term", importance_score=0.96, embed_fn=_embed)
+    m_high = mgr.promote(mid_high)
+    assert m_high["type"] == "permanent"  # 0.96 >= 0.95 升 permanent
+
+
+def test_permanent_threshold_custom_override(mgr, tmp_path):
+    """构造传入 permanent_threshold 可覆盖默认 0.95。"""
+    m = MemoryManager(
+        store=MemoryStore(db_path=str(tmp_path / "custom.db")),
+        vector_store=InMemoryVectorStore(),
+        permanent_threshold=0.80,
+    )
+    mid = m.add_memory("custom threshold memory", type="long_term", importance_score=0.82, embed_fn=_embed)
+    mem = m.promote(mid)
+    assert mem["type"] == "permanent"
 
 
 def test_explicit_demote(mgr):

@@ -2,16 +2,17 @@
 """记忆衰减计算器——移植自 CX-O 的 DecayCalculator。
 
 提供两种衰减模型：
-- 艾宾浩斯优化版（decay_type='exponential'/'ebbinghaus'）：
+- 艾宾浩斯优化版（decay_type='ebbinghaus_opt'）：
       T(t) = 1 / (1 + (Δt / T50)^k)
 - 双阶段指数（decay_type='two_stage'）：
       T(t) = α·e^(-λ1·Δt) + (1-α)·e^(-λ2·Δt)
 
 ⚠️ 命名说明：CX-O 中把「双阶段指数」命名为 decay_type='exponential'，
-真正的艾宾浩斯命名为 'ebbinghaus'，存在命名歧义（详见交付报告 CX-O 问题 #1）。
-为与 CX-A schema 默认 decay_type='exponential' 对齐且避免混淆，本模块按任务契约约定：
-- 'exponential' / 'ebbinghaus' -> 艾宾浩斯优化版；
-- 'two_stage'                -> 双阶段指数。
+真正的艾宾浩斯命名为 'ebbinghaus'，存在同名异义（详见交付报告 CX-O 问题 #1）。
+为根治该歧义，CX-A schema 默认与存根统一使用**独立枚举名** 'ebbinghaus_opt'：
+- 'ebbinghaus_opt' / 'exponential' / 'ebbinghaus' -> 艾宾浩斯优化版（后两者为兼容
+  存量数据的别名，仅用于读取，不推荐新写入）；
+- 'two_stage' -> 双阶段指数。
 默认参数与 CX-O 源码对齐：T50=30 天 / k=2.0；α=0.6 / λ1=0.25 / λ2=0.04。
 
 另提供再激活加成逻辑（对齐 CX-O calculate_reactivation_score）：
@@ -31,9 +32,11 @@ REACTIVATION_GAIN = 0.2  # 每次访问的乘法加成系数
 REACTIVATION_BASE = 0.1  # 发生再激活时的固定加分
 EMOTION_BOOST = 0.05     # 情感强度加分系数
 
-# 艾宾浩斯/双阶段指数在统一入口中接受的 decay_type 名
-EBBINGHAUS_ALIASES = ("exponential", "ebbinghaus")
-TWO_STAGE_ALIASES = ("two_stage",)
+# 艾宾浩斯 canonical 名与兼容别名（exponential/ebbinghaus 仅为存量数据读取保留）
+EBBINGHAUS_CANONICAL = "ebbinghaus_opt"
+EBBINGHAUS_ALIASES = (EBBINGHAUS_CANONICAL, "exponential", "ebbinghaus")
+TWO_STAGE_CANONICAL = "two_stage"
+TWO_STAGE_ALIASES = (TWO_STAGE_CANONICAL,)
 ZERO_ALIASES = ("zero",)
 
 
@@ -92,18 +95,18 @@ class DecayCalculator:
         return self.current_time
 
     # ------------------------------------------------------------ 衰减因子
-    def decay_factor(self, days_elapsed, decay_type="exponential", params=None):
+    def decay_factor(self, days_elapsed, decay_type="ebbinghaus_opt", params=None):
         """计算纯度高的时间保留因子（0~1，不乘 importance）。
 
         参数决定走哪种模型：
-        - exponential / ebbinghaus -> 艾宾浩斯优化版；
+        - ebbinghaus_opt / exponential / ebbinghaus -> 艾宾浩斯优化版；
         - two_stage                -> 双阶段指数；
         - zero / permanent         -> 恒 1.0。
         未识别类型回退双阶段指数。
         """
         if days_elapsed is None or days_elapsed <= 0:
             return 1.0
-        dtype = (decay_type or "exponential").lower()
+        dtype = (decay_type or "ebbinghaus_opt").lower()
         params = params or {}
 
         if dtype in ZERO_ALIASES:
@@ -140,12 +143,12 @@ class DecayCalculator:
         return min(importance * factor, 1.0)
 
     # ------------------------------------------------------------ 强度/保留/再激活
-    def retention(self, importance, age_seconds, decay_type="exponential", params=None):
+    def retention(self, importance, age_seconds, decay_type="ebbinghaus_opt", params=None):
         """记忆保留分数（importance 衰减后），0~1。永久记忆路径请用 score。"""
         days = age_seconds / 86400.0
         return self.decay_factor(days, decay_type, params) * float(importance)
 
-    def strength(self, importance, age_seconds, decay_type="exponential", params=None):
+    def strength(self, importance, age_seconds, decay_type="ebbinghaus_opt", params=None):
         """记忆强度（同 retention，即衰减后分数）。"""
         return self.retention(importance, age_seconds, decay_type, params)
 
@@ -162,7 +165,7 @@ class DecayCalculator:
         self,
         importance,
         age_seconds,
-        decay_type="exponential",
+        decay_type="ebbinghaus_opt",
         params=None,
         reactivation_count=0,
         emotion_score=0.0,
@@ -173,7 +176,8 @@ class DecayCalculator:
         Args:
             importance: 重要性分数（0~1）。
             age_seconds: 距上次记忆建立经过的秒数。
-            decay_type: 衰减类型（exponential/ebbinghaus/two_stage/zero）。
+            decay_type: 衰减类型（ebbinghaus_opt/two_stage/zero；exponential、
+                ebbinghaus 为兼容存量别名）。
             params: 衰减参数 dict（t50/k 或 alpha/lambda1/lambda2）。
             reactivation_count: 再激活次数（访问次数越多分越高）。
             emotion_score: 情感强度（越高分越高）。

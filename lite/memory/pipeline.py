@@ -115,7 +115,7 @@ class MemoryRetrievalPipeline:
                 "type": type_,
                 "importance": importance,
                 "importance_score": max(0.0, min(1.0, int(importance) / 5.0)),
-                "decay_type": "exponential",
+                "decay_type": "ebbinghaus_opt",
                 "reactivation_count": 0,
                 "emotion_score": 0.0,
                 "permanent": type_ == "permanent",

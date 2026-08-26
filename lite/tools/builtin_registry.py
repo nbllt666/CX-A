@@ -41,6 +41,7 @@ from lite.computer_control.control import (
     TOOL_KEYBOARD,
     TOOL_SCREEN,
     NotAuthorizedError,
+    _redact,
 )
 
 #: 本模块所在目录（供路径推导；本实现无磁盘 IO，仅声明规范）
@@ -71,9 +72,14 @@ __all__ = ["BuiltinToolRegistry", "SOURCE_BUILTIN"]
 class BuiltinToolRegistry:
     """内置工具注册表：核心能力直接内置，不走插件协议。
 
-    :param computer: 可选的完全内置电脑控制实例（:class:`ComputerControl`）
+    :param computer: 可选的完全内置电脑控制实例（:class:`ComputerControl`）。注意：
+        **禁止仅注入 computer**——直连回退必须同时注入 ``authorizer``（:class:`ControlAuthorizer`）
+        把关授权/高危确认/审计，否则调用一律拒绝（安全装配禁令）。
     :param computer_bridge: 可选的接线层（:class:`ToolBridge`），电脑控制优先走
         ``execute(tool, arguments)``（内部已由 ControlAuthorizer 把关授权）
+    :param authorizer: 可选的授权/审计门（:class:`ControlAuthorizer`），供 computer
+        直连回退路径复用；同时注入 ``computer`` 与 ``authorizer`` 时，回退路径
+        与 bridge 享有同等安全链路（授权 + 高危确认 + 审计）
     :param memory_store: 可选记忆存储（``MemoryStore.add/list``）
     :param pipeline: 可选记忆检索管线（``MemoryRetrievalPipeline.retrieve``）
     :param config: 配置（ConfigManager / 裸 dict / None）；按 ``tools`` 段读取各
@@ -85,12 +91,14 @@ class BuiltinToolRegistry:
         self,
         computer: Any = None,
         computer_bridge: Any = None,
+        authorizer: Any = None,
         memory_store: Any = None,
         pipeline: Any = None,
         config: Any = None,
     ) -> None:
         self.computer = computer
         self.computer_bridge = computer_bridge
+        self.authorizer = authorizer
         self.memory_store = memory_store
         self.pipeline = pipeline
         self.config = config
@@ -213,10 +221,44 @@ class BuiltinToolRegistry:
                     res.setdefault("authorized", True)
                 return res if isinstance(res, dict) else {"success": True, "result": res, "tool": tool_id}
 
-            # 2) 退化为 ComputerControl 直接调用
+            # 2) 退化为 ComputerControl 直接调用：必须经 ControlAuthorizer 把关
+            #    （授权 + 高危确认 + 审计），禁止「仅注入 computer」绕过安全链路
             if self.computer is not None:
+                if self.authorizer is None:
+                    return {
+                        "success": False,
+                        "tool": tool_id,
+                        "authorized": False,
+                        "error": "电脑控制装配不完整：computer 直连须注入 authorizer（建议改用 computer_bridge）",
+                        "result": None,
+                    }
                 try:
+                    # a) 永久授权开关
+                    if not self.authorizer.is_authorized():
+                        self._audit_direct(tool_id, arguments, authorized=False, summary="拒绝：本地授权未开启 error_code=NOT_AUTHORIZED")
+                        return {
+                            "success": False,
+                            "tool": tool_id,
+                            "authorized": False,
+                            "error": "电脑控制未授权",
+                            "result": None,
+                        }
+                    # b) 高危指令二次确认（指令类工具）
+                    if tool_id == TOOL_COMMAND:
+                        command = str((arguments or {}).get("command") or "")
+                        if not self.authorizer.confirm(command):
+                            self._audit_direct(tool_id, arguments, authorized=False, summary="拒绝：高危指令未确认 error_code=NEEDS_CONFIRMATION")
+                            return {
+                                "success": False,
+                                "tool": tool_id,
+                                "authorized": False,
+                                "error": "需要确认",
+                                "error_code": "NEEDS_CONFIRMATION",
+                                "result": None,
+                            }
+                    # c) 执行 + 审计
                     result = self.computer.call_tool(tool_id, arguments or {})
+                    self._audit_direct(tool_id, arguments, authorized=True, summary="成功")
                 except NotAuthorizedError:
                     return {
                         "success": False,
@@ -247,6 +289,33 @@ class BuiltinToolRegistry:
             }
 
         return handler
+
+    @staticmethod
+    def _audit_summary_text(arguments) -> str:
+        """把直连回退的工具参数转成脱敏摘要（避免敏感内容进审计日志）。"""
+        raw = str(arguments or {})
+        return _redact(raw)[:200]
+
+    def _audit_direct(self, tool_id, arguments, authorized, summary):
+        """直连回退路径的审计记录（委托 authorizer.audit，失败仅告警不抛出）。
+
+        :param tool_id: 工具稳定标识
+        :param arguments: 工具参数（脱敏摘要后入审计）
+        :param authorized: 本次是否放行
+        :param summary: 审计结果摘要
+        """
+        if self.authorizer is None:
+            return
+        try:
+            self.authorizer.audit(
+                action="call_tool",
+                tool=tool_id,
+                arguments_summary=self._audit_summary_text(arguments),
+                authorized=authorized,
+                result_summary=summary,
+            )
+        except Exception:  # noqa: BLE001 - 审计失败不阻断工具链路
+            LOGGER.warning("内置工具审计失败（tool=%s, summary=%s）", tool_id, summary)
 
     # ----- 记忆读写 -----
 

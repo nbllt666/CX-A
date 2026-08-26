@@ -61,6 +61,21 @@ def http_status(url):
         return exc.code
 
 
+def http_post(url, payload, method="POST"):
+    """POST/PUT 请求返回 (status, JSON)，非 2xx 同样解析错误体返回。"""
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
 def search_url(base, **params):
     """构造 search 端点 URL，查询参数做 URL 编码（支持中文 query）。"""
     querystring = urlencode({k: str(v) for k, v in params.items() if v is not None})
@@ -162,3 +177,74 @@ def test_unknown_route_returns_404(api_server):
 def test_bad_limit_returns_400(api_server):
     _store, _pipeline, base = api_server
     assert http_status(f"{base}/api/memories?limit=abc") == 400
+
+
+# ---------------------------------------------------------------- 状态 / 设置 / 聊天守卫（管理面收敛为纯 API）
+def test_status_endpoint(api_server):
+    """GET /api/status 返回轻量系统状态。"""
+    _store, _pipeline, base = api_server
+    status, body, _raw = http_get(f"{base}/api/status")
+    assert status == 200
+    assert body["status"] == "ok"
+    assert body["app"] == "CX-A/CX-Lite"
+    assert "uptime_seconds" in body
+    assert body["companion"] is True
+
+
+def test_settings_get_masked_without_api_key(api_server):
+    """GET /api/settings 返回脱敏配置视图，绝不包含 API Key。"""
+    _store, _pipeline, base = api_server
+    status, body, raw = http_get(f"{base}/api/settings")
+    assert status == 200
+    assert body["cloud"]["provider"] == "deepseek"
+    assert body["tts"]["voice"] == "cx-open"
+    assert body["local_llm"]["enabled"] is False
+    assert "api_key" not in raw.lower()
+    assert "api_key" not in json.dumps(body)
+
+
+def test_settings_update_hot_reload(api_server):
+    """PUT /api/settings 应用白名单键并热更新，再次 GET 可见。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/settings",
+        {"cloud": {"provider": "tongyi"}, "tts": {"voice": "ling"}},
+        method="PUT",
+    )
+    assert status == 200
+    assert "cloud.provider" in body["applied"]
+    assert "tts.voice" in body["applied"]
+    assert body["config"]["cloud"]["provider"] == "tongyi"
+    assert body["config"]["tts"]["voice"] == "ling"
+
+    _st2, body2, _raw = http_get(f"{base}/api/settings")
+    assert body2["cloud"]["provider"] == "tongyi"
+    assert body2["tts"]["voice"] == "ling"
+
+
+def test_settings_update_ignores_unknown_provider(api_server):
+    """PUT provider 不在白名单时 ignored 且不覆盖原值。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/settings",
+        {"cloud": {"provider": "bogus"}},
+        method="PUT",
+    )
+    assert status == 200
+    assert body["applied"] == []
+    assert any("bogus" in item for item in body["ignored"])
+    assert body["config"]["cloud"]["provider"] == "deepseek"
+
+
+def test_chat_endpoints_guard(api_server):
+    """聊天端点本期为未启用守卫：明确提示而不 404，避免直连误判。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/chat/messages", {"text": "hi"})
+    assert status == 200
+    assert body["error"] == "chat_service_disabled"
+    assert body["ok"] is False
+
+    status2, body2, _raw = http_get(f"{base}/api/chat/history")
+    assert status2 == 200
+    assert body2["error"] == "chat_service_disabled"
+    assert body2["messages"] == []

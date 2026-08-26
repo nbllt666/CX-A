@@ -1,22 +1,37 @@
 import React, { useEffect, useState } from 'react';
 import { GlassCard } from '../components/GlassCard';
 import Toggle from '../components/Toggle';
-import { IS_BACKEND_READY, fetchComputerStatus, setComputerAuthorized } from '../api';
+import {
+  IS_BACKEND_READY,
+  fetchComputerStatus,
+  fetchSettings,
+  setComputerAuthorized,
+  updateSettings,
+} from '../api';
 
 /**
  * 设置页（/settings）：
  * 云端提供商选择 / 本地模式开关 / 电脑控制授权开关 / 音色选择。
  *
- * 「电脑控制授权」区块已接入真实后端：
- * - 挂载时 GET /api/computer/status 初始化授权与高危确认状态；
- * - 切换授权走 POST /api/computer/authorize；
- * - 后端不可用时降级为本地 mock 交互（localStorage 记忆，界面提示离线）。
+ * - 云端提供商 / 本地模式 / 音色：首帧从后端 GET /api/settings 读取，切换走
+ *   PUT /api/settings 热更新（失败不阻断界面，待后端上线后自动同步）。
+ * - 电脑控制授权：已接入真实后端（GET /api/computer/status + POST /api/computer/authorize）。
+ * - 本页默认值与后端 config 默认值一致：deepseek / 本地模式关 / cx-open。
  */
 
 /** localStorage 键：电脑控制授权开关 */
 const LS_AUTH_KEY = 'cx.computer.authorized';
 /** localStorage 键：高危二次确认开关（仅展示，后端常态化开启） */
 const LS_CONFIRM_KEY = 'cx.computer.confirm_dangerous';
+
+/** 云端 provider 白名单（与后端 /api/settings 一致） */
+const CLOUD_PROVIDERS = ['deepseek', 'tongyi', 'openai', 'moonshot'];
+/** 音色选项（默认 cx-open，其余为演示可选） */
+const VOICE_OPTIONS = ['cx-open', 'ling', 'gulu', 'momo'];
+/** 后端不可用时的回退默认值（与 config_manager DEFAULTS 一致） */
+const FALLBACK_PROVIDER = 'deepseek';
+const FALLBACK_LOCAL_MODE = false;
+const FALLBACK_VOICE = 'cx-open';
 
 /** 读取 localStorage 布尔值；缺失 / 异常时回落默认值 */
 function readLsBool(key: string, fallback: boolean): boolean {
@@ -39,9 +54,11 @@ function writeLsBool(key: string, value: boolean): void {
 }
 
 export default function SettingsPage() {
-  const [provider, setProvider] = useState('auto');
-  const [localMode, setLocalMode] = useState(true);
-  const [voice, setVoice] = useState('ling');
+  const [provider, setProvider] = useState(FALLBACK_PROVIDER);
+  const [localMode, setLocalMode] = useState(FALLBACK_LOCAL_MODE);
+  const [voice, setVoice] = useState(FALLBACK_VOICE);
+  // 后端返回的 provider 若不在白名单则附加为自定义项
+  const [extraProvider, setExtraProvider] = useState<string | null>(null);
 
   // 电脑控制授权状态
   const [controlAuth, setControlAuth] = useState(false);
@@ -50,16 +67,33 @@ export default function SettingsPage() {
   // 是否走真实后端（false 时降级为本地 mock）
   const [computerOnline, setComputerOnline] = useState(IS_BACKEND_READY);
 
-  // 挂载初始化：优先拉后端 status，失败降级到本地 mock
+  // 挂载初始化：拉后端配置视图 + 电脑控制状态；失败回退默认值（与 config 默认一致）
   useEffect(() => {
-    if (!IS_BACKEND_READY) {
-      setComputerOnline(false);
-      setControlAuth(readLsBool(LS_AUTH_KEY, false));
-      setConfirmDangerous(readLsBool(LS_CONFIRM_KEY, true));
-      return;
-    }
     let alive = true;
     (async () => {
+      if (IS_BACKEND_READY) {
+        try {
+          const st = await fetchSettings();
+          if (!alive) return;
+          const p = st?.cloud?.provider;
+          if (p && !CLOUD_PROVIDERS.includes(p)) setExtraProvider(p);
+          setProvider((p && CLOUD_PROVIDERS.includes(p) ? p : (st?.cloud?.provider ?? FALLBACK_PROVIDER)) as string);
+          setLocalMode(Boolean(st?.local_llm?.enabled ?? FALLBACK_LOCAL_MODE));
+          setVoice(st?.tts?.voice || FALLBACK_VOICE);
+        } catch {
+          if (!alive) return;
+          setProvider(FALLBACK_PROVIDER);
+          setLocalMode(FALLBACK_LOCAL_MODE);
+          setVoice(FALLBACK_VOICE);
+        }
+      }
+      // 电脑控制授权状态
+      if (!IS_BACKEND_READY) {
+        setComputerOnline(false);
+        setControlAuth(readLsBool(LS_AUTH_KEY, false));
+        setConfirmDangerous(readLsBool(LS_CONFIRM_KEY, true));
+        return;
+      }
       try {
         const st = await fetchComputerStatus();
         if (!alive) return;
@@ -80,6 +114,22 @@ export default function SettingsPage() {
       alive = false;
     };
   }, []);
+
+  // 云端 / 本地模式 / 音色走 PUT /api/settings 热更新（失败不阻断界面）
+  const handleProviderChange = (next: string) => {
+    setProvider(next);
+    if (CLOUD_PROVIDERS.includes(next)) {
+      void updateSettings({ cloud: { provider: next } }).catch(() => {});
+    }
+  };
+  const handleLocalModeChange = (next: boolean) => {
+    setLocalMode(next);
+    void updateSettings({ local_llm: { enabled: next } }).catch(() => {});
+  };
+  const handleVoiceChange = (next: string) => {
+    setVoice(next);
+    void updateSettings({ tts: { voice: next } }).catch(() => {});
+  };
 
   // 切换授权：在线走 POST authorize；离线/失败则本地记忆
   const handleControlAuthChange = async (next: boolean) => {
@@ -116,20 +166,21 @@ export default function SettingsPage() {
             <p className="text-xs text-[var(--text-tertiary)]">选一个你信任的云端服务来跑智能大脑</p>
             <select
               value={provider}
-              onChange={(e) => setProvider(e.target.value)}
+              onChange={(e) => handleProviderChange(e.target.value)}
               className="mt-1 h-9 rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-2 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)]"
             >
-              <option value="auto">自动（推荐）</option>
-              <option value="providerA">云端 A</option>
-              <option value="providerB">云端 B</option>
-              <option value="custom">自定义地址</option>
+              <option value="deepseek">DeepSeek</option>
+              <option value="tongyi">通义（Tongyi）</option>
+              <option value="openai">OpenAI</option>
+              <option value="moonshot">Moonshot（月之暗面）</option>
+              {extraProvider && <option value={extraProvider}>{extraProvider}（当前值）</option>}
             </select>
           </div>
         </GlassCard>
 
         {/* 本地模式 */}
-        <SettingRow title="本地模式" desc="不上传任何内容，所有对话都留在你电脑上（离线优先）">
-          <Toggle checked={localMode} onChange={setLocalMode} label="本地模式" />
+        <SettingRow title="本地模式" desc="不上传任何内容，所有对话都留在你电脑上（离线优先，默认关闭）">
+          <Toggle checked={localMode} onChange={handleLocalModeChange} label="本地模式" />
         </SettingRow>
 
         {/* 电脑控制授权 */}
@@ -178,9 +229,10 @@ export default function SettingsPage() {
             <p className="text-xs text-[var(--text-tertiary)]">挑一个舒服的声音陪你说话</p>
             <select
               value={voice}
-              onChange={(e) => setVoice(e.target.value)}
+              onChange={(e) => handleVoiceChange(e.target.value)}
               className="mt-1 h-9 rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-2 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)]"
             >
+              <option value="cx-open">CX-OPEN（默认）</option>
               <option value="ling">灵灵（温柔）</option>
               <option value="gulu">咕噜（元气）</option>
               <option value="momo">默默（低沉）</option>
@@ -189,7 +241,7 @@ export default function SettingsPage() {
         </GlassCard>
 
         <p className="text-xs text-[var(--text-tertiary)]">
-          云端 / 本地模式 / 音色仍为演示占位；电脑控制授权已接入真实后端，后端不可用时会自动转为本地记忆。
+          云端 / 本地模式 / 音色已接入后端配置（GET/PUT /api/settings），后端不可用时回退默认值；电脑控制授权已接入真实后端。
         </p>
       </div>
     </div>
