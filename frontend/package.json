@@ -1,0 +1,38 @@
+{
+  "name": "cx-a-companion",
+  "productName": "CX-A 赛博伴侣",
+  "version": "0.1.0",
+  "description": "CX-A 赛博伴侣桌面应用前端（Electron + React + Vite + Tailwind，Liquid Glass 玻璃拟态）",
+  "main": "src/main/main.js",
+  "author": "CX-A",
+  "license": "UNLICENSED",
+  "private": true,
+  "_note": "electron 为 dev 依赖（electron 主进程/预加载需要它才能启动桌面外壳）。本轮 npm install 在 electron 二进制的 postinstall(GitHub 下载)处超时未完成，node_modules/electron/dist 缺失；renderer 依赖已全部就位，npm run build 已验证通过。Electron 可执行文件需在有网络环境时补跑 `npm rebuild electron` 或设置 ELECTRON_MIRROR(例如 https://npmmirror.com/mirrors/electron/) 后重装。详见任务 A8 报告。",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n renderer,electron \"npm:dev:renderer\" \"npm:dev:electron\"",
+    "dev:renderer": "vite",
+    "dev:electron": "wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .",
+    "build": "vite build",
+    "build:renderer": "vite build",
+    "start": "electron .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.15",
+    "vite": "^5.4.11",
+    "wait-on": "^8.0.1",
+    "electron": "^33.2.0"
+  }
+}

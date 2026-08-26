@@ -1,0 +1,72 @@
+{
+  "schema": "cxa-installer-manifest/v1",
+  "version": "0.1.0",
+  "generated_at": "2026-08-26",
+  "description": "CX-A 安装器组件清单——记录内置组件（builtin）与可选组件（optional）的安装态映射。真实二进制当前为开发态，由安装器做结构初始化 + 引导流程。",
+  "components": [
+    {
+      "name": "Electron 运行时",
+      "key": "electron",
+      "size_estimate": "约 120 MB",
+      "status": "builtin",
+      "install_target": "runtime/electron",
+      "notes": "桌面外壳运行时（前端宿主）。"
+    },
+    {
+      "name": "llama.cpp",
+      "key": "llama_cpp",
+      "size_estimate": "约 80 MB",
+      "status": "builtin",
+      "install_target": "runtime/llama",
+      "notes": "本地推理运行时（GCGUF 加载 / 向量嵌入）。"
+    },
+    {
+      "name": "qwen3-embedding:0.6b (GGUF)",
+      "key": "qwen3_embedding",
+      "size_estimate": "约 400 MB",
+      "status": "builtin",
+      "install_target": "data/local_llm/qwen3-embedding-0.6b",
+      "notes": "本地嵌入模型，对齐 config.embedding.model。"
+    },
+    {
+      "name": "LanceDB",
+      "key": "lancedb",
+      "size_estimate": "约 50 MB",
+      "status": "builtin",
+      "install_target": "data/lancedb",
+      "notes": "向量数据库后端（对齐 config.vector.backend）。"
+    },
+    {
+      "name": "MeloTTS + CX-OPEN 音色",
+      "key": "melotts",
+      "size_estimate": "约 160 MB",
+      "status": "builtin",
+      "install_target": "data/voices/cx-open",
+      "notes": "语音合成默认音色 CX-OPEN（对齐 config.tts.voice）。"
+    },
+    {
+      "name": "SenseVoice",
+      "key": "sensevoice",
+      "size_estimate": "约 300 MB",
+      "status": "builtin",
+      "install_target": "data/voices/sensevoice",
+      "notes": "语音识别模型（对齐 config.asr.engine）。"
+    },
+    {
+      "name": "后端服务 (Python)",
+      "key": "backend",
+      "size_estimate": "约 150 MB",
+      "status": "builtin",
+      "install_target": "runtime/backend",
+      "notes": "CX-A 后端服务可执行包。"
+    },
+    {
+      "name": "本地小 LLM（可选）",
+      "key": "local_llm",
+      "size_estimate": "约 1.7 GB",
+      "status": "optional",
+      "install_target": "data/local_llm/llm",
+      "notes": "可选组件：默认不下载，由 C2 下载引导按需拉取（HF / 魔塔双源）。"
+    }
+  ]
+}

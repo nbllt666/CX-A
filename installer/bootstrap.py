@@ -1,0 +1,250 @@
+# -*- coding: utf-8 -*-
+"""CX-A 安装引导（bootstrap）——目录初始化 / 组件校验 / 内置组件落位 / 数据目录初始化。
+
+对齐工程文档 §4（无 GPU、不依赖外部服务）：
+- 解压内置组件（Electron / llama.cpp / qwen3-embedding / LanceDB / MeloTTS / SenseVoice / 后端）
+- 初始化数据目录
+- 当前为开发态：组件二进制尚不可得，installer 实现"结构初始化 + 引导流程"，真实组件放置留目录占位。
+
+路径规范：本项目所有路径均基于
+``os.path.dirname(os.path.abspath(__file__))`` 逐级推导，禁止相对路径或字符串斜杠拼接。
+本文件位于 ``<root>/installer/bootstrap.py``，上溯一级即项目根（c:\\CX-A）。
+"""
+
+import datetime
+import json
+import os
+import shutil
+
+#: 本安装器目录（installer/），基于文件绝对位置推导，禁止相对路径。
+_INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
+#: 项目根目录（installer 的直接上级）。
+PROJECT_ROOT = os.path.dirname(_INSTALLER_DIR)
+
+#: 内置组件源目录（installer/bundled/）。开发态仅供占位，真实二进制后续填充。
+BUNDLED_DIR = os.path.join(_INSTALLER_DIR, "bundled")
+#: 组件清单文件绝对路径。
+MANIFEST_PATH = os.path.join(_INSTALLER_DIR, "manifest.json")
+
+from lite.config.config_manager import ConfigManager  # noqa: E402
+from lite.memory.storage import MemoryStore  # noqa: E402
+
+
+#: 数据目录相对项目根的子目录（与工程文档 §4 及 manifest install_target 对齐）。
+REQUIRED_DATA_DIRS = (
+    os.path.join("data", "lancedb"),
+    os.path.join("data", "local_llm"),
+    os.path.join("data", "voices"),
+)
+
+
+def _log_info(message):
+    """以 [INFO] + 时间戳形式输出中文安装进度。"""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[INFO] {timestamp} {message}")
+
+
+def _log_warn(message):
+    """以 [WARN] + 时间戳形式输出中文风险提示。"""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[WARN] {timestamp} {message}")
+
+
+# ------------------------------------------------------------------ #
+# 清单加载                                                           #
+# ------------------------------------------------------------------ #
+
+
+def load_manifest(path=None):
+    """加载组件清单 manifest.json，返回 dict。
+
+    :param path: manifest.json 绝对路径；缺省使用 installer 内置清单。
+    :return: 清单 dict（含 components 列表）。
+    """
+    path = path or MANIFEST_PATH
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+# ------------------------------------------------------------------ #
+# 目录初始化                                                          #
+# ------------------------------------------------------------------ #
+
+
+def ensure_dirs(root):
+    """创建数据目录（幂等）。
+
+    创建 data/（memories.db、lancedb/、local_llm/、voices/）、logs/ 等数据目录。
+    重复调用不会报错或产生重复目录。
+
+    :param root: 安装根目录（真实使用 PROJECT_ROOT，测试可传 tmp_path）。
+    :return: 已确保存在的目录绝对路径列表。
+    """
+    root = root or PROJECT_ROOT
+    _log_info("开始初始化数据目录...")
+    dirs = [
+        os.path.join(root, "data"),
+        os.path.join(root, "data", "lancedb"),
+        os.path.join(root, "data", "local_llm"),
+        os.path.join(root, "data", "voices"),
+        os.path.join(root, "logs"),
+    ]
+    for directory in dirs:
+        os.makedirs(directory, exist_ok=True)
+
+    # memories.db 占位（真实建表由 init_workplace 完成，此处仅为目录齐全性设占位文件）
+    db_path = os.path.join(root, "data", "memories.db")
+    if not os.path.exists(db_path):
+        with open(db_path, "w", encoding="utf-8") as fh:
+            fh.write("")
+    _log_info(f"数据目录就绪：{', '.join(os.path.relpath(d, root) for d in dirs)} + data/memories.db")
+    return dirs
+
+
+# ------------------------------------------------------------------ #
+# 组件校验                                                            #
+# ------------------------------------------------------------------ #
+
+
+def verify_components(root):
+    """校验内置组件占位，返回问题/警告列表。
+
+    - 必需数据目录（data/lancedb、data/local_llm、data/voices）缺失时追加问题；
+    - 依据 manifest 逐项记录内置组件"安装态 / 待装态"——开发态二进制缺失时
+      返回警告而非抛错，保证安装流程可继续。
+
+    :param root: 安装根目录。
+    :return: list[str] 问题/警告描述。
+    """
+    root = root or PROJECT_ROOT
+    problems = []
+
+    # 1. 必需数据目录占位校验
+    for rel in REQUIRED_DATA_DIRS:
+        if not os.path.isdir(os.path.join(root, rel)):
+            problems.append(f"缺少必需数据目录：{rel}（请先运行 ensure_dirs）")
+
+    # 2. 组件安装态 / 待装态记录（依据 manifest）
+    manifest = load_manifest()
+    for comp in manifest["components"]:
+        target = os.path.join(root, comp["install_target"])
+        installed = os.path.exists(target)
+        if comp["status"] == "builtin":
+            state = "已安装" if installed else "待装态"
+        else:
+            state = "已安装" if installed else "可选未装"
+        if comp["status"] == "builtin" and not installed:
+            problems.append(
+                f"内置组件[{comp['name']}]处于待装态：{comp['install_target']} 尚未就位（"
+                f"size={comp.get('size_estimate')}）"
+            )
+        elif comp["status"] == "builtin" and installed:
+            _log_info(f"组件[{comp['name']}] 已安装：{comp['install_target']}")
+
+    return problems
+
+
+# ------------------------------------------------------------------ #
+# 内置组件落位                                                        #
+# ------------------------------------------------------------------ #
+
+
+def _copytree(src, dst):
+    """递归拷贝 src 到 dst；目标已存在则先移除再拷贝（保证结果确定性）。"""
+    if os.path.exists(dst):
+        if os.path.isdir(dst):
+            shutil.rmtree(dst)
+        else:
+            os.remove(dst)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copytree(src, dst)
+
+
+def install_builtin_assets(root, manifest=None):
+    """将"内置组件"从 installer/bundled/ 拷贝/解压到数据目录。
+
+    按 manifest.json 中 status=builtin 的组件，把 bundled/<key> 拷贝到
+    <root>/<install_target>。真实二进制缺失时仅记录警告，不失败（开发态允许）。
+
+    :param root: 安装根目录。
+    :param manifest: 组件清单 dict；缺省加载 installer 内置清单。
+    :return: list[str] 缺失源组件警告。
+    """
+    root = root or PROJECT_ROOT
+    manifest = manifest or load_manifest()
+    warnings = []
+    for comp in manifest["components"]:
+        if comp["status"] != "builtin":
+            continue
+        key = comp["key"]
+        src = os.path.join(BUNDLED_DIR, key)
+        dst = os.path.join(root, comp["install_target"])
+        if not os.path.exists(src):
+            warnings.append(f"内置组件[{comp['name']}]源缺失：{src}（开发态跳过，不失败）")
+            _log_warn(f"[跳过] {comp['name']} 源缺失，标记待装态")
+            continue
+        if os.path.isdir(src):
+            _copytree(src, dst)
+        else:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+        _log_info(f"[安装] {comp['name']} -> {comp['install_target']}")
+
+    if warnings:
+        _log_info(f"共 {len(warnings)} 项内置组件源缺失（开发态待装，不影响安装流程整体完成）")
+    else:
+        _log_info("全部内置组件落位完成。")
+    return warnings
+
+
+# ------------------------------------------------------------------ #
+# 数据目录初始化（config.json + memories.db）                           #
+# ------------------------------------------------------------------ #
+
+
+def init_workplace(root):
+    """初始化工作区：生成 config.json 并完成 memories.db 建表。
+
+    - 通过 ConfigManager 首次启动自动生成含默认值的 config.json；
+    - 通过 MemoryStore.create_table() 触发 memories 表建表。
+
+    :param root: 安装根目录。
+    :return: 已初始化好的 ConfigManager 实例。
+    """
+    root = root or PROJECT_ROOT
+    cfg = ConfigManager(
+        config_path=os.path.join(root, "config.json"),
+        data_dir=os.path.join(root, "data"),
+    )
+    _log_info("config.json 已生成 / 加载（默认云端提供商：%s）" % cfg.get("cloud", "provider"))
+
+    store = MemoryStore(db_path=os.path.join(root, "data", "memories.db"))
+    store.create_table()
+    store.close()
+    _log_info("memories.db 建表完成（memories 表就绪）")
+    return cfg
+
+
+# ------------------------------------------------------------------ #
+# 一键安装编排                                                        #
+# ------------------------------------------------------------------ #
+
+
+def install(root=None):
+    """一键安装编排：目录初始化 → 组件校验 → 内置组件落位 → 数据目录初始化。
+
+    全程中文 [INFO] 提示。返回 （problems, builtin_warnings），供调用方展示或落盘。
+    """
+    root = root or PROJECT_ROOT
+    ensure_dirs(root)
+    problems = verify_components(root)
+    for p in problems:
+        _log_warn(p)
+    builtin_warnings = install_builtin_assets(root)
+    init_workplace(root)
+    _log_info("一键安装流程完成。")
+    return problems, builtin_warnings
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI 直跑入口
+    install()

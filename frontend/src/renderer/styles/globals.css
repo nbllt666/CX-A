@@ -1,0 +1,134 @@
+@import './tokens.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    color: var(--text-primary);
+    background: var(--bg-primary);
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+  }
+
+  /* 文字可选（输入框 / 气泡正文允许选中复制） */
+  selectable,
+  p,
+  input,
+  textarea {
+    user-select: text;
+  }
+}
+
+@layer components {
+  /* 液态玻璃面板：半透明 + 背景模糊 + 顶部高光描边 */
+  .glass-panel {
+    background: var(--glass-bg);
+    backdrop-filter: blur(var(--glass-blur)) saturate(1.4);
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.4);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--glass-shadow);
+  }
+
+  .glass-panel-strong {
+    background: var(--glass-bg-strong);
+    backdrop-filter: blur(var(--glass-blur)) saturate(1.6);
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.6);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-xl);
+    box-shadow: var(--glass-shadow);
+  }
+
+  /* 楼层渐变背景（页面色底，垫在玻璃后面增强层次） */
+  .app-surface {
+    min-height: 100vh;
+    background:
+      radial-gradient(1200px 600px at 15% -10%, rgba(255, 183, 225, 0.5), transparent 60%),
+      radial-gradient(1000px 500px at 100% 0%, rgba(240, 226, 255, 0.55), transparent 55%),
+      radial-gradient(900px 520px at 50% 110%, rgba(214, 242, 255, 0.5), transparent 55%),
+      var(--bg-primary);
+  }
+
+  /* 二次元渐变文字（樱花粉 → 梦境紫 → 星海青） */
+  .text-gradient {
+    background: linear-gradient(
+      135deg,
+      var(--color-primary),
+      var(--color-secondary),
+      var(--color-accent)
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* 通用入场动画（bubble 弹性） */
+  .animate-bubble-in {
+    animation: bubble-in 260ms var(--ease-spring) both;
+  }
+
+  .animate-fade-up {
+    animation: fade-up 320ms var(--ease-spring) both;
+  }
+
+  /* 优雅二次元滚动条 */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 183, 225, 0.22);
+    border-radius: 9999px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    transition: background 150ms ease-out;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 183, 225, 0.45);
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 183, 225, 0.25) transparent;
+  }
+}
+
+@keyframes bubble-in {
+  from {
+    opacity: 0;
+    transform: scale(0.55);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-bubble-in,
+  .animate-fade-up {
+    animation: none;
+  }
+}

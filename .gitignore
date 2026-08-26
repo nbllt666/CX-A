@@ -1,0 +1,29 @@
+# ===== Agent 元层（不提交） =====
+.trae/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== 数据与配置（含本地密钥 / API Key，绝不提交） =====
+data/
+config.json
+logs/
+*.key
+
+# ===== 前端 =====
+frontend/node_modules/
+frontend/dist/
+
+# ===== 第三方源码（手动克隆 / 管理） =====
+MeloTTS/
+
+# ===== 杂项 =====
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
