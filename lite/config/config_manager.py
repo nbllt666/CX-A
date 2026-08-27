@@ -51,7 +51,9 @@ DEFAULTS = {
     },
     "embedding": {"model": "qwen3-embedding:0.6b", "runtime": "llama.cpp", "device": "cpu"},
     "vector": {"backend": "lancedb", "path": "data/lancedb"},
-    "tts": {"engine": "melotts", "voice": "cx-open"},
+    # device：推理设备开关（"cpu"(默认)/"gpu"）。gpu 时按各引擎能力切 GPU，
+    # CUDA 不可用自动回落 cpu（llama 侧全层卸载、torch 侧 resolve_torch_device）。
+    "tts": {"engine": "melotts", "voice": "cx-open", "device": "cpu"},
     "asr": {"engine": "sensevoice", "device": "cpu"},
     "vad": {"mode": "webrtc"},
     "memory": {"max_memories": 30, "dedup": 0.85, "permanent_threshold": 0.95},

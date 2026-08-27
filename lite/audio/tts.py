@@ -13,6 +13,7 @@ import os
 
 # data/ 目录推导统一收敛到 asr.data_dir（三级 dirname），消除复制漂移。
 from lite.audio.asr import data_dir  # noqa: F401  （re-export 供既有引用使用）
+from lite.audio.asr import resolve_torch_device
 
 __all__ = ["TTSBackend", "MeloTTSBackend", "MockTTSBackend", "LiteTTS", "data_dir"]
 
@@ -55,14 +56,17 @@ class MeloTTSBackend(TTSBackend):
     音色路径映射为 ``data/voices/<voice>``。
     """
 
-    def __init__(self, default_voice="cx-open", voice_dir=""):
+    def __init__(self, default_voice="cx-open", voice_dir="", device="cpu"):
         """初始化后端。
 
         :param default_voice: 默认音色标识，默认 ``cx-open``
         :param voice_dir: 音色根目录；留空时回退 ``data/voices``
+        :param device: 推理设备意图，``"cpu"``(默认)/``"gpu"``/显式 torch 设备串；
+            构造时经 ``resolve_torch_device`` 归一化（gpu 不可用自动回落 cpu）
         """
         self.default_voice = default_voice or "cx-open"
         self.voice_dir = voice_dir or os.path.join(data_dir(), "voices")
+        self.device = resolve_torch_device(device)
         self._TTSType = None
         #: (config_path, ckpt_path) 组合 → 已构建的 TTS 引擎实例。
         #: MeloTTS 构造需加载 BERT/pinyin/声学权重，代价秒级以上，
@@ -91,7 +95,7 @@ class MeloTTSBackend(TTSBackend):
         if engine is None:
             engine = self._TTSType(
                 language="ZH",
-                device="cpu",
+                device=self.device,
                 use_hf=True,
                 config_path=config_path,
                 ckpt_path=ckpt_path,

@@ -91,7 +91,10 @@ def _try_melotts(tts_cfg):
         from melo.api import TTS  # noqa: F401
     except ImportError:
         return None
-    return MeloTTSBackend(default_voice=tts_cfg.get("voice", "cx-open"))
+    return MeloTTSBackend(
+        default_voice=tts_cfg.get("voice", "cx-open"),
+        device=tts_cfg.get("device", "cpu"),
+    )
 
 
 class _LlamaRuntimeJudgeAdapter(ShouldReplyJudge):

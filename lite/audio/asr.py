@@ -12,7 +12,14 @@
 
 import os
 
-__all__ = ["ASRBackend", "SenseVoiceBackend", "MockASRBackend", "LiteASR", "data_dir"]
+__all__ = [
+    "ASRBackend",
+    "SenseVoiceBackend",
+    "MockASRBackend",
+    "LiteASR",
+    "resolve_torch_device",
+    "data_dir",
+]
 
 
 def data_dir():
@@ -25,6 +32,33 @@ def data_dir():
     return os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data"
     )
+
+
+def resolve_torch_device(device="cpu"):
+    """把配置的设备意图归一化为 torch 推理设备串（TTS/ASR 共用）。
+
+    规则（与 llama.cpp 侧 device 键语义统一）：
+    - ``"gpu"``：``torch.cuda.is_available()`` 为真返回 ``"cuda"``；
+      CUDA 不可用或 torch 未安装时打印告警并回落 ``"cpu"``（不崩溃）；
+    - 其余值原样放行（兼容 ``"cpu"`` / ``"cuda:0"`` 等显式 torch 设备串）；
+    - None / 空串回 ``"cpu"``；大小写不敏感。
+    torch 延迟导入——未装 torch 的环境（如当前 3.14 态）构造不报错。
+
+    :param device: 配置设备意图（"cpu"/"gpu"/显式 torch 设备串）
+    :return: str，可直接传给 torch 生态模型构造的设备串
+    """
+    d = str(device or "cpu").strip().lower() or "cpu"
+    if d != "gpu":
+        return d
+    try:
+        import torch
+    except ImportError:
+        print("[WARN] 配置 device=gpu 但 torch 未安装，回落 cpu")
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    print("[WARN] 配置 device=gpu 但 CUDA 不可用，回落 cpu")
+    return "cpu"
 
 
 class ASRBackend:
@@ -50,10 +84,11 @@ class SenseVoiceBackend(ASRBackend):
         """初始化后端。
 
         :param model_path: SenseVoice 模型目录；留空时回退 ``data/`` 下默认路径
-        :param device: 推理设备，默认 ``cpu``
+        :param device: 推理设备意图，``"cpu"``(默认)/``"gpu"``/显式 torch 设备串；
+            构造时经 ``resolve_torch_device`` 归一化（gpu 不可用自动回落 cpu）
         """
         self.model_path = model_path or os.path.join(data_dir(), "SenseVoiceSmall")
-        self.device = device
+        self.device = resolve_torch_device(device)
         self._model = None
         self._loaded = False
 

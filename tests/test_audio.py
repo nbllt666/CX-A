@@ -368,3 +368,84 @@ def test_asr_sensevoice_empty_result_warns_not_silent(capsys):
     out = backend.transcribe(b"\x00\x00")
     assert out == {"text": "", "emotion": "", "event": None}
     assert "ASR" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ #
+# GPU 开关：resolve_torch_device 归一化 + TTS/ASR 后端透传            #
+# ------------------------------------------------------------------ #
+
+def _make_torch(available):
+    """构造 fake torch 模块：``cuda.is_available()`` 返回 available。"""
+    torch_mod = types.ModuleType("torch")
+    cuda_mod = types.ModuleType("torch.cuda")
+    cuda_mod.is_available = lambda: available
+    torch_mod.cuda = cuda_mod
+    return torch_mod
+
+
+def test_resolve_torch_device_passthrough():
+    """None/空 → cpu；显式 torch 串原样放行；大小写不敏感。"""
+    from lite.audio.asr import resolve_torch_device
+
+    assert resolve_torch_device(None) == "cpu"
+    assert resolve_torch_device("") == "cpu"
+    assert resolve_torch_device("cpu") == "cpu"
+    assert resolve_torch_device("CUDA:0") == "cuda:0"
+    assert resolve_torch_device(" CUDA ") == "cuda"
+
+
+def test_resolve_torch_device_gpu_with_cuda(monkeypatch):
+    """gpu 且 CUDA 可用 → cuda。"""
+    from lite.audio.asr import resolve_torch_device
+
+    monkeypatch.setitem(sys.modules, "torch", _make_torch(True))
+    assert resolve_torch_device("GPU") == "cuda"
+
+
+def test_resolve_torch_device_cuda_unavailable_falls_back(monkeypatch, capsys):
+    """gpu 但 CUDA 不可用 → 回落 cpu 并打印告警（不崩溃）。"""
+    from lite.audio.asr import resolve_torch_device
+
+    monkeypatch.setitem(sys.modules, "torch", _make_torch(False))
+    assert resolve_torch_device("gpu") == "cpu"
+    assert "回落" in capsys.readouterr().out
+
+
+def test_resolve_torch_device_no_torch_falls_back(monkeypatch, capsys):
+    """gpu 但 torch 未安装（sys.modules 置 None 模拟 ImportError）→ 回落 cpu。"""
+    from lite.audio.asr import resolve_torch_device
+
+    monkeypatch.setitem(sys.modules, "torch", None)
+    assert resolve_torch_device("gpu") == "cpu"
+    assert "torch" in capsys.readouterr().out
+
+
+def test_sensevoice_backend_device_normalized(monkeypatch):
+    """SenseVoiceBackend 构造即归一化 device：gpu→cuda / 不可用回落 cpu。"""
+    monkeypatch.setitem(sys.modules, "torch", _make_torch(True))
+    assert SenseVoiceBackend(device="gpu").device == "cuda"
+    monkeypatch.setitem(sys.modules, "torch", _make_torch(False))
+    assert SenseVoiceBackend(device="gpu").device == "cpu"
+    assert SenseVoiceBackend(device="cpu").device == "cpu"
+
+
+def test_melotts_backend_device_normalized_and_passed(monkeypatch):
+    """MeloTTSBackend 归一化 device，并把设备透传到 melo.api.TTS 构造。"""
+    recorded = {}
+
+    class _FakeTTS:
+        def __init__(self, language=None, device=None, use_hf=None, config_path=None, ckpt_path=None, **kw):
+            recorded["device"] = device
+
+    fake_api = types.ModuleType("melo.api")
+    fake_api.TTS = _FakeTTS
+    fake_melo = types.ModuleType("melo")
+    fake_melo.api = fake_api
+    monkeypatch.setitem(sys.modules, "melo", fake_melo)
+    monkeypatch.setitem(sys.modules, "melo.api", fake_api)
+    monkeypatch.setitem(sys.modules, "torch", _make_torch(True))
+
+    backend = MeloTTSBackend(device="gpu")
+    assert backend.device == "cuda"
+    backend._get_engine()  # 触发 fake TTS 构造，验证设备透传
+    assert recorded["device"] == "cuda"

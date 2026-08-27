@@ -65,7 +65,7 @@ def test_defaults_values():
         "device": "cpu",
     }
     assert DEFAULTS["vector"] == {"backend": "lancedb", "path": "data/lancedb"}
-    assert DEFAULTS["tts"] == {"engine": "melotts", "voice": "cx-open"}
+    assert DEFAULTS["tts"] == {"engine": "melotts", "voice": "cx-open", "device": "cpu"}
     assert DEFAULTS["asr"] == {"engine": "sensevoice", "device": "cpu"}
     assert DEFAULTS["vad"] == {"mode": "webrtc"}
     assert DEFAULTS["memory"] == {"max_memories": 30, "dedup": 0.85, "permanent_threshold": 0.95}
