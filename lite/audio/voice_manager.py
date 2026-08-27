@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """VoiceManager：自定义音色加载管理器（Task F2）。
 
-对齐工程文档 §12：
-- 默认内置 CX-OPEN 官方音色（``cx-open``）开箱即用；
-- 自定义音色由 CX-O 音频工作站训练后下载至 ``data/voices/<id>/``，
+对齐工程文档 §12（M13 承诺收敛后如实描述）：
+- 默认音色 ``cx-open`` 依赖 MeloTTS 官方模型（首次使用联网自动下载），
+  不承诺"官方音色开箱即用内置"；
+- 自定义音色包放置于 ``data/voices/<id>/``，
   每个子目录即一个音色包，由 MeloTTS 加载。
 
 职责：
@@ -19,7 +20,7 @@ import warnings
 
 from lite.config.config_manager import ConfigManager
 
-#: 默认音色标识（内置 CX-OPEN 官方音色）
+#: 默认音色标识（依赖 MeloTTS 官方模型，首次使用联网自动下载；自定义包放 data/voices/）
 DEFAULT_VOICE_ID = "cx-open"
 
 

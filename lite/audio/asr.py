@@ -18,11 +18,13 @@ __all__ = ["ASRBackend", "SenseVoiceBackend", "MockASRBackend", "LiteASR", "data
 def data_dir():
     """推导本项目 ``data/`` 目录（存放模型 / 音色等资产）。
 
-    本文件位于 ``<root>/lite/audio/asr.py``，逐级向上取两次 dirname 即得
-    ``<root>/data``。路径推导一律基于
+    本文件位于 ``<root>/lite/audio/asr.py``，逐级向上取三次 dirname 即得
+    ``<root>``，再拼接 ``data`` 得 ``<root>/data``。路径推导一律基于
     ``os.path.dirname(os.path.abspath(__file__))``，禁止相对路径。
     """
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data"
+    )
 
 
 class ASRBackend:

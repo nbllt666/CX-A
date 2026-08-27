@@ -6,11 +6,14 @@
 - LiteASR：Mock backend 透传；SenseVoice 未装时代理 import backend 报错路径
 - LiteTTS：Mock backend 合成已知字节；默认 voice=cx-open 生效；melotts 未装报错路径
 - build_default_pipeline：无三方库回退 mock 并打印 warning
+- 工厂 judge 接线（H4）：未配置默认态 None；enabled+runtime 可用为委托包装实例；
+  加载失败回退 HeuristicJudge
 """
 
 import math
 import struct
 import sys
+import types
 
 import pytest
 
@@ -22,6 +25,8 @@ from lite.audio import (
     MockTTSBackend,
     SenseVoiceBackend,
     MeloTTSBackend,
+    ShouldReplyJudge,
+    HeuristicJudge,
     build_default_pipeline,
 )
 
@@ -179,3 +184,82 @@ def test_factory_falls_back_to_mock(monkeypatch, capsys):
     assert isinstance(pipe["asr"].backend, MockASRBackend)
     assert isinstance(pipe["tts"].backend, MockTTSBackend)
     assert "回退" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ #
+# 5. 工厂 judge 接线（H4）                                            #
+# ------------------------------------------------------------------ #
+
+def test_factory_includes_judge_key_disabled_by_default():
+    """local_llm 未配置时 judge 键存在且为默认态 None（既有行为不变）。"""
+    cfg = {"asr": {"device": "cpu"}, "tts": {}, "vad": {}}
+    pipe = build_default_pipeline(cfg)
+    assert "judge" in pipe
+    assert pipe["judge"] is None
+
+
+def test_factory_judge_enabled_with_runtime(monkeypatch):
+    """enabled=True 且 runtime 可用（fake LlamaRuntime 注入）时 judge 为
+    包装实例且委托 judge_should_reply 生效。"""
+
+    class FakeRuntime:
+        """可判定的 fake LlamaRuntime：load 恒成功，判定按前缀返回。"""
+
+        def __init__(self, config=None):
+            self.config = config
+
+        def load_local_llm(self, path):
+            return True
+
+        def judge_should_reply(self, text):
+            return str(text).startswith("帮我")
+
+    fake_mod = types.ModuleType("lite.runtime.llama_runtime")
+    fake_mod.LlamaRuntime = FakeRuntime
+    monkeypatch.setitem(sys.modules, "lite.runtime.llama_runtime", fake_mod)
+
+    cfg = {"local_llm": {"enabled": True, "model_path": "D:/models/fake.gguf"}}
+    pipe = build_default_pipeline(cfg)
+
+    judge = pipe["judge"]
+    assert isinstance(judge, ShouldReplyJudge)   # 包装实例符合契约
+    assert judge.model_ready is True
+    assert judge.judge("帮我带杯咖啡") is True    # 委托 fake runtime 判定
+    assert judge.judge("随便看看") is False
+
+
+def test_factory_judge_enabled_load_failure_falls_back(monkeypatch, capsys):
+    """模型加载失败（load_local_llm 返回 False）时打 warning 并回退 HeuristicJudge。"""
+
+    class DeadRuntime:
+        """加载恒失败的 fake LlamaRuntime。"""
+
+        def __init__(self, config=None):
+            self.warnings = ["GGUF 文件不存在"]
+
+        def load_local_llm(self, path):
+            return False
+
+    fake_mod = types.ModuleType("lite.runtime.llama_runtime")
+    fake_mod.LlamaRuntime = DeadRuntime
+    monkeypatch.setitem(sys.modules, "lite.runtime.llama_runtime", fake_mod)
+
+    cfg = {"local_llm": {"enabled": True, "model_path": "D:/missing/model.gguf"}}
+    pipe = build_default_pipeline(cfg)
+
+    assert isinstance(pipe["judge"], HeuristicJudge)
+    assert "接线失败" in capsys.readouterr().out
+
+
+def test_factory_judge_real_missing_model_falls_back():
+    """真机冒烟：未装 llama-cpp / 模型文件缺失 → 延迟导入链不炸、回退 HeuristicJudge。"""
+    cfg = {"local_llm": {"enabled": True, "model_path": "Z:/definitely-missing/x.gguf"}}
+    pipe = build_default_pipeline(cfg)
+    assert isinstance(pipe["judge"], HeuristicJudge)
+
+
+def test_factory_judge_enabled_without_model_path_stays_none():
+    """enabled=True 但未配置 model_path：无法接线，保持默认态 None。"""
+    cfg = {"local_llm": {"enabled": True}}
+    pipe = build_default_pipeline(cfg)
+    assert pipe["judge"] is None

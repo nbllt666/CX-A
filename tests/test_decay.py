@@ -102,6 +102,24 @@ def test_high_importance_immune_to_decay(calc):
     assert s == pytest.approx(1.0)
 
 
+# ---------------------------------------------------------------- 阈值注入（M5 接线）
+def test_permanent_importance_threshold_injection():
+    """DecayCalculator 构造参数可注入免疫衰减阈值；默认行为不变（0.95）。"""
+    calc_default = DecayCalculator()
+    # 默认阈值不变：0.94 < 0.95，长时间后随时间衰减（不为 1.0）
+    s_default = calc_default.score(importance=0.94, age_seconds=500 * DAY, decay_type="two_stage")
+    assert s_default < 1.0
+
+    # 注入自定义阈值 0.50 后：0.55 >= 0.50 触发免疫衰减恒为 1.0，
+    # 同一输入在默认阈值下则正常衰减——行为随构造参数变化
+    calc_custom = DecayCalculator(permanent_importance_threshold=0.50)
+    assert calc_custom.permanent_importance_threshold == pytest.approx(0.5)
+    s_custom = calc_custom.score(importance=0.55, age_seconds=500 * DAY, decay_type="two_stage")
+    s_default_low = calc_default.score(importance=0.55, age_seconds=500 * DAY, decay_type="two_stage")
+    assert s_custom == pytest.approx(1.0)
+    assert s_default_low < 1.0
+
+
 # ---------------------------------------------------------------- 参数对齐 CX-O
 def test_params_aligned_with_cxo():
     """对齐 CX-O 默认参数：双阶段 α=0.6/λ1=0.25/λ2=0.04；艾宾浩斯 T50=30/k=2。"""

@@ -7,6 +7,7 @@ health、空列表、add 后列表可查、search 可返回、delete 后列表�
 """
 
 import json
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -248,3 +249,143 @@ def test_chat_endpoints_guard(api_server):
     assert status2 == 200
     assert body2["error"] == "chat_service_disabled"
     assert body2["messages"] == []
+
+
+# ---------------------------------------------------------------- 安全加固（20260827_模块0_API服务安全加固）
+def raw_request(port, method, path, host=None):
+    """发送裸 HTTP 请求（绕过 urllib 自动补头），返回完整响应原文。
+
+    仅用于 Host 伪造场景：urllib 无法可靠覆盖自动生成的 Host 头，
+    故用 socket 直连以精确控制请求行与头字段。
+    """
+    headers = {
+        "Host": host if host is not None else f"127.0.0.1:{port}",
+        "Connection": "close",
+    }
+    head = "\r\n".join([f"{method} {path} HTTP/1.0"] + [f"{k}: {v}" for k, v in headers.items()])
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+        sock.sendall((head + "\r\n\r\n").encode("ascii"))
+        chunks = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def test_options_preflight_204_with_cors_headers(api_server):
+    """do_OPTIONS：允许源预检返回 204，并附带放行 CORS 头集合。"""
+    _store, _pipeline, base = api_server
+    req = urllib.request.Request(
+        f"{base}/api/health",
+        method="OPTIONS",
+        headers={"Origin": "http://localhost:5173"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 204
+        assert resp.read() == b""  # 空 body（Content-Length: 0）
+        assert resp.headers.get("Access-Control-Allow-Origin") == "http://localhost:5173"
+        assert resp.headers.get("Access-Control-Allow-Methods") == "GET, POST, PUT, DELETE, OPTIONS"
+        assert resp.headers.get("Access-Control-Allow-Headers") == "Content-Type"
+
+
+def test_cors_headers_echo_allowlisted_origin_only(api_server):
+    """JSON 响应仅对白名单 Origin 回显 ACAO；非白名单 Origin 不带任何 Access-Control 头。"""
+    _store, _pipeline, base = api_server
+    req = urllib.request.Request(
+        f"{base}/api/health", headers={"Origin": "http://127.0.0.1:5173"}
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 200
+        assert resp.headers.get("Access-Control-Allow-Origin") == "http://127.0.0.1:5173"
+
+    req2 = urllib.request.Request(
+        f"{base}/api/health", headers={"Origin": "http://evil.example.com"}
+    )
+    with urllib.request.urlopen(req2, timeout=5) as resp2:
+        assert resp2.status == 200
+        assert resp2.headers.get("Access-Control-Allow-Origin") is None
+
+
+def test_bad_host_returns_403(api_server):
+    """Host 不指向本服务（DNS rebinding 形态）→ 403 结构化响应。"""
+    _store, _pipeline, base = api_server
+    port = int(base.rsplit(":", 1)[1])
+    raw = raw_request(port, "GET", "/api/health", host="evil.example.com:8600")
+    first_line = raw.split("\r\n", 1)[0]
+    assert first_line.startswith("HTTP/")
+    assert "403" in first_line
+
+
+def test_settings_invalid_section_type_400(api_server):
+    """PUT /api/settings 段存在但非 dict（{"cloud": "x"}）→ 400 结构化错误而非 AttributeError 冒泡。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/settings", {"cloud": "x"}, method="PUT")
+    assert status == 400
+    assert body["error"] == "invalid section type: cloud"
+
+
+def test_delete_memory_huge_id_returns_structured_500(api_server):
+    """超大数字 id 触发 sqlite OverflowError 时兜底为结构化 500（而非连接中断）。"""
+    _store, _pipeline, base = api_server
+    huge_id = "9" * 30
+    status, body = http_delete(f"{base}/api/memories/{huge_id}")
+    assert status == 500
+    assert body["error"] == "internal error"
+    assert isinstance(body.get("detail"), str)
+    assert len(body["detail"]) <= 200
+
+
+def test_post_wrong_content_type_400(api_server):
+    """POST 带 body 但 Content-Type 非 application/json（urllib 默认表单类型）→ 400。"""
+    _store, _pipeline, base = api_server
+    req = urllib.request.Request(
+        f"{base}/api/computer/authorize",
+        data=json.dumps({"enabled": True}).encode("utf-8"),
+        method="POST",  # 不设置 Content-Type，urllib 自动补 application/x-www-form-urlencoded
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    assert status == 400
+
+
+# ---------------------------------------------------------------- M5 config.memory 装配接线
+def test_create_app_wires_memory_config(tmp_path):
+    """create_app 按 data_dir 下 config.json 的 memory 段装配 pipeline/manager 行为。"""
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    cfg = {"memory": {"max_memories": 2, "dedup": 0.5, "permanent_threshold": 0.6}}
+    (cfg_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    store, pipeline, _handler = create_app(data_dir=str(cfg_dir))
+
+    # 配置注入生效（非默认值 30/0.85/0.95）
+    assert pipeline.max_memories == 2
+    assert pipeline.manager.dedup_threshold == pytest.approx(0.5)
+    assert pipeline.manager._permanent_threshold == pytest.approx(0.6)
+
+    # 行为随之变化（dedup=0.5）：两句 Jaccard≈4/6≈0.667，默认阈值下各自入库，
+    # 自定义阈值下第二条在写入口即被去重
+    first = pipeline.add("alpha beta gamma delta epsilon")
+    second = pipeline.add("alpha beta gamma delta zeta")
+    assert first is not None
+    assert second is None
+
+    # 行为随之变化（permanent_threshold=0.6）：importance_score=0.62 的记忆可直晋永久
+    mid = store.add({"type": "long_term", "content": "custom permanent wiring check"})
+    store.update(mid, {"importance_score": 0.62})
+    promoted = pipeline.manager.promote(mid)
+    assert promoted["type"] == "permanent"
+
+
+def test_create_app_default_memory_config_unchanged(tmp_path):
+    """config.json 未提供 memory 段时装配结果保持默认行为（30/0.85/0.95）。"""
+    store, pipeline, _handler = create_app(data_dir=str(tmp_path))
+    assert pipeline.max_memories == 30
+    assert pipeline.manager.dedup_threshold == pytest.approx(0.85)
+    assert pipeline.manager._permanent_threshold == pytest.approx(0.95)
+    assert len(store.list()) == 0

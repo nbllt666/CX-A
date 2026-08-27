@@ -243,6 +243,13 @@ class BuiltinToolRegistry:
                             "error": "电脑控制未授权",
                             "result": None,
                         }
+                    # b0) 授权状态同步（MU2）：authorizer 自 security_state.json 恢复
+                    #     的授权态需传导到 computer 内部闸门；方向约束——仅当
+                    #     authorizer 已开启（上方 is_authorized 通过）才同步 True，
+                    #     不得反向令未授权状态放行任何本机动作。
+                    sync_authorized = getattr(self.computer, "set_authorized", None)
+                    if callable(sync_authorized):
+                        sync_authorized(True)
                     # b) 高危指令二次确认（指令类工具）
                     if tool_id == TOOL_COMMAND:
                         command = str((arguments or {}).get("command") or "")

@@ -82,6 +82,25 @@ export async function requestJson<T>(url: string, init?: RequestInit): Promise<T
   return res.json() as Promise<T>;
 }
 
+/** 聊天发送请求体 */
+export interface ChatSendPayload {
+  content: string;
+}
+
+/**
+ * 发送一条聊天消息到后端 POST /api/chat/messages。
+ * 当前该端点为「未启用守卫」占位实现或可能不可达：
+ * - 网络失败 / 非 2xx → 抛错，由调用方 catch 后降级为「未送达」提示；
+ * - 守卫端点返回占位 JSON → 上层校验响应形状决定展示，绝不伪造回复文本。
+ */
+export async function sendMessage(payload: ChatSendPayload): Promise<unknown> {
+  return requestJson<unknown>(API_ENDPOINTS.chat.sendMessage, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
 /** 拉取记忆列表（可附带 type / agent_id / limit 过滤）。 */
 export async function fetchMemories(params?: {
   type?: string;

@@ -34,6 +34,18 @@ DEFAULT_LLM_N_CTX = 2048
 #: 离线对话时拼接进提示词的最大历史消息条数
 DEFAULT_CHAT_WINDOW = 6
 
+#: offline_chat 单次生成的最大 token 数
+OFFLINE_CHAT_MAX_TOKENS = 128
+
+#: 「是否回复」判定单次生成的最大 token 数
+JUDGE_MAX_TOKENS = 8
+
+#: n_ctx 预算中为响应/安全保留的余量 token 数（M11 溢出防护）
+N_CTX_RESERVE_TOKENS = 64
+
+#: prompt 长度估算比例：约 4 字符 ≈ 1 token
+_CHARS_PER_TOKEN = 4
+
 #: 「是否回复」判定提示词（中文，要求只答 是/否）
 JUDGE_PROMPT_TEMPLATE = (
     "你是本助手的「是否应当回复」判定器。\n"
@@ -97,6 +109,13 @@ class LlamaRuntime:
         self._llm_enabled = bool(self._read_cfg(config, "local_llm", "enabled", False))
         #: 本地小 LLM 模型文件路径
         self._llm_path = self._read_cfg(config, "local_llm", "model_path", "") or ""
+        #: 本地小 LLM 上下文窗口（可选 n_ctx 覆盖键，缺省 DEFAULT_LLM_N_CTX；非法值回退默认）
+        raw_n_ctx = self._read_cfg(config, "local_llm", "n_ctx", None)
+        try:
+            parsed_n_ctx = int(raw_n_ctx)
+        except (TypeError, ValueError):
+            parsed_n_ctx = DEFAULT_LLM_N_CTX
+        self._n_ctx = parsed_n_ctx if parsed_n_ctx > 0 else DEFAULT_LLM_N_CTX
 
         #: 已加载的嵌入模型实例（Llama），未加载为 None
         self._emb_model = None
@@ -248,7 +267,7 @@ class LlamaRuntime:
             return self._record_load_failure("llm", f"本地小 LLM 文件不存在：{path}（配置意向：{self._llm_path}）")
         llama_cls = _import_llama()  # 导入失败抛 RuntimeError（提示安装）
         try:
-            self._llm = llama_cls(model_path=path, embedding=False, n_ctx=DEFAULT_LLM_N_CTX)
+            self._llm = llama_cls(model_path=path, embedding=False, n_ctx=self._n_ctx)
         except Exception as exc:  # noqa: BLE001 - 加载异常按降级处理，不崩溃
             self._llm = None
             return self._record_load_failure("llm", f"本地小 LLM 加载失败：{exc}")
@@ -293,6 +312,64 @@ class LlamaRuntime:
     # 本地小 LLM：判定 + 离线兜底                                        #
     # ------------------------------------------------------------------ #
 
+    def _max_prompt_chars(self, max_tokens):
+        """按 4 chars≈1token 估算的 prompt 字符预算。
+
+        预算公式：``(n_ctx - max_tokens - 64余量) * 4``；保证至少留出可用空间。
+        """
+        usable = int(self._n_ctx) - int(max_tokens) - N_CTX_RESERVE_TOKENS
+        return max(int(usable), 1) * _CHARS_PER_TOKEN
+
+    def _fit_prompt(self, prompt, max_tokens, messages=None):
+        """投递前的 n_ctx 溢出防护（M11）。
+
+        规则：
+        - 按 ``4 chars ≈ 1 token`` 估算，预算 = ``(n_ctx - max_tokens - 64余量) * 4``；
+        - 未超限原样返回；
+        - 超限且提供 ``messages``：按**消息列表**从最旧侧删减重建
+          （保底全部 system 行 + 最近一轮），重建后仍未落地则继续行级兜底；
+        - 行级兜底：拆行后保护头部连续 ``system`` 行，从最旧侧删减、最近一行恒留，
+          重算仍超限（单条/system 即爆）则硬截断 prompt 尾部到预算内。
+
+        :param prompt: 待投递的提示词文本
+        :param max_tokens: 本次生成的最大 token 数（用于预算计算）
+        :param messages: 生成 ``prompt`` 的原始消息列表（可选）；提供时启用消息级删减
+        :return: 裁剪后的提示词（长度 <= 预算）
+        """
+        prompt = str(prompt)
+        limit = self._max_prompt_chars(max_tokens)
+        if len(prompt) <= limit:
+            return prompt
+
+        if messages:
+            # 消息级删减重建：保底 system 行 + 最近一轮（绕开 chat_window 造成的截断）
+            system_msgs = [
+                m for m in messages
+                if isinstance(m, dict) and m.get("role") == "system"
+            ]
+            recent = messages[-1] if messages else None
+            if isinstance(recent, dict) and all(recent is not m for m in system_msgs):
+                system_msgs.append(recent)
+            rebuilt = self._format_messages(system_msgs)
+            if len(rebuilt) <= limit:
+                return rebuilt
+            prompt = rebuilt  # 仍超限 -> 继续行级兜底
+
+        lines = prompt.split("\n")
+        # 保护头部连续 system 行（_format_messages / 判定模板均以 system 开头）
+        header = []
+        idx = 0
+        while idx < len(lines) - 1 and lines[idx].startswith("system"):
+            header.append(lines[idx])
+            idx += 1
+        body = lines[idx:]
+        while len(body) > 1 and len("\n".join(header + body)) > limit:
+            body.pop(0)  # 从最旧侧删减；body[-1]（最近一轮）恒保留
+        fitted = "\n".join(header + body)
+        if len(fitted) > limit:
+            fitted = fitted[:limit]  # 硬截断尾部兜底
+        return fitted
+
     def judge_should_reply(self, user_text) -> bool:
         """本地小 LLM 判定：用户是否在对本助手说话、是否应当回复。
 
@@ -309,7 +386,8 @@ class LlamaRuntime:
         if not self._llm_ready or self._llm is None:
             raise LlamaNotReady("本地小 LLM 未就绪：请先调用 load_local_llm 加载模型后再进行「是否回复」判定。")
         prompt = JUDGE_PROMPT_TEMPLATE.format(user_text=str(user_text).strip() or "（空输入）")
-        result = self._llm(prompt, max_tokens=8, temperature=0.0)
+        prompt = self._fit_prompt(prompt, JUDGE_MAX_TOKENS)
+        result = self._llm(prompt, max_tokens=JUDGE_MAX_TOKENS, temperature=0.0)
         return self._parse_yes(self._extract_text(result))
 
     def offline_chat(self, messages) -> str:
@@ -325,8 +403,10 @@ class LlamaRuntime:
         """
         if not self._llm_ready or self._llm is None:
             raise LlamaNotReady("本地小 LLM 未就绪：请先调用 load_local_llm 加载模型后再进行离线对话。")
-        prompt = self._format_messages(messages)
-        result = self._llm(prompt, max_tokens=128)
+        prompt = self._fit_prompt(
+            self._format_messages(messages), OFFLINE_CHAT_MAX_TOKENS, messages=messages
+        )
+        result = self._llm(prompt, max_tokens=OFFLINE_CHAT_MAX_TOKENS)
         return self._extract_text(result).strip()
 
 

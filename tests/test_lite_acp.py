@@ -13,7 +13,9 @@
 
 import json
 import os
+import socket
 import tempfile
+import time
 
 import pytest
 
@@ -264,9 +266,89 @@ def test_lan_discovery_disabled_raises():
 
 
 def test_lan_discovery_enabled_returns_list():
-    """lan_discovery=True 时 discover_lan 返回列表（无网络一般为空，不报错）。"""
+    """lan_discovery=True 时 discover_lan 返回列表（确定性注入 stub，无真实网络）。"""
+    stub = _StubDiscovery()
     acp = LiteACP(config=_config(lan_discovery=True))
-    assert isinstance(acp.discover_lan(timeout=0), list)
+    agents = acp.discover_lan(timeout=0, discovery_factory=lambda: stub)
+    assert isinstance(agents, list)
+
+
+class _StubDiscovery:
+    """discover_lan 的确定性注入桩：预填 found_agents，记录 start/broadcast/stop。"""
+
+    def __init__(self, prefill=None):
+        self.found_agents = list(prefill or [])
+        self.started = False
+        self.stopped = False
+        self.broadcast_calls = []
+        self.start_port = None
+
+    def start(self, port=9999):
+        self.started = True
+        self.start_port = port
+
+    def broadcast_presence(self, *args, **kwargs):
+        self.broadcast_calls.append((args, kwargs))
+
+    def stop(self):
+        self.stopped = True
+
+
+def test_discover_lan_broadcasts_collects_and_stops():
+    """M3：discover_lan 启动后广播一次、分片等待收集、最终 stop 清理并剔除自身信标。"""
+    other = ({"agent_id": "node-a", "host": "192.168.1.20", "port": 9000}, ("192.168.1.20", 9000))
+    myself = ({"agent_id": "cxa-agent-001", "host": "192.168.1.9", "port": 9999}, ("192.168.1.9", 9999))
+    stub = _StubDiscovery(prefill=[myself, other])
+    acp = LiteACP(config=_config(lan_discovery=True))  # agent_id 默认 cxa-agent-001
+
+    agents = acp.discover_lan(timeout=0.1, discovery_factory=lambda: stub)
+
+    # 自身信标被剔除，仅保留外部节点
+    assert [a["agent_id"] for a in agents] == ["node-a"]
+    # 生命周期：启动 port=9999、广播恰一次、结束 stop 清理
+    assert stub.started and stub.start_port == 9999
+    assert len(stub.broadcast_calls) == 1
+    args, kwargs = stub.broadcast_calls[0]
+    assert args[0] == "cxa-agent-001"
+    assert stub.stopped
+
+
+class _FakeSocket:
+    """可编排收包的 fake UDP socket：bind/settimeout/recvfrom/sendto 全覆盖。"""
+
+    def __init__(self):
+        self.sent = []
+        self.closed = False
+        self.bound = None
+        self.timeout_set = None
+        self._queue = []
+
+    def setsockopt(self, *args):
+        pass
+
+    def bind(self, addr):
+        self.bound = addr
+
+    def settimeout(self, value):
+        self.timeout_set = value
+
+    def sendto(self, data, addr):
+        self.sent.append((data, addr))
+
+    def close(self):
+        self.closed = True
+
+    def recvfrom(self, _bufsize):
+        # 从队列短轮询取包；无包则快速超时，避免测试线程长时间阻塞
+        deadline = time.monotonic() + 0.05
+        while time.monotonic() < deadline:
+            if self._queue:
+                return self._queue.pop(0)
+            time.sleep(0.005)
+        raise socket.timeout("no packet")
+
+    def queue_packet(self, data, addr):
+        self._queue.append((data, addr))
 
 
 def test_group_disabled_raises():
@@ -331,21 +413,6 @@ def test_discovery_parse_invalid_packet():
     assert d.found_agents == []
 
 
-class _FakeSocket:
-    def __init__(self):
-        self.sent = []
-        self.closed = False
-
-    def setsockopt(self, *args):
-        pass
-
-    def sendto(self, data, addr):
-        self.sent.append((data, addr))
-
-    def close(self):
-        self.closed = True
-
-
 def test_discovery_start_stop_with_fake_socket():
     """start/stop 以注入 fake socket 完成生命周期。"""
     d = LiteLanDiscovery(socket_factory=lambda *a, **k: _FakeSocket())
@@ -353,6 +420,21 @@ def test_discovery_start_stop_with_fake_socket():
     assert d._running
     d.stop()
     assert not d._running
+
+
+def test_discovery_start_binds_wildcard_and_starts_recv_thread():
+    """M3：start 后 bind ("0.0.0.0", port) 且后台接收线程存活、stop 后线程回收。"""
+    d = LiteLanDiscovery(socket_factory=lambda *a, **k: _FakeSocket())
+    d.start(port=12345)
+    try:
+        assert d._socket.bound == ("0.0.0.0", 12345)
+        assert d._recv_thread is not None and d._recv_thread.is_alive()
+    finally:
+        d.stop()
+    assert d._recv_thread is None or not d._recv_thread.is_alive()
+    # stop 幂等 + close 别名可用
+    d.stop()
+    d.close()
 
 
 def test_discovery_broadcast_presence():
@@ -380,6 +462,35 @@ def test_discovery_broadcast_not_started_raises():
     d = LiteLanDiscovery()
     with pytest.raises(AcpDiscoveryError):
         d.broadcast_presence("me")
+
+
+def test_discovery_recv_loop_delivers_packets_to_found_agents():
+    """M3 端到端（确定性注入）：后台线程收包 -> parse_packet 命中登记 found_agents。"""
+    fake = _FakeSocket()
+    d = LiteLanDiscovery(socket_factory=lambda *a, **k: fake)
+    beacon = json.dumps({
+        "type": "ACP_BEACON",
+        "agent_id": "node-x",
+        "agent_name": "nx",
+        "port": 9000,
+        "capabilities": ["chat"],
+    }).encode("utf-8")
+    d.start(port=9999)
+    thread = d._recv_thread
+    try:
+        fake.queue_packet(beacon, ("192.168.1.66", 5566))
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not d.found_agents:
+            time.sleep(0.02)
+        assert len(d.found_agents) == 1
+        agent, addr = d.found_agents[0]
+        assert agent["agent_id"] == "node-x"
+        assert agent["host"] == "192.168.1.66"
+        assert addr == ("192.168.1.66", 5566)
+    finally:
+        d.stop()
+    # 线程已被哨兵+join 干净回收
+    assert thread is not None and not thread.is_alive()
 
 
 # ------------------------------------------------------------------ #

@@ -33,10 +33,23 @@ import time
 from typing import Callable, Iterator, List, Optional
 
 from lite.cloud.adapter import CloudAdapter, CloudUnavailableError
-from lite.runtime.llama_runtime import LlamaNotReady, LlamaRuntime
 
 #: 离线提示文案（工程文档 §10.2 与 checklist 验收口径一致）
 OFFLINE_PROMPT = "当前离线，开启本地模式可继续对话"
+
+
+def _llama_runtime_types():
+    """惰性解析 LlamaRuntime / LlamaNotReady 类型（避免 fallback <-> runtime 循环导入）。
+
+    运行期仅在需要类型注解 / 异常判断时才导入；导入失败返回 ``(None, RuntimeError)`` 兜底，
+    保证本模块在 runtime 子包尚未完成初始化时也可被加载。
+    """
+    try:
+        from lite.runtime.llama_runtime import LlamaNotReady, LlamaRuntime
+
+        return LlamaRuntime, LlamaNotReady
+    except Exception:  # noqa: BLE001 - 循环导入兜底
+        return None, RuntimeError
 
 #: 有效模式集合（状态机仅允许 "cloud" / "local" 二值）
 _VALID_MODES = ("cloud", "local")
@@ -66,7 +79,7 @@ class OfflineFallbackManager:
     def __init__(
         self,
         cloud: CloudAdapter,
-        local_llm: Optional[LlamaRuntime] = None,
+        local_llm=None,
         config=None,
         online_probe_interval: float = 30.0,
         online_check: Optional[OnlineCheck] = None,

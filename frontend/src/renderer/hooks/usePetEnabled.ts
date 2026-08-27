@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { openPetOverlay, closePetOverlay } from '../bridge';
 
 /**
  * 桌宠开关持久化 key：PetPage 与 SettingsPage 共享同一 local storage 键，
@@ -17,7 +18,12 @@ function readStoredEnabled(): boolean {
 
 /**
  * 桌宠开关 Hook（默认关闭，轻量优先）。
- * 读取 / 写入 `cx-a.petEnabled`，并监听跨窗口 storage 事件保持同步。
+ *
+ * 职责：
+ * - 读取 / 写入 `cx-a.petEnabled` 并监听跨窗口 storage 事件保持同步；
+ * - Electron 环境下开关联动透明悬浮窗生命周期：开启 → IPC 打开悬浮窗，
+ *   关闭 → IPC 关闭悬浮窗（开后必有窗、关后必无窗）；纯浏览器预览下
+ *   桥调用自动降级为 no-op，行为与旧版一致。
  */
 export function usePetEnabled() {
   const [enabled, setEnabledState] = useState<boolean>(readStoredEnabled);
@@ -29,6 +35,10 @@ export function usePetEnabled() {
     } catch {
       /* 存储不可用（隐私模式等）时静默忽略 */
     }
+    // Electron 下经桥开关悬浮窗；桥内部已处理非 Electron 环境（返回 false）
+    void (next ? openPetOverlay() : closePetOverlay()).catch(() => {
+      /* IPC 异常时静默：下次操作自然重试 */
+    });
   }, []);
 
   // 跨窗口同步：Electron 悬浮窗 / 多窗口修改该 key 时跟随刷新

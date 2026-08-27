@@ -14,12 +14,16 @@ export default defineConfig({
     },
   },
   build: {
-    // 只构建 renderer（index.html 入口）；main/preload 由 electron 直接运行，不参与打包。
+    // 构建 renderer 双入口：index.html（主界面）+ pet-overlay.html（桌宠透明悬浮窗）；
+    // electron 主进程文件不参与打包，由 electron 直接运行。
     outDir: 'dist',
     emptyOutDir: true,
     target: 'chrome120',
     rollupOptions: {
-      input: fileURLToPath(new URL('./index.html', import.meta.url)),
+      input: {
+        main: fileURLToPath(new URL('./index.html', import.meta.url)),
+        'pet-overlay': fileURLToPath(new URL('./pet-overlay.html', import.meta.url)),
+      },
     },
   },
   server: {

@@ -4,23 +4,17 @@
 对齐工程文档 §7.3：``synthesize(text, voice="cx-open") -> bytes``（wav/pcm 音频字节）。
 - ``TTSBackend``：抽象基类，定义统一合成契约。
 - ``MeloTTSBackend``：可选导入 melotts 的官方后端；melotts 未安装时抛
-  ``RuntimeError``（提示 pip install melotts），voice 映射指向 ``data/voices/``。
+  ``RuntimeError``（附准确安装指引），音色目录统一推导自 ``data/voices/<voice>``；
+  默认音色 ``cx-open`` 依赖 MeloTTS 官方模型（首次使用联网自动下载）。
 - ``MockTTSBackend``：测试用后端，返回已知字节。
 """
 
 import os
 
+# data/ 目录推导统一收敛到 asr.data_dir（三级 dirname），消除复制漂移。
+from lite.audio.asr import data_dir  # noqa: F401  （re-export 供既有引用使用）
+
 __all__ = ["TTSBackend", "MeloTTSBackend", "MockTTSBackend", "LiteTTS", "data_dir"]
-
-
-def data_dir():
-    """推导本项目 ``data/`` 目录（存放模型 / 音色等资产）。
-
-    本文件位于 ``<root>/lite/audio/tts.py``，逐级向上取两次 dirname 即得
-    ``<root>/data``。路径推导一律基于
-    ``os.path.dirname(os.path.abspath(__file__))``，禁止相对路径。
-    """
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
 
 class TTSBackend:
@@ -52,30 +46,44 @@ class MeloTTSBackend(TTSBackend):
         """
         self.default_voice = default_voice or "cx-open"
         self.voice_dir = voice_dir or os.path.join(data_dir(), "voices")
-        #: voice 标识 → 音色模型目录映射（默认 cx-open 指向 data/voices/cx-open）
-        self._voice_map = {}
-        self._engine = None
+        self._TTSType = None
+        #: (config_path, ckpt_path) 组合 → 已构建的 TTS 引擎实例。
+        #: MeloTTS 构造需加载 BERT/pinyin/声学权重，代价秒级以上，
+        #: 必须按音色配置组合缓存复用，禁止每次合成重建。
+        self._engines = {}
 
-    def _ensure_engine(self):
-        """惰性加载 MeloTTS 引擎；未安装时抛 RuntimeError。"""
-        if self._engine is not None:
+    def _ensure_lib(self):
+        """校验 MeloTTS 库可导入；未安装时抛 RuntimeError（附准确安装指引）。"""
+        if self._TTSType is not None:
             return
         try:
             # 官方 PyPI 分发名为 bettamelo/melotts，但模块导入语是 melo（包名 melo.api）
-            from melo.api import TTS  # noqa: F401
+            from melo.api import TTS
         except ImportError as exc:
             raise RuntimeError(
-                "MeloTTSBackend 需要 MeloTTS 库，请安装：pip install C:\\CX-A\\MeloTTS，"
-                "并将音色放置到 data/voices/"
+                "需要 MeloTTS 库：pip install -e <MeloTTS源码目录>（含 melo.api 模块），"
+                "并将自定义音色放置到 <项目>/data/voices/"
             ) from exc
         self._TTSType = TTS
-        self._engine = True
+
+    def _get_engine(self, config_path=None, ckpt_path=None):
+        """取（或惰性构建并缓存）某音色配置组合对应的 TTS 引擎实例。"""
+        self._ensure_lib()
+        key = (config_path or "", ckpt_path or "")
+        engine = self._engines.get(key)
+        if engine is None:
+            engine = self._TTSType(
+                language="ZH",
+                device="cpu",
+                use_hf=True,
+                config_path=config_path,
+                ckpt_path=ckpt_path,
+            )
+            self._engines[key] = engine
+        return engine
 
     def _voice_path(self, voice):
-        """推导某音色的模型目录路径：``data/voices/<voice>``。"""
-        mapped = self._voice_map.get(voice)
-        if mapped:
-            return mapped
+        """推导某音色的模型目录路径：``data/voices/<voice>``（M13：删除永不填充的 _voice_map 死分支）。"""
         return os.path.join(self.voice_dir, voice)
 
     def synthesize(self, text, voice=None):
@@ -88,15 +96,12 @@ class MeloTTSBackend(TTSBackend):
         - ``tts_to_file(..., output_path=None)`` 返回 float32 音频数组，
           此处封装为 16-bit PCM WAV 字节并返回。
         """
-        self._ensure_engine()
+        self._ensure_lib()
         _voice = voice or self.default_voice
         _voice_path = self._voice_path(_voice)
         cfg = os.path.join(_voice_path, "config.json")
         ckpt = os.path.join(_voice_path, "ckpt.txt")  # 训练产物常见名；视后端而定
-        tts = self._TTSType(
-            language="ZH",
-            device="cpu",
-            use_hf=True,
+        tts = self._get_engine(
             config_path=cfg if os.path.exists(cfg) else None,
             ckpt_path=ckpt if os.path.exists(ckpt) else None,
         )

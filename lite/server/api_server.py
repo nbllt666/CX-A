@@ -45,6 +45,18 @@ CHAT_SERVICE_DISABLED = "chat_service_disabled"
 # 云端 provider 白名单（与 lite/cloud/adapter.py 支持的 provider 对齐）
 CLOUD_PROVIDER_ALLOWLIST = ("deepseek", "tongyi", "openai", "moonshot")
 
+# CSRF/CORS 加固：受信任的跨源 Origin 白名单。
+# "null" 是 Electron 生产态（file:// 页面）发出的 Origin 字面量；
+# 不使用通配符 *，未命中白名单的一律不返回 CORS 头（浏览器侧即被同源策略拦截）。
+_ALLOWED_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173", "null")
+
+# 防 DNS rebinding：Host 必须指向服务自身。生产默认端口 8600 精确列入白名单。
+# 另放行"主机名为本机回环名、端口任意"的形态：测试起服绑定临时端口
+# （HTTPServer(("127.0.0.1", 0))），urllib 自动发送 Host: 127.0.0.1:<随机端口>，
+# 严格两值白名单会误伤；外部恶意域名（DNS rebinding 的真正攻击面）仍被拒绝。
+_ALLOWED_HOSTS = ("127.0.0.1:8600", "localhost:8600")
+_ALLOWED_HOST_NAMES = ("127.0.0.1", "localhost")
+
 # ------------------------------------------------------------------ 路径推导
 # lite/server/api_server.py -> lite/server -> lite -> 项目根目录（逐级上溯 3 次）
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -74,7 +86,7 @@ from lite.computer_control.control import (  # noqa: E402
 )
 from lite.computer_control.security import ControlAuthorizer  # noqa: E402
 from lite.computer_control.tool_bridge import ToolBridge  # noqa: E402
-from lite.config.config_manager import ConfigManager  # noqa: E402
+from lite.config.config_manager import DEFAULTS, ConfigManager  # noqa: E402
 
 # 默认数据目录：项目根目录下 data/（与 storage._default_db_path 的 data/memories.db 一致）
 DEFAULT_DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
@@ -102,13 +114,25 @@ def build_deps(data_dir=None):
     """
     data_dir = _resolve_data_dir(data_dir)
     os.makedirs(data_dir, exist_ok=True)
+    # M5 配置接线：读取 memory 段注入检索管线（缺省值与 DEFAULTS["memory"] 一致），
+    # pipeline 内部会把 dedup/permanent_threshold 透传给其持有的 MemoryManager
+    config = ConfigManager(config_path=os.path.join(data_dir, "config.json"))
     store = MemoryStore(db_path=os.path.join(data_dir, "memories.db"))
     embed = LiteEmbeddingProvider(dim=64)
     vector_store = InMemoryVectorStore()
-    pipeline = MemoryRetrievalPipeline(store=store, vector_store=vector_store, embed=embed)
+    pipeline = MemoryRetrievalPipeline(
+        store=store,
+        vector_store=vector_store,
+        embed=embed,
+        max_memories=int(config.get("memory", "max_memories", DEFAULTS["memory"]["max_memories"])),
+        dedup_threshold=float(config.get("memory", "dedup", DEFAULTS["memory"]["dedup"])),
+        permanent_threshold=float(
+            config.get("memory", "permanent_threshold", DEFAULTS["memory"]["permanent_threshold"])
+        ),
+    )
     manager = AgentManager(path=os.path.join(data_dir, "agents.json"))
     #: 遥控控制器：config 驱动（remote.enabled 默认 false），不主动发起真实网络
-    remote = RemoteController(config=ConfigManager(config_path=os.path.join(data_dir, "config.json")))
+    remote = RemoteController(config=config)
     return store, pipeline, manager, remote
 
 
@@ -167,14 +191,71 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
         def log_message(self, fmt, *args):
             """精简访问日志（避免默认 stderr 冗长输出，服务启动信息仍打印）。"""
 
+        def _check_host(self):
+            """校验 Host 头是否指向本服务自身（防 DNS rebinding）。
+
+            规则：Host 精确命中 _ALLOWED_HOSTS 放行；否则拆出主机名部分，
+            仅当主机名为本机回环名（127.0.0.1 / localhost，端口任意，兼容
+            测试态临时端口与本机自定义端口部署）时放行。缺失 Host 头一律拒绝。
+            """
+            host = (self.headers.get("Host") or "").strip().lower()
+            if not host:
+                return False
+            if host in {h.lower() for h in _ALLOWED_HOSTS}:
+                return True
+            # IPv6 字面量形态 [::1]:port 与常规 host:port 分别拆出主机名
+            name = host
+            if name.startswith("["):
+                name = name[1:].split("]", 1)[0]
+            elif ":" in name:
+                name = name.rsplit(":", 1)[0]
+            return name in _ALLOWED_HOST_NAMES
+
+        def _cors_headers(self):
+            """按请求 Origin 计算应附带的 CORS 响应头。
+
+            Origin 命中 _ALLOWED_ORIGINS 时返回放行头集合；未命中返回空 dict
+            （不返回任何 Access-Control 头，更不放通配符 *），由浏览器同源策略兜底。
+            """
+            origin = self.headers.get("Origin")
+            if origin in _ALLOWED_ORIGINS:
+                return {
+                    "Access-Control-Allow-Origin": origin,
+                    "Vary": "Origin",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                    "Access-Control-Allow-Headers": "Content-Type",
+                }
+            return {}
+
+        def _deny_bad_host(self):
+            """Host 校验失败的统一 403 响应。"""
+            self._send_json({"error": "forbidden", "message": "Host 校验失败：拒绝访问"}, 403)
+
+        def _guard_internal_error(self, exc):
+            """全局异常兜底：回结构化 500，确保畸形输入不致连接中断。"""
+            self._send_json({"error": "internal error", "detail": str(exc)[:200]}, 500)
+
         def _send_json(self, payload, status=200):
             """以 UTF-8 编码、ensure_ascii=False 输出 JSON 响应（中文不转义）。"""
             body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            for key, value in self._cors_headers().items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
+
+        def do_OPTIONS(self):
+            """处理预检请求：直接 204 + CORS 头 + 空 body（无路由分发、无副作用）。"""
+            if not self._check_host():
+                self._deny_bad_host()
+                return
+            self.send_response(204)
+            for key, value in self._cors_headers().items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def _parse_query(self):
             """解析查询串为 dict[str, str|None]（首个值优先，空串归一为 None）。"""
@@ -221,8 +302,22 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
 
             支持键：``cloud.provider``（须在 provider 白名单内）、``tts.voice``、
             ``local_llm.enabled``。其余键被忽略并列入 ``ignored`` 返回，供调用方校正。
+            段（cloud/tts/local_llm）存在但非 dict 时回 400，避免 AttributeError 冒泡。
             """
             body = self._read_body_json()
+            if body is None:
+                self._send_json(
+                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
+                )
+                return
+            # 修复2：先做段类型校验——段存在但非 dict 一律 400，不做 .get() 取值
+            invalid_sections = [
+                name for name in ("cloud", "tts", "local_llm")
+                if name in body and not isinstance(body[name], dict)
+            ]
+            if invalid_sections:
+                self._send_json({"error": f"invalid section type: {', '.join(invalid_sections)}"}, 400)
+                return
             ignored = []
             applied = []
 
@@ -287,94 +382,119 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
         # ------------------------------------------------------------ 路由
         def do_GET(self):
             """处理 GET：/api/health、/api/status、/api/settings、/api/chat/history、记忆/Agent/远端接口。"""
-            path = urlparse(self.path).path
-            query = self._parse_query()
-
-            if path == "/api/health":
-                self._send_json({"status": "ok"})
+            if not self._check_host():
+                self._deny_bad_host()
                 return
+            try:
+                path = urlparse(self.path).path
+                query = self._parse_query()
 
-            if path == "/api/status":
-                self._handle_status()
-                return
+                if path == "/api/health":
+                    self._send_json({"status": "ok"})
+                    return
 
-            if path == "/api/settings":
-                self._handle_settings_get()
-                return
+                if path == "/api/status":
+                    self._handle_status()
+                    return
 
-            if path == "/api/chat/history":
-                self._handle_chat_history_guard()
-                return
+                if path == "/api/settings":
+                    self._handle_settings_get()
+                    return
 
-            if path == "/api/remote/status":
-                self._handle_remote_status()
-                return
+                if path == "/api/chat/history":
+                    self._handle_chat_history_guard()
+                    return
 
-            if path == "/api/memories":
-                self._handle_list(query)
-                return
+                if path == "/api/remote/status":
+                    self._handle_remote_status()
+                    return
 
-            if path == "/api/memories/search":
-                self._handle_search(query)
-                return
+                if path == "/api/memories":
+                    self._handle_list(query)
+                    return
 
-            if path == "/api/agents":
-                self._handle_agents_list(query)
-                return
+                if path == "/api/memories/search":
+                    self._handle_search(query)
+                    return
 
-            if path == "/api/computer/status":
-                self._handle_computer_status()
-                return
+                if path == "/api/agents":
+                    self._handle_agents_list(query)
+                    return
 
-            self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
+                if path == "/api/computer/status":
+                    self._handle_computer_status()
+                    return
+
+                self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
+            except Exception as exc:  # noqa: BLE001 - 兜底：任何畸形输入都得到结构化 500 而非连接中断
+                # SystemExit / KeyboardInterrupt 继承 BaseException，不会被此处捕获
+                self._guard_internal_error(exc)
 
         def do_POST(self):
             """处理 POST：/api/chat/messages、Agent/远端/电脑控制接口。"""
-            path = urlparse(self.path).path
-            if path == "/api/chat/messages":
-                self._handle_chat_send_guard()
+            if not self._check_host():
+                self._deny_bad_host()
                 return
-            if path == "/api/agents":
-                self._handle_agents_create()
-                return
-            if path == "/api/remote/control":
-                self._handle_remote_control()
-                return
-            if path == "/api/remote/push_config":
-                self._handle_remote_push_config()
-                return
-            if path == "/api/computer/authorize":
-                self._handle_computer_authorize()
-                return
-            if path == "/api/computer/call":
-                self._handle_computer_call()
-                return
-            self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
+            try:
+                path = urlparse(self.path).path
+                if path == "/api/chat/messages":
+                    self._handle_chat_send_guard()
+                    return
+                if path == "/api/agents":
+                    self._handle_agents_create()
+                    return
+                if path == "/api/remote/control":
+                    self._handle_remote_control()
+                    return
+                if path == "/api/remote/push_config":
+                    self._handle_remote_push_config()
+                    return
+                if path == "/api/computer/authorize":
+                    self._handle_computer_authorize()
+                    return
+                if path == "/api/computer/call":
+                    self._handle_computer_call()
+                    return
+                self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
+            except Exception as exc:  # noqa: BLE001 - 兜底：结构化 500 而非连接中断
+                self._guard_internal_error(exc)
 
         def do_PUT(self):
             """处理 PUT：/api/settings 更新配置；/api/agents/{id} 更新指定 Agent。"""
-            path = urlparse(self.path).path
-            if path == "/api/settings":
-                self._handle_settings_update()
+            if not self._check_host():
+                self._deny_bad_host()
                 return
-            agent_id = self._extract_agents_id(path)
-            if agent_id is None:
-                self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
-                return
-            self._handle_agents_update(agent_id)
+            try:
+                path = urlparse(self.path).path
+                if path == "/api/settings":
+                    self._handle_settings_update()
+                    return
+                agent_id = self._extract_agents_id(path)
+                if agent_id is None:
+                    self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
+                    return
+                self._handle_agents_update(agent_id)
+            except Exception as exc:  # noqa: BLE001 - 兜底：结构化 500 而非连接中断
+                self._guard_internal_error(exc)
 
         def do_DELETE(self):
             """处理 DELETE：/api/memories/{id} 软删除 / /api/agents/{id} 删除 Agent。"""
-            path = urlparse(self.path).path
-            prefix = "/api/memories/"
-            if path.startswith(prefix):
-                self._delete_memory(path[len(prefix):])
+            if not self._check_host():
+                self._deny_bad_host()
                 return
-            agent_id = self._extract_agents_id(path)
-            if agent_id is not None:
-                self._handle_agents_delete(agent_id)
-                return
-            self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
+            try:
+                path = urlparse(self.path).path
+                prefix = "/api/memories/"
+                if path.startswith(prefix):
+                    self._delete_memory(path[len(prefix):])
+                    return
+                agent_id = self._extract_agents_id(path)
+                if agent_id is not None:
+                    self._handle_agents_delete(agent_id)
+                    return
+                self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
+            except Exception as exc:  # noqa: BLE001 - 兜底：超大 int 触发 sqlite OverflowError 等畸形输入均结构化响应
+                self._guard_internal_error(exc)
 
         @staticmethod
         def _extract_agents_id(path):
@@ -480,6 +600,11 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
         def _handle_remote_control(self):
             """POST /api/remote/control：读取 action/agent_id 并转发 control。"""
             body = self._read_body_json()
+            if body is None:
+                self._send_json(
+                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
+                )
+                return
             action = body.get("action")
             if action not in self._remote.ACTIONS:
                 self._send_json(
@@ -499,6 +624,11 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
         def _handle_remote_push_config(self):
             """POST /api/remote/push_config：读取非空 JSON 补丁并转发 push_config。"""
             patch = self._read_body_json()
+            if patch is None:
+                self._send_json(
+                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
+                )
+                return
             if not isinstance(patch, dict) or not patch:
                 self._send_json({"error": "bad_request", "message": "patch 必须为非空 JSON 对象"}, 400)
                 return
@@ -526,6 +656,11 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             同步 authorizer 与 computer 两端授权状态，返回最新状态。
             """
             body = self._read_body_json()
+            if body is None:
+                self._send_json(
+                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
+                )
+                return
             enabled = body.get("enabled")
             if not isinstance(enabled, bool):
                 self._send_json({"error": "bad_request", "message": "enabled 必须为布尔值"}, 400)
@@ -548,6 +683,11 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             未授权（NotAuthorizedError）映射 403；其余协议错误按各错误码映射状态码。
             """
             body = self._read_body_json()
+            if body is None:
+                self._send_json(
+                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
+                )
+                return
             tool = body.get("tool")
             if not tool:
                 self._send_json({"error": "bad_request", "message": "tool 为必填字段"}, 400)
@@ -579,13 +719,23 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
 
         # ------------------------------------------------------------ Agent 接口
         def _read_body_json(self):
-            """读取请求体并解析为 dict；空体或非法 JSON 返回空 dict。"""
+            """读取请求体并解析为 dict。
+
+            返回值语义：
+            - 无 body（Content-Length<=0）：返回 {}（保持既有行为兼容）；
+            - 带 body 但 Content-Type 非 application/json 开头：返回 None（内容类型校验，
+              调用方须将 None 视为坏请求回 400）；
+            - 非法 JSON 或非 dict JSON：返回 {}（与既有语义一致，按空补丁处理）。
+            """
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 length = 0
             if length <= 0:
                 return {}
+            content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if not content_type.startswith("application/json"):
+                return None
             try:
                 body = json.loads(self.rfile.read(length).decode("utf-8"))
             except (OSError, ValueError):
@@ -610,6 +760,11 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
         def _handle_agents_create(self):
             """创建 Agent：body 必须含 name 与 persona，voice 可选。"""
             body = self._read_body_json()
+            if body is None:
+                self._send_json(
+                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
+                )
+                return
             name = (body.get("name") or "").strip()
             persona = (body.get("persona") or "").strip()
             if not name or not persona:
@@ -622,6 +777,11 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
         def _handle_agents_update(self, agent_id):
             """更新 Agent：body 为任意可更新字段（name/persona/voice/enabled）。"""
             body = self._read_body_json()
+            if body is None:
+                self._send_json(
+                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
+                )
+                return
             try:
                 agent = self._manager.update(agent_id, **body)
             except AgentNotFound as exc:

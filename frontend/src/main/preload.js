@@ -19,7 +19,13 @@ contextBridge.exposeInMainWorld('cxaAPI', {
     return () => ipcRenderer.removeListener('mode:switch', listener);
   },
 
+  /** 打开桌宠透明悬浮窗（主进程幂等创建；已存在则置前显示） */
+  openPetOverlay: () => ipcRenderer.invoke('pet-overlay:open'),
+
+  /** 关闭桌宠透明悬浮窗（不存在时静默成功） */
+  closePetOverlay: () => ipcRenderer.invoke('pet-overlay:close'),
+
   // ---------- 后续任务扩展点（占位，保留签名） ----------
-  // 后端 API / 桌宠悬浮窗控制 / 系统通知等能力将在此处增量暴露，
+  // 后端 API / 系统通知等能力将在此处增量暴露，
   // 契约由对应任务（A10 起）补充，本期保持最小集。
 });

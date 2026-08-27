@@ -212,6 +212,39 @@ def test_download_rejects_bad_filename_in_primary(tmp_path):
 
 
 # ------------------------------------------------------------------ #
+# 3b. M12：校验先于 os.replace（Content-Length 一致性 + 大小不符不落盘）
+# ------------------------------------------------------------------ #
+
+def test_download_content_length_mismatch_raises_and_cleans_tmp(tmp_path):
+    """M12：Content-Length 与实际字节不符 → 删 tmp 抛 ValueError，正式位不落盘、无残留。"""
+    data = b"\x03" * 512
+    dl = make_loader(tmp_path, data=data, headers={"Content-Length": str(len(data) * 4)})
+    with pytest.raises(ValueError, match="下载不完整"):
+        dl.download(MODELSCOPE_REPO, MODELSCOPE_FILE)
+    assert not (tmp_path / MODELSCOPE_FILE).exists()  # 未落盘
+    assert list(tmp_path.iterdir()) == []             # .tmp 已删除
+
+
+def test_download_size_mismatch_cleans_tmp_before_replace(tmp_path):
+    """M12：verify_size 不符 → 删 tmp 抛 ValueError；目标位与临时文件均不存在。"""
+    data = b"\x00" * 1024
+    dl = make_loader(tmp_path, data=data)
+    with pytest.raises(ValueError):
+        dl.download(MODELSCOPE_REPO, MODELSCOPE_FILE, verify_size_gb=1.7)
+    assert not (tmp_path / MODELSCOPE_FILE).exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_content_length_match_still_passes(tmp_path):
+    """M12：Content-Length 与实际一致时不触发完整性报错，正常落盘。"""
+    data = b"\x05" * 4096
+    dl = make_loader(tmp_path, data=data)  # 默认头即真实长度
+    result = dl.download(MODELSCOPE_REPO, MODELSCOPE_FILE)
+    assert result.is_file()
+    assert result.read_bytes() == data
+
+
+# ------------------------------------------------------------------ #
 # 4. download：urllib 兜底路径                                       #
 # ------------------------------------------------------------------ #
 

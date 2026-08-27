@@ -66,6 +66,10 @@ export default function SettingsPage() {
   const [confirmDangerous, setConfirmDangerous] = useState(true);
   // 是否走真实后端（false 时降级为本地 mock）
   const [computerOnline, setComputerOnline] = useState(IS_BACKEND_READY);
+  // 首帧配置读取失败：区块级降级提示条（默认值可能与后端不一致）
+  const [settingsDegraded, setSettingsDegraded] = useState(false);
+  // 配置项保存失败的轻量内联提示（哪一项失败显示哪一句）
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   // 挂载初始化：拉后端配置视图 + 电脑控制状态；失败回退默认值（与 config 默认一致）
   useEffect(() => {
@@ -85,6 +89,8 @@ export default function SettingsPage() {
           setProvider(FALLBACK_PROVIDER);
           setLocalMode(FALLBACK_LOCAL_MODE);
           setVoice(FALLBACK_VOICE);
+          // 首帧加载失败：展示区块级降级提示（本次渲染使用的是默认值）
+          setSettingsDegraded(true);
         }
       }
       // 电脑控制授权状态
@@ -115,20 +121,30 @@ export default function SettingsPage() {
     };
   }, []);
 
-  // 云端 / 本地模式 / 音色走 PUT /api/settings 热更新（失败不阻断界面）
+  // 云端 / 本地模式 / 音色走 PUT /api/settings 热更新。
+  // 保存失败不再静默吞掉：setSaveError 内联显错；下次操作开头自动清空，自然覆盖重试。
   const handleProviderChange = (next: string) => {
     setProvider(next);
     if (CLOUD_PROVIDERS.includes(next)) {
-      void updateSettings({ cloud: { provider: next } }).catch(() => {});
+      setSaveError(null);
+      void updateSettings({ cloud: { provider: next } }).catch(() => {
+        setSaveError('云端提供商没保存上…待会儿再动一下就好啦');
+      });
     }
   };
   const handleLocalModeChange = (next: boolean) => {
     setLocalMode(next);
-    void updateSettings({ local_llm: { enabled: next } }).catch(() => {});
+    setSaveError(null);
+    void updateSettings({ local_llm: { enabled: next } }).catch(() => {
+      setSaveError('本地模式开关没保存上…待会儿再拨一次就好啦');
+    });
   };
   const handleVoiceChange = (next: string) => {
     setVoice(next);
-    void updateSettings({ tts: { voice: next } }).catch(() => {});
+    setSaveError(null);
+    void updateSettings({ tts: { voice: next } }).catch(() => {
+      setSaveError('音色设置没保存上…待会儿再选一次就好啦');
+    });
   };
 
   // 切换授权：在线走 POST authorize；离线/失败则本地记忆
@@ -157,6 +173,18 @@ export default function SettingsPage() {
         <h1 className="text-xl font-bold text-gradient">设置</h1>
         <p className="text-sm text-[var(--text-secondary)]">按照你的习惯，把它调成喜欢的样子</p>
       </div>
+
+      {/* 首帧加载失败降级提示条：本次展示的是默认值，可能与后端不一致 */}
+      {settingsDegraded && (
+        <div className="mb-3 rounded-xl border border-[var(--glass-border)] bg-[rgba(255,183,225,0.10)] px-3 py-2 text-xs text-[var(--text-secondary)]">
+          设置加载失败啦～下面先用默认值顶着，可能与你的后端配置不太一样，连上后会自动同步的
+        </div>
+      )}
+
+      {/* 配置项保存失败的轻量内联提示 */}
+      {saveError && (
+        <p className="-mt-1 mb-2 text-xs font-medium text-[var(--color-error)]">{saveError}</p>
+      )}
 
       <div className="flex max-w-2xl flex-col gap-4">
         {/* 云端提供商 */}
@@ -215,7 +243,7 @@ export default function SettingsPage() {
               'inline-flex shrink-0 items-center rounded-full px-2.5 py-0.5 text-xs font-medium',
               confirmDangerous
                 ? 'bg-[rgba(124,216,255,0.16)] text-[var(--color-primary)]'
-                : 'bg-[rgba(255,130,130,0.16)] text-[var(--danger)]',
+                : 'bg-[rgba(255,130,130,0.16)] text-[var(--color-error)]',
             ].join(' ')}
           >
             {confirmDangerous ? '已开启' : '已关闭'}

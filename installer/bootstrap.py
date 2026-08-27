@@ -15,6 +15,7 @@ import datetime
 import json
 import os
 import shutil
+import sys
 
 #: 本安装器目录（installer/），基于文件绝对位置推导，禁止相对路径。
 _INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,6 +26,12 @@ PROJECT_ROOT = os.path.dirname(_INSTALLER_DIR)
 BUNDLED_DIR = os.path.join(_INSTALLER_DIR, "bundled")
 #: 组件清单文件绝对路径。
 MANIFEST_PATH = os.path.join(_INSTALLER_DIR, "manifest.json")
+
+# CLI 直跑支持（MU1）：``python installer/bootstrap.py`` 直接执行时本模块不在包
+# 上下文中，project_root 不会自动进入 sys.path。这里基于 __file__ 三级路径
+# （文件 -> installer/ -> 项目根）推导项目根并显式注入，保证下方 import lite.* 可用。
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from lite.config.config_manager import ConfigManager  # noqa: E402
 from lite.memory.storage import MemoryStore  # noqa: E402
@@ -128,7 +135,12 @@ def verify_components(root):
     manifest = load_manifest()
     for comp in manifest["components"]:
         target = os.path.join(root, comp["install_target"])
-        installed = os.path.exists(target)
+        # HP1 修复：目录型组件必须「非空」才判定已安装——裸 os.path.exists 会把
+        # ensure_dirs 预建/重装残留的空占位目录误判为“已安装”。
+        if os.path.isdir(target):
+            installed = len(os.listdir(target)) > 0
+        else:
+            installed = os.path.exists(target)
         if comp["status"] == "builtin":
             state = "已安装" if installed else "待装态"
         else:
@@ -149,8 +161,41 @@ def verify_components(root):
 # ------------------------------------------------------------------ #
 
 
-def _copytree(src, dst):
-    """递归拷贝 src 到 dst；目标已存在则先移除再拷贝（保证结果确定性）。"""
+def _under_data_prefix(dst, root):
+    """判定 dst 是否位于 ``<root>/data`` 运行数据前缀之下。
+
+    :param dst: 目标路径（绝对）。
+    :param root: 安装根目录。
+    :return: True 表示 dst 属于 data/ 运行数据前缀（如 data/lancedb、data/voices/x）。
+    """
+    try:
+        rel = os.path.normpath(os.path.relpath(dst, root))
+    except ValueError:
+        # Windows 跨盘符等无法求相对路径的情形，保守判定为非运行数据前缀
+        return False
+    return rel == "data" or rel.startswith("data" + os.sep)
+
+
+def _is_nonempty_dir(path):
+    """目录存在且至少含一项内容时返回 True（listdir 判定，与 verify_components 同口径）。"""
+    return os.path.isdir(path) and len(os.listdir(path)) > 0
+
+
+def _copytree(src, dst, root=None):
+    """递归拷贝 src 到 dst；目标已存在则先移除再拷贝（保证结果确定性）。
+
+    运行数据目录保护（HP1）：当 dst 属于 ``<root>/data`` 运行数据前缀、且已存在
+    非空内容（用户向量库 / 本地模型 / 自定义音色等）时，跳过拷贝并告警
+    “检测到已有运行数据，跳过覆盖”，防止重跑安装器擦除既有数据；
+    普通全新落位行为不变。
+
+    :param src: 源目录绝对路径。
+    :param dst: 目标目录绝对路径。
+    :param root: 安装根目录（用于 data/ 前缀判定）；缺省用真实项目根 PROJECT_ROOT。
+    """
+    if _under_data_prefix(dst, root or PROJECT_ROOT) and _is_nonempty_dir(dst):
+        _log_warn(f"检测到已有运行数据，跳过覆盖：{dst}")
+        return
     if os.path.exists(dst):
         if os.path.isdir(dst):
             shutil.rmtree(dst)
@@ -184,7 +229,7 @@ def install_builtin_assets(root, manifest=None):
             _log_warn(f"[跳过] {comp['name']} 源缺失，标记待装态")
             continue
         if os.path.isdir(src):
-            _copytree(src, dst)
+            _copytree(src, dst, root=root)
         else:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(src, dst)

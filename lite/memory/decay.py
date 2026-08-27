@@ -81,18 +81,37 @@ def _parse_datetime(text):
 class DecayCalculator:
     """记忆衰减计算器——按衰减类型计算时间衰减、再激活加成后的记忆分数（因子 0~1）。"""
 
-    def __init__(self):
-        """记录当前时间作为计算基准（可被 set_current_time 覆盖以便测试）。"""
-        self.current_time = datetime.now()
+    # 「极高重要性免疫衰减」阈值（对齐 CX-O zero/permanent 与 config.memory.permanent_threshold）
+    DEFAULT_PERMANENT_IMPORTANCE_THRESHOLD = 0.95
+
+    def __init__(self, permanent_importance_threshold=None):
+        """初始化衰减计算器。
+
+        Args:
+            permanent_importance_threshold: 极高重要性免疫衰减的阈值
+                （默认 0.95，对齐 config.memory.permanent_threshold；
+                由 MemoryManager 构造时注入自身持有的阈值，M5 接线）。
+
+        默认以真实时钟为准（每次打分即时取 ``datetime.now()``）；
+        测试可通过 :meth:`set_current_time` 冻结基准时间。
+        """
+        self._time_override = None
+        self.permanent_importance_threshold = float(
+            permanent_importance_threshold
+            if permanent_importance_threshold is not None
+            else self.DEFAULT_PERMANENT_IMPORTANCE_THRESHOLD
+        )
 
     # ------------------------------------------------------------ 时间基准
     def set_current_time(self, value):
-        """设置计算基准时间（测试用）。"""
-        self.current_time = value
+        """设置计算基准时间（测试用）；传 None 恢复真实时钟。"""
+        self._time_override = value
 
     def _now(self):
-        """当前基准时间。"""
-        return self.current_time
+        """当前基准时间：有覆写用覆写值，否则返回实时时钟。"""
+        if self._time_override is not None:
+            return self._time_override
+        return datetime.now()
 
     # ------------------------------------------------------------ 衰减因子
     def decay_factor(self, days_elapsed, decay_type="ebbinghaus_opt", params=None):
@@ -187,8 +206,9 @@ class DecayCalculator:
             float: 0~1 的分数，先按时间衰减，再叠加再激活与情感加成。
         """
         importance = max(0.0, min(1.0, float(importance)))
-        # 永久记忆或极高重要性记忆不随时间衰减（对齐 CX-O zero/permanent 逻辑）
-        if permanent or importance >= 0.95:
+        # 永久记忆或极高重要性记忆不随时间衰减（对齐 CX-O zero/permanent 逻辑；
+        # 阈值由构造参数注入，默认 0.95 对齐 config.memory.permanent_threshold）
+        if permanent or importance >= self.permanent_importance_threshold:
             return 1.0
 
         base = self.strength(importance, age_seconds, decay_type, params)

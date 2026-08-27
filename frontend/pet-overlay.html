@@ -3,12 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#fafafc" />
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:8600 http://localhost:8600" />
-    <title>CX-A 赛博伴侣</title>
+    <!-- 透明悬浮窗：html/body 必须无背景色，透明由 Electron BrowserWindow backgroundColor '#00000000' 提供 -->
+    <style>html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }</style>
+    <title>CX-A 桌宠</title>
   </head>
-  <body>
+  <body style="background: transparent;">
     <div id="root"></div>
-    <script type="module" src="/src/renderer/main.jsx"></script>
+    <script type="module" src="/src/renderer/pet-overlay-main.jsx"></script>
   </body>
 </html>

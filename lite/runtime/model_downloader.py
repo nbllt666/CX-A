@@ -207,16 +207,17 @@ class LlmDownloader:
         return done
 
     def _download_requests(self, url, tmp_path, progress_cb):
-        """使用 requests 流式下载（分块写临时文件），返回累计字节数。"""
+        """使用 requests 流式下载（分块写临时文件），返回 ``(downloaded, total)``。"""
         resp = self._requests.get(url, stream=True, timeout=self.timeout)
         resp.raise_for_status()
         total = int((resp.headers or {}).get("Content-Length", 0) or 0)
-        return self._stream_from_response(
+        downloaded = self._stream_from_response(
             resp.iter_content(chunk_size=64 * 1024), total, tmp_path, progress_cb
         )
+        return downloaded, total
 
     def _download_urllib(self, url, tmp_path, progress_cb):
-        """使用 urllib.request 兜底流式下载，返回累计字节数（未装 requests 时）。"""
+        """使用 urllib.request 兜底流式下载，返回 ``(downloaded, total)``（未装 requests 时）。"""
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310 - 下载源为固定白名单双源
             total = int((resp.headers or {}).get("Content-Length", 0) or 0)
@@ -228,7 +229,8 @@ class LlmDownloader:
                         break
                     yield chunk
 
-            return self._stream_from_response(_iterator(), total, tmp_path, progress_cb)
+            downloaded = self._stream_from_response(_iterator(), total, tmp_path, progress_cb)
+            return downloaded, total
 
     def download(self, repo, filename, source=None, progress_cb=None, verify_size_gb=None) -> Path:
         """流式下载 GGUF 模型到存储目录（临时文件 + 原子改名）。
@@ -265,7 +267,7 @@ class LlmDownloader:
             self._log("INFO", f"开始下载：{url}")
             tmp = dest + ".tmp"
             try:
-                downloaded = self._download_requests(url, tmp, progress_cb)
+                downloaded, total = self._download_requests(url, tmp, progress_cb)
             except Exception as exc:  # noqa: BLE001 - 网络/写入异常统一清理临时文件后上抛
                 if os.path.exists(tmp):
                     os.remove(tmp)
@@ -275,18 +277,37 @@ class LlmDownloader:
             self._log("INFO", f"开始下载（urllib 兜底）：{url}")
             tmp = dest + ".tmp"
             try:
-                downloaded = self._download_urllib(url, tmp, progress_cb)
+                downloaded, total = self._download_urllib(url, tmp, progress_cb)
             except Exception as exc:  # noqa: BLE001
                 if os.path.exists(tmp):
                     os.remove(tmp)
                 self._log("ERROR", f"下载失败：{filename}（{exc}）")
                 raise
 
+        # M12 修复：所有校验前置于 os.replace——损坏/伪造大小的模型不得落到正式位。
+        # 1) Content-Length 可得时校验 done == total，不符删 tmp 抛 ValueError
+        if total and int(downloaded) != int(total):
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            self._log(
+                "ERROR",
+                f"下载不完整：{filename}（预期 {total} 字节，实际 {downloaded} 字节），已删除临时文件",
+            )
+            raise ValueError(
+                f"模型文件 {filename} 下载不完整：预期 {total} 字节，实际 {downloaded} 字节。"
+            )
+        # 2) 大小校验（相对预期 20% 容差），失败删 tmp 并抛 ValueError
+        if verify_size_gb is not None:
+            try:
+                self._check_size(downloaded, verify_size_gb, filename)
+            except ValueError as exc:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                self._log("ERROR", f"大小校验失败（已删除临时文件）：{filename}（{exc}）")
+                raise
+
         os.replace(tmp, dest)
         self._log("INFO", f"下载完成：{dest}（{downloaded} 字节）")
-
-        if verify_size_gb is not None:
-            self._check_size(downloaded, verify_size_gb, filename)
         return Path(dest)
 
     # ------------------------------------------------------------------ #

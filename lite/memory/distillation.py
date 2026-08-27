@@ -13,6 +13,7 @@
 """
 
 import json
+import sys
 import uuid
 from typing import Dict, List
 
@@ -36,7 +37,10 @@ class DistillStateError(RuntimeError):
 # 蒸馏会话状态机（对齐 CX-O distillation_service 的 9 态语义，精简为 7 态）：#
 #   pending -> extracting -> quality_check -> committing -> done             #
 #                              |-> rejected（质量门拒绝，不落库）            #
-#   extracting/committing --异常--> failed                                   #
+#   extracting/quality_check/committing --异常--> failed                     #
+#   （M8 补边：quality_check 态内解析/评分异常可合法直达 failed，不再依赖     #
+#     兜底覆写；committing 部分落库失败时终态同样为 failed，已落库条目        #
+#     如实保留在 added 中，partial/committed 字段记录部分失败语义。）         #
 # 与 CX-O 的对应：pending≈S_PREREAD、extracting≈S_EXTRACT、                  #
 #   quality_check≈S_STORAGE_DECISION 前的质量评估、committing≈落库、         #
 #   rejected≈S_REJECT、failed/done≈S_FINALIZE 收束。                        #
@@ -53,7 +57,7 @@ S_DONE = "done"  # 成功收束
 _TRANSITIONS = {
     S_PENDING: (S_EXTRACT,),
     S_EXTRACT: (S_QUALITY, S_FAILED),
-    S_QUALITY: (S_COMMIT, S_REJECT),
+    S_QUALITY: (S_COMMIT, S_REJECT, S_FAILED),
     S_COMMIT: (S_DONE, S_FAILED),
     S_REJECT: (),
     S_FAILED: (),
@@ -171,10 +175,13 @@ class MemoryDistiller:
 
         与 ``distill_long_conversation`` 同一主流程；返回结构为：
 
-        ``[{session_id, agent_id, state, quality_score, reason, facts, added, error}]``
+        ``[{session_id, agent_id, state, quality_score, reason, facts, added,
+            partial, committed, error}]``
 
         其中 ``state`` 为终止态之一：``done``（已落库）/ ``rejected``（质量门拒绝）/
-        ``failed``（异常）。供管理 API 与测试核对状态机行为。
+        ``failed``（异常）。``partial`` 为真表示落库阶段仅部分条目成功（终态 failed），
+        ``committed`` 为已成功落库条数，``added`` 如实反映已落库条目（不清空、不误导
+        统计）。供管理 API 与测试核对状态机行为。
 
         :raises DistillationPaused: 云端离线时抛出
         """
@@ -197,7 +204,7 @@ class MemoryDistiller:
     # ------------------------------------------------------------------ #
 
     def _new_session(self, agent_id: str) -> Dict:
-        """新建一个蒸馏会话（初始态 pending）。"""
+        """新建一个蒸馏会话（初始态 pending；partial/committed 记录部分落库语义）。"""
         return {
             "session_id": uuid.uuid4().hex,
             "agent_id": agent_id,
@@ -206,6 +213,8 @@ class MemoryDistiller:
             "reason": "",
             "facts": [],
             "added": [],
+            "partial": False,
+            "committed": 0,
             "error": None,
         }
 
@@ -267,28 +276,46 @@ class MemoryDistiller:
                 self._set_state(session, S_REJECT)
                 return session
 
-            # 3) 落库（真正持久化，对齐 CX-O 蒸馏必须落真实记忆的要求）
+            # 3) 落库（真正持久化，对齐 CX-O 蒸馏必须落真实记忆的要求）。
+            #    M8 部分落库语义：单条 fact 落库/int(importance) 异常只跳过该条，
+            #    继续落其余事实，不再中断整个 chunk；已成功条目如实保留在 added。
             self._set_state(session, S_COMMIT)
+            fact_errors: List[str] = []
             for fact in facts:
-                content = fact["content"]
-                importance = fact.get("importance") or 3
-                mem_id = self._store.add(
-                    {
-                        "type": "long_term",
-                        "content": content,
-                        "importance": int(importance),
-                        "agent_id": agent_id,
-                    }
-                )
+                try:
+                    content = fact["content"]
+                    importance = int(fact.get("importance") or 3)
+                    mem_id = self._store.add(
+                        {
+                            "type": "long_term",
+                            "content": content,
+                            "importance": importance,
+                            "agent_id": agent_id,
+                        }
+                    )
+                except Exception as fact_exc:  # noqa: BLE001 - 单条失败不放大为整块失败
+                    fact_errors.append(f"第 {len(session['added']) + len(fact_errors) + 1} 条落库失败：{fact_exc}")
+                    continue
                 session["added"].append(
                     {
                         "id": mem_id,
                         "type": "long_term",
                         "content": content,
-                        "importance": int(importance),
+                        "importance": importance,
                         "agent_id": agent_id,
                     }
                 )
+            session["committed"] = len(session["added"])
+            if fact_errors:
+                # 部分落库：终态仍 failed，但已落库条目如实保留（不清空/不误导统计）
+                session["partial"] = True
+                session["reason"] = (
+                    f"质量分 {quality:.2f}，部分落库 {session['committed']}/{len(facts)} 条"
+                )
+                session["error"] = "；".join(fact_errors)
+                self._set_state(session, S_FAILED)
+                return session
+
             session["reason"] = f"质量分 {quality:.2f}，已落库 {len(session['added'])} 条"
             self._set_state(session, S_DONE)
             return session
@@ -297,6 +324,15 @@ class MemoryDistiller:
             try:
                 self._set_state(session, S_FAILED)
             except DistillStateError:
+                # 最后防线兜底：非法转移不应静默。正常情况下转移表已覆盖
+                # extracting / quality_check / committing 三个在途态到 failed 的边，
+                # 走到这里说明出现了状态机之外的非预期转移（如未来新增在途态
+                # 却忘记补 failed 边），必须显式告警而不是悄悄覆写状态。
+                print(
+                    f"[WARNING] 蒸馏状态机发生非预期转移（{session['state']} -> {S_FAILED}），"
+                    f"已强制置为 failed 兜底。会话：{session.get('session_id')}",
+                    file=sys.stderr,
+                )
                 session["state"] = S_FAILED
             return session
 

@@ -14,6 +14,7 @@
 
 import json
 import socket
+import threading
 
 #: 信标报文类型（与 CX-O discover.py 保持一致，便于跨版本互通）
 MSG_TYPE = "ACP_BEACON"
@@ -44,11 +45,19 @@ class LiteLanDiscovery:
         self._running = False
         self._socket = None
         self.port = 0
+        #: 后台接收线程与停止哨兵（M3 真实化：start 后 bind 并循环收包）
+        self._recv_thread = None
+        self._stop_event = threading.Event()
 
     def start(self, port=9999):
-        """启动发现：创建 UDP socket（广播 + 地址复用），不监听端口。
+        """启动发现：创建 UDP socket（广播 + 地址复用），bind 通配端口并开启后台接收线程。
+
+        M3 真实化修复：此前 start 只建 socket 不 bind、不收包，``discover_lan``
+        恒返空列表。现在启动后台 daemon 线程循环 ``recvfrom`` 并交
+        :meth:`parse_packet` 解析，命中合法 ACP_BEACON 即登记 ``found_agents``。
 
         :param port: 本机信标宣告端口（加入 ACP_BEACON 报文供对端回连）
+        :raises AcpDiscoveryError: socket 创建失败或端口 bind 失败时抛出
         """
         if self._running:
             return
@@ -62,17 +71,71 @@ class LiteLanDiscovery:
             self._running = False
             self._socket = None
             raise AcpDiscoveryError(f"局域网发现 socket 创建失败：{exc}") from exc
+        try:
+            # 接收侧显式 bind 通配地址——不 bind 则内核不向本端口投递报文
+            self._socket.bind(("0.0.0.0", port))
+        except Exception as exc:
+            self._running = False
+            self._close_socket_quietly()
+            raise AcpDiscoveryError(f"局域网发现端口绑定失败（port={port}）：{exc}") from exc
+        try:
+            # 收包用超时轮询停止哨兵，避免阻塞式 recv 卡住线程退出（沿用仓库 Event 线程风格）；
+            # fake socket 无 settimeout 时静默跳过，不影响后续注入式测试。
+            self._socket.settimeout(0.5)
+        except Exception:  # noqa: BLE001 - 注入式 fake socket 可能不支持超时设置
+            pass
         self.port = port
+        self._stop_event.clear()
         self._running = True
+        thread = threading.Thread(
+            target=self._recv_loop, name="cxa-lan-discovery", daemon=True
+        )
+        self._recv_thread = thread
+        thread.start()
 
     def stop(self):
-        """停止发现：关闭 socket 并复位运行标记。"""
+        """停止发现：置停止哨兵、关闭 socket 并回收后台接收线程（幂等）。"""
         self._running = False
+        self._stop_event.set()
+        self._close_socket_quietly()
+        thread = self._recv_thread
+        self._recv_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3.0)
+
+    def close(self):
+        """关闭并回收资源（stop 的别名，供「关闭」语义调用方使用）。"""
+        self.stop()
+
+    def _close_socket_quietly(self):
+        """静默关闭当前 socket（幂等，异常仅吞掉用于收尾路径）。"""
         if self._socket is not None:
             try:
                 self._socket.close()
             finally:
                 self._socket = None
+
+    def _recv_loop(self):
+        """后台接收循环：在本端口上循环 recvfrom，命中合法信标即登记 found_agents。
+
+        - ``socket.timeout``：无数据超时轮询，回到哨兵判定继续；
+        - ``OSError``：socket 已关闭 / 不可用，退出线程；
+        - 单包解析异常不影响后续接收。
+        """
+        while not self._stop_event.is_set():
+            sock = self._socket
+            if sock is None:
+                break
+            try:
+                data, addr = sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                self.parse_packet(data, addr)
+            except Exception:  # noqa: BLE001 - 单包解析失败不影响整体接收
+                continue
 
     def broadcast_presence(self, agent_id, agent_name="", capabilities=None, port=None):
         """向局域网广播一条 ACP_BEACON 报文，宣告本机 Agent 存在。

@@ -31,7 +31,7 @@ DEDUP_THRESHOLD = 0.85
 class MemoryManager:
     """记忆管理器门面：存储 + 衰减 + 三维打分 + 去重 + 分层升降级。"""
 
-    def __init__(self, store=None, vector_store=None, db_path=None, permanent_threshold=None):
+    def __init__(self, store=None, vector_store=None, db_path=None, permanent_threshold=None, dedup_threshold=None):
         """初始化内存管理器。
 
         Args:
@@ -39,16 +39,24 @@ class MemoryManager:
             vector_store: 可选向量存储（缺省使用纯 Python 的 InMemoryVectorStore）。
             db_path: 存储数据库路径（store 未注入时使用）。
             permanent_threshold: 永久晋级 importance 阈值（默认 0.95，对齐
-                config.memory.permanent_threshold 与 CX-O 语义）。
+                config.memory.permanent_threshold 与 CX-O 语义；None 回落模块级
+                常量 PERMANENT_PROMOTE_IMPORTANCE）。
+            dedup_threshold: 内容相似去重阈值（默认 0.85，对齐 config.memory.dedup
+                与 CX-O DeduplicationEngine 语义；None 回落模块级常量
+                DEDUP_THRESHOLD）。
         """
         self.store = store or MemoryStore(db_path=db_path)
         self.vector_store = vector_store or InMemoryVectorStore()
-        self.decay = DecayCalculator()
-        self.dedup_threshold = DEDUP_THRESHOLD
+        # 先确定 permanent 阈值，再构建衰减器：把阈值注入 DecayCalculator，
+        # 使「极高重要性免疫衰减」判定与永久晋级共用同一配置来源（M5 接线）
         self._permanent_threshold = (
             float(permanent_threshold)
             if permanent_threshold is not None
             else PERMANENT_PROMOTE_IMPORTANCE
+        )
+        self.decay = DecayCalculator(permanent_importance_threshold=self._permanent_threshold)
+        self.dedup_threshold = (
+            float(dedup_threshold) if dedup_threshold is not None else DEDUP_THRESHOLD
         )
         self.store.create_table()
 

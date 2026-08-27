@@ -120,6 +120,24 @@ def test_permanent_threshold_custom_override(mgr, tmp_path):
     assert mem["type"] == "permanent"
 
 
+def test_dedup_threshold_custom_override(mgr, tmp_path):
+    """构造传入 dedup_threshold 可覆盖默认 0.85（对齐 config.memory.dedup 接线）。"""
+    m = MemoryManager(
+        store=MemoryStore(db_path=str(tmp_path / "custom_dedup.db")),
+        vector_store=InMemoryVectorStore(),
+        dedup_threshold=0.5,
+    )
+    # 两句 Jaccard 相似度约 4/6≈0.667：默认阈值 0.85 下各自入库，0.5 阈值下第二条被去重
+    mid1 = m.add_memory("alpha beta gamma delta epsilon", embed_fn=_embed)
+    mid2 = m.add_memory("alpha beta gamma delta zeta", embed_fn=_embed)
+    assert mid1 is not None
+    assert mid2 is None, "相似度 0.667 >= 自定义阈值 0.5，第二条应在写入口被去重"
+    # 对照：同内容对在默认阈值 0.85 下不会被去重（行为随配置变化）
+    mgr_mid1 = mgr.add_memory("alpha beta gamma delta epsilon", embed_fn=_embed)
+    mgr_mid2 = mgr.add_memory("alpha beta gamma delta zeta", embed_fn=_embed)
+    assert mgr_mid1 is not None and mgr_mid2 is not None
+
+
 def test_explicit_demote(mgr):
     mid = mgr.add_memory("downgrade memory token", type="long_term", importance_score=0.9, embed_fn=_embed)
     # 先升 permanent 再降

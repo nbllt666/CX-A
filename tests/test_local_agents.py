@@ -84,6 +84,43 @@ def test_update_missing_raises(manager):
         manager.update("agent-nope", name="x")
 
 
+# ---------------------------------------------------------------- M4 严格解析
+def test_update_enabled_strict_parsing(manager):
+    """M4：enabled 支持的字面量映射正确，bool 原样透传。"""
+    created = manager.create(name="小夜", persona="……")
+    # 字符串真值
+    for raw in ("true", "1", "yes", "TRUE", " Yes "):
+        manager.update(created.id, enabled=raw)
+        assert manager.get(created.id).enabled is True
+    # 字符串假值（含空串）
+    for raw in ("false", "0", "", "no", "False"):
+        manager.update(created.id, enabled=raw)
+        assert manager.get(created.id).enabled is False
+    # bool 原样
+    manager.update(created.id, enabled=True)
+    assert manager.get(created.id).enabled is True
+    manager.update(created.id, enabled=False)
+    assert manager.get(created.id).enabled is False
+
+
+@pytest.mark.parametrize("bad", ["on", "off", "enable", "2", "是"])
+def test_update_enabled_bad_string_raises(manager, bad):
+    """M4：其余字符串一律 ValueError，不落盘、不静默取真值。"""
+    created = manager.create(name="小夜", persona="……")
+    before = manager.get(created.id).enabled
+    with pytest.raises(ValueError, match="invalid enabled value"):
+        manager.update(created.id, enabled=bad)
+    assert manager.get(created.id).enabled == before  # 失败不改变状态
+
+
+@pytest.mark.parametrize("bad_type", [1, 0, None, [True]])
+def test_update_enabled_non_bool_non_str_raises(manager, bad_type):
+    """M4：其他类型（含 int / None / list）一律 ValueError。"""
+    created = manager.create(name="小夜", persona="……")
+    with pytest.raises(ValueError, match="invalid enabled value"):
+        manager.update(created.id, enabled=bad_type)
+
+
 def test_delete(manager):
     created = manager.create(name="小夜", persona="……")
     assert len(manager.list()) == 2  # 种子 default + 新建

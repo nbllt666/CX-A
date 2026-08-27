@@ -95,6 +95,73 @@ def test_verify_components_after_ensure_reduces_warnings(tmp_path):
     assert not any("缺少必需数据目录" in p for p in problems)
 
 
+def test_verify_components_requires_nonempty_dir(tmp_path):
+    """HP1：目录型组件须非空才算已安装——空占位目录不应误判为已装。"""
+    root = str(tmp_path)
+    bootstrap.ensure_dirs(root)
+
+    # data/lancedb 为空目录：LanceDB 组件应报"待装态"
+    problems = bootstrap.verify_components(root)
+    assert any("lancedb" in p and "待装态" in p for p in problems)
+
+    # 放入一个文件后视为已安装，该组件不再报待装态
+    with open(os.path.join(root, "data", "lancedb", "vectors-0001.lance"), "w", encoding="utf-8") as fh:
+        fh.write("user-vector-data")
+    problems_after = bootstrap.verify_components(root)
+    assert not any("data/lancedb" in p for p in problems_after)
+
+
+# ------------------------------------------------------------------ #
+# HP1：install() 不得擦除既有运行数据                                  #
+# ------------------------------------------------------------------ #
+
+def test_install_preserves_existing_nonempty_lancedb(tmp_path, monkeypatch, capsys):
+    """预置非空 data/lancedb 后重跑 install()：既有向量库数据不被清空、内置源不覆盖进去。"""
+    root = str(tmp_path / "instroot")
+    os.makedirs(root)
+    bootstrap.ensure_dirs(root)
+
+    lancedb_dir = os.path.join(root, "data", "lancedb")
+    user_table = os.path.join(lancedb_dir, "vectors-0001.lance")
+    with open(user_table, "w", encoding="utf-8") as fh:
+        fh.write("user-vector-data")
+
+    # 构造假的内置组件源并替换 BUNDLED_DIR：验证"有源可拷"时同样跳过覆盖
+    bundled_root = tmp_path / "bundled"
+    fake_lancedb_src = bundled_root / "lancedb"
+    fake_lancedb_src.mkdir(parents=True)
+    (fake_lancedb_src / "lancedb.bin").write_text("builtin-payload", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "BUNDLED_DIR", str(bundled_root))
+
+    bootstrap.install(root)
+
+    # 用户数据原样保留，内置载荷未被写入
+    assert os.path.exists(user_table)
+    with open(user_table, encoding="utf-8") as fh:
+        assert fh.read() == "user-vector-data"
+    assert not os.path.exists(os.path.join(lancedb_dir, "lancedb.bin"))
+    # 告警提示已输出
+    assert "检测到已有运行数据" in capsys.readouterr().out
+
+
+def test_install_fresh_empty_data_dir_still_receives_assets(tmp_path, monkeypatch):
+    """普通全新落位行为不变：空 data/lancedb 重跑 install() 后内置组件正常落位。"""
+    root = str(tmp_path / "freshroot")
+    os.makedirs(root)
+    bootstrap.ensure_dirs(root)  # 预建空的 data/lancedb 占位
+
+    bundled_root = tmp_path / "bundled"
+    fake_src = bundled_root / "lancedb"
+    fake_src.mkdir(parents=True)
+    (fake_src / "lancedb.bin").write_text("builtin-payload", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "BUNDLED_DIR", str(bundled_root))
+
+    bootstrap.install(root)
+
+    assert os.path.isfile(os.path.join(root, "data", "lancedb", "lancedb.bin"))
+    assert not any(p.suffix == ".tmp" for p in (tmp_path / "freshroot").rglob("*"))
+
+
 # ------------------------------------------------------------------ #
 # first_run：全流程驱动                                              #
 # ------------------------------------------------------------------ #

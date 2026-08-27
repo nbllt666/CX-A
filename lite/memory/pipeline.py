@@ -12,11 +12,11 @@
 - 关键字加权（manager 未覆盖）由本管线在 pipeline 层补齐。
 """
 
-from datetime import datetime
+from typing import Optional
 
 from .decay import DecayCalculator
 from .embedding import EmbeddingProvider
-from .manager import DEDUP_THRESHOLD, MemoryManager
+from .manager import MemoryManager
 from .scoring import _get_weights, score_memories
 from .storage import MemoryStore
 from .vector_store import VectorStore
@@ -57,6 +57,8 @@ class MemoryRetrievalPipeline:
         keyword_weight: float = DEFAULT_KEYWORD_WEIGHT,
         max_memories: int = 30,
         scene_context=None,
+        dedup_threshold=None,
+        permanent_threshold=None,
     ):
         """初始化检索管线。
 
@@ -66,8 +68,14 @@ class MemoryRetrievalPipeline:
             embed: 嵌入提供者（EmbeddingProvider 实现，C1 前为桩）。
             vector_weight: 向量相关度权重（默认 0.6）。
             keyword_weight: 关键词相关度权重（默认 0.4）。
-            max_memories: 最终注入记忆条数上限（默认 30）。
+            max_memories: 最终注入记忆条数上限（默认 30；装配点可按
+                config.memory.max_memories 传入，M5 接线）。
             scene_context: 场景上下文（场景名或权重 dict），用于三维权重调整。
+            dedup_threshold: 内容相似去重阈值（None 用模块级常量 0.85；
+                装配点透传 config.memory.dedup 给内部 MemoryManager）。
+            permanent_threshold: 永久晋级阈值（None 用模块级常量 0.95；
+                装配点透传 config.memory.permanent_threshold 给内部
+                MemoryManager，M5 接线）。
         """
         self.store = store
         self.vector_store = vector_store
@@ -77,11 +85,18 @@ class MemoryRetrievalPipeline:
         self.max_memories = int(max_memories)
         self.scene_context = scene_context
 
-        # 复用 MemoryManager 以继承其去重 / 衰减策略（store/vector_store 共享实例）
+        # 复用 MemoryManager 以继承其写入口去重 / 检索去重 / 衰减策略（store/vector_store 共享实例）
+        # 装配点传入的 dedup/permanent 阈值在此透传给内部 manager（M5 接线）
         self.store.create_table()
-        self.manager = MemoryManager(store=store, vector_store=vector_store)
+        self.manager = MemoryManager(
+            store=store,
+            vector_store=vector_store,
+            dedup_threshold=dedup_threshold,
+            permanent_threshold=permanent_threshold,
+        )
         self.decay = self.manager.decay
-        self.dedup_threshold = DEDUP_THRESHOLD
+        # 与内部 manager 保持同一生效阈值（含配置接线后的值）
+        self.dedup_threshold = self.manager.dedup_threshold
 
     # ------------------------------------------------------------------ 写
     def add(
@@ -92,8 +107,11 @@ class MemoryRetrievalPipeline:
         tags=None,
         agent_id="default",
         metadata=None,
-    ) -> int:
-        """新增一条记忆：写入 SQLite + 同步向量，返回记忆 id。
+    ) -> Optional[int]:
+        """新增一条记忆：委托 MemoryManager.add_memory，含写入口相似度去重。
+
+        与已有记忆内容相似度达 manager.dedup_threshold（默认 0.85）时跳过写入并
+        返回 None；否则写入 SQLite 并同步向量，返回新记忆 id（M7 写入口去重一致性）。
 
         Args:
             content: 记忆内容（必填）。
@@ -104,28 +122,26 @@ class MemoryRetrievalPipeline:
             metadata: 附加元数据 dict。
 
         Returns:
-            int: 新记忆 id。
+            Optional[int]: 新记忆 id；命中写入口去重时返回 None。
 
         Raises:
             ValueError: type 非法或 content 为空（由 MemoryStore 校验）。
         """
-        memory_id = self.store.add(
-            {
-                "content": content,
-                "type": type_,
-                "importance": importance,
-                "importance_score": max(0.0, min(1.0, int(importance) / 5.0)),
-                "decay_type": "ebbinghaus_opt",
-                "reactivation_count": 0,
-                "emotion_score": 0.0,
-                "permanent": type_ == "permanent",
-                "tags": tags,
-                "metadata": metadata,
-                "agent_id": agent_id,
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
-            }
+        # 委托 manager.add_memory 统一走相似度去重（与检索侧 _dedup_retrieved 同阈值），
+        # 字段语义与原直写完全一致：importance_score 按 importance/5 折算、
+        # decay_type=ebbinghaus_opt、permanent 随 type_ 判定、emotion_score 缺省 0。
+        memory_id = self.manager.add_memory(
+            content=content,
+            type=type_,
+            importance=importance,
+            permanent=(type_ == "permanent"),
+            tags=tags,
+            metadata=metadata,
+            agent_id=agent_id,
         )
-        # 写向量：vector_id = 记忆 id（与 memories.vector_id 关联）
+        if memory_id is None:
+            return None
+        # 写向量：vector_id = 记忆 id（与 memories.vector_id 关联）；去重命中不重复写向量
         try:
             vector = self.embed.embed([content])[0]
         except (IndexError, TypeError, ValueError):

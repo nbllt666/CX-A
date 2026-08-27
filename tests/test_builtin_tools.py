@@ -171,6 +171,38 @@ def test_computer_direct_authorizer_success_and_audit():
     assert "hello" in auth.audits[0]["arguments_summary"]
 
 
+class SyncAwareComputer(MockComputer):
+    """带 set_authorized 记录的 mock computer（MU2 同步验证用）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.authorized_flags = []
+
+    def set_authorized(self, flag):
+        self.authorized_flags.append(bool(flag))
+
+
+def test_computer_direct_syncs_authorized_true_when_authorizer_on():
+    """MU2：authorizer 授权开启时，直连回退把授权态同步传导到 computer.set_authorized(True)。"""
+    comp = SyncAwareComputer()
+    auth = MockAuthorizer(authorized=True)
+    reg = BuiltinToolRegistry(computer=comp, authorizer=auth, config=_CONFIG_COMPUTER_ON)
+    res = reg.call("computer_screen_control", {"_k": 1})
+    assert res["success"] is True, res
+    assert comp.authorized_flags == [True]  # 仅在 authorizer 开启侧同步 True
+
+
+def test_computer_direct_no_sync_when_authorizer_off():
+    """MU2 方向约束：authorizer 未开启时提前拒绝，不得触碰 computer 内部闸门。"""
+    comp = SyncAwareComputer()
+    auth = MockAuthorizer(authorized=False)
+    reg = BuiltinToolRegistry(computer=comp, authorizer=auth, config=_CONFIG_COMPUTER_ON)
+    res = reg.call("computer_screen_control", {"_k": 1})
+    assert res["success"] is False
+    assert comp.authorized_flags == []  # 不发生任何方向反转式放行
+    assert comp.calls == []
+
+
 def test_computer_run_command_needs_confirmation_direct():
     """直连回退下运行指令未通过高危确认 -> NEEDS_CONFIRMATION，不执行。"""
     comp = MockComputer()

@@ -10,6 +10,7 @@ from lite.memory import DistillationPaused, MemoryDistiller
 from lite.memory.distillation import (
     QUALITY_REJECT_THRESHOLD,
     S_DONE,
+    S_FAILED,
     S_REJECT,
     DistillStateError,
     _estimate_tokens,
@@ -221,3 +222,68 @@ def test_invalid_state_transition_raises(store):
     # 合法路径可推进
     distiller._set_state(session, "extracting")
     assert session["state"] == "extracting"
+
+
+# ---------------------------------------------------------------- M8 补边与部分落库语义
+def test_quality_state_exception_reaches_failed(store, capsys):
+    """quality_check 态内抛异常：会话合法转移至 failed，不依赖兜底覆写。
+
+    兜底覆写触发时会向 stderr 输出「非预期转移」warning；补边后正常路径不应出现。
+    """
+    cloud = FakeCloud(response=['[{"content": "用户偏好阅读科幻小说", "importance": 4}]'])
+    distiller = _mk_distiller(cloud, store)
+
+    def _boom(_raw_text):
+        raise RuntimeError("quality gate exploded")
+
+    distiller._parse_facts = _boom  # quality_check 态内异常（解析环节）
+    sessions = distiller.distill_with_sessions([{"role": "user", "content": "hello"}])
+    assert len(sessions) == 1
+    s = sessions[0]
+    assert s["state"] == S_FAILED
+    assert "quality gate exploded" in s["error"]
+    # 未进入落库阶段，无部分落库语义，库中无新增
+    assert s["partial"] is False
+    assert s["committed"] == 0
+    assert store.list(type="long_term") == []
+    # 补边后为合法转移，不应触发兜底覆写的「非预期转移」warning
+    err_out = capsys.readouterr().err
+    assert "非预期转移" not in err_out
+
+
+def test_committing_partial_failure_keeps_committed_rows(store, monkeypatch):
+    """committing 第 2 条落库失败：第 1 条仍在库中且 session.partial 为真，
+    终态 failed 且 added 如实保留已落库条目。"""
+    cloud = FakeCloud(
+        response=[
+            '[{"content": "用户偏好阅读科幻小说", "importance": 4},',
+            '{"content": "用户喜欢雨天出行", "importance": 3}]',
+        ]
+    )
+    distiller = _mk_distiller(cloud, store)
+    original_add = distiller._store.add
+    call_counter = {"n": 0}
+
+    def flaky_add(payload):
+        call_counter["n"] += 1
+        if call_counter["n"] == 2:
+            raise RuntimeError("db write failed")
+        return original_add(payload)
+
+    monkeypatch.setattr(distiller._store, "add", flaky_add)
+
+    sessions = distiller.distill_with_sessions([{"role": "user", "content": "hi"}])
+    assert len(sessions) == 1
+    s = sessions[0]
+    assert s["state"] == S_FAILED
+    assert s["partial"] is True
+    assert s["committed"] == 1
+    assert len(s["added"]) == 1, "已成功落库的第 1 条应如实保留在 added"
+    assert s["added"][0]["content"] == "用户偏好阅读科幻小说"
+    assert "db write failed" in s["error"]
+    # 库中实况：第 1 条在库、第 2 条未入库
+    contents = [row["content"] for row in store.list(type="long_term")]
+    assert contents == ["用户偏好阅读科幻小说"]
+    # 聚合接口如实返回已落库条目（不清空/不误导统计）
+    flat = [a for sess in distiller.last_sessions for a in sess.get("added") or []]
+    assert [a["content"] for a in flat] == ["用户偏好阅读科幻小说"]

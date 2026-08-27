@@ -12,6 +12,10 @@ export interface AppInfo {
 interface CxaBridge {
   getAppInfo: () => Promise<AppInfo>;
   onModeSwitch: (cb: (mode: string) => void) => () => void;
+  /** 打开桌宠透明悬浮窗 */
+  openPetOverlay: () => Promise<boolean>;
+  /** 关闭桌宠透明悬浮窗 */
+  closePetOverlay: () => Promise<boolean>;
 }
 
 declare global {
@@ -48,4 +52,26 @@ export function onModeSwitch(cb: (mode: 'companion' | 'management') => void): ()
     });
   }
   return () => {};
+}
+
+/**
+ * 打开桌宠透明悬浮窗（经 IPC pet-overlay:open，主进程幂等创建）。
+ * 仅 Electron 环境生效；纯浏览器预览降级为 no-op 并返回 false。
+ */
+export function openPetOverlay(): Promise<boolean> {
+  if (isElectron() && window.cxaAPI) {
+    return window.cxaAPI.openPetOverlay();
+  }
+  return Promise.resolve(false);
+}
+
+/**
+ * 关闭桌宠透明悬浮窗（经 IPC pet-overlay:close，窗口不存在时静默成功）。
+ * 仅 Electron 环境生效；纯浏览器预览降级为 no-op 并返回 false。
+ */
+export function closePetOverlay(): Promise<boolean> {
+  if (isElectron() && window.cxaAPI) {
+    return window.cxaAPI.closePetOverlay();
+  }
+  return Promise.resolve(false);
 }

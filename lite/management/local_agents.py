@@ -98,6 +98,35 @@ class AgentNotFound(Exception):
     """
 
 
+#: enabled 字段认可的「真」字符串字面量（大小写不敏感、可含首尾空白）
+_TRUE_TOKENS = ("true", "1", "yes")
+#: enabled 字段认可的「假」字符串字面量（大小写不敏感、可含首尾空白）
+_FALSE_TOKENS = ("false", "0", "", "no")
+
+
+def _parse_enabled(value):
+    """严格解析 enabled 布尔值（M4：禁止宽松 bool() 反转语义）。
+
+    规则：
+    - ``bool`` 原样返回；
+    - ``str`` 归一化（strip + lower）后命中 {"true","1","yes"} -> True，
+      命中 {"false","0","","no"} -> False，其余字符串抛 ``ValueError``；
+    - 其他类型一律抛 ``ValueError("invalid enabled value")``。
+
+    :raises ValueError: 非法 enabled 值时抛出。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_TOKENS:
+            return True
+        if normalized in _FALSE_TOKENS:
+            return False
+        raise ValueError(f"invalid enabled value: {value!r}")
+    raise ValueError(f"invalid enabled value: {value!r}")
+
+
 class AgentManager:
     """本地智能体（Agent）的 CRUD 管理器。
 
@@ -230,13 +259,15 @@ class AgentManager:
 
         Raises:
             AgentNotFound: 目标智能体不存在。
+            ValueError: enabled 字段非法（M4 严格解析：字符串仅接受
+                true/1/yes/false/0/no/空串，其余类型与字面量一律拒绝）。
         """
         agent = self.get(agent_id)
-        # 规范化布尔字段
+        # 规范化布尔字段（enabled 走严格解析，禁止宽松 bool() 造成 "false" -> True 反转）
         normalized = {}
         for key, value in fields.items():
             if key == "enabled":
-                normalized[key] = bool(value)
+                normalized[key] = _parse_enabled(value)
             elif key in ("name", "persona", "voice"):
                 normalized[key] = value
             # 其余未知字段忽略，不落盘

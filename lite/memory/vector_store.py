@@ -75,14 +75,20 @@ class LanceVectorStore(VectorStore):
         return True
 
     def search(self, vector, top_k=10):
-        """按余弦/内积检索 top_k 条最相似向量。"""
+        """检索 top_k 条最相似向量（LanceDB 返回 L2 距离，此处转为相似度）。
+
+        与 InMemoryVectorStore 口径对齐：score 为相似度、越大越相似，
+        归一公式 ``score = 1 / (1 + L2距离)``——相同向量为 1.0，越远越接近 0。
+        """
         if self._table is None:
             return []
         results = self._table.search(list(vector)).limit(int(top_k)).to_list()
         return [
             {
                 "vector_id": r.get("vector_id"),
-                "score": float(r.get("_distance")) if r.get("_distance") is not None else 0.0,
+                "score": (1.0 / (1.0 + float(r.get("_distance"))))
+                if r.get("_distance") is not None
+                else 0.0,
                 "metadata": r.get("metadata"),
             }
             for r in results

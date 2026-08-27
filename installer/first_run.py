@@ -10,6 +10,9 @@
   步骤5 完成汇总输出（配置段一览）
 
 通过 FirstRunDriver 逐步执行，注入 input_fn / output_fn 即可在测试或向导中驱动。
+
+运行口径（MU1）：本模块含包内相对导入，推荐 ``python -m installer.first_run``；
+``python installer/bootstrap.py`` 为 CLI 直跑入口（bootstrap 内部已做 sys.path 项目根注入）。
 """
 
 import os

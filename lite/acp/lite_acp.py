@@ -336,21 +336,47 @@ class LiteACP:
     # 可选能力：局域网发现（默认关）                                       #
     # ------------------------------------------------------------------ #
 
-    def discover_lan(self, timeout=2):
+    def discover_lan(self, timeout=2, discovery_factory=None):
         """局域网发现（默认关）。
 
-        :param timeout: 预留的等待秒数（单线程实现下为极简收集，不阻塞阻塞等待）
-        :return: 发现的 agent dict 列表（无网络时一般为空）
+        M3 真实化流程：start 后主动 ``broadcast_presence`` 宣告本机一次，随后在
+        可配置的短暂等待窗口内分片轮询 ``found_agents``，窗口结束收集返回并确保
+        stop 清理。接收侧由 :class:`LiteLanDiscovery` 的后台线程 bind + recvfrom 完成。
+
+        :param timeout: 等待窗口秒数；缺省 2s。窗口内命中即提前收集可用发现结果，
+            超时则以最后快照为准。
+        :param discovery_factory: 增量注入参数——自定义发现器工厂（测试确定性注入用）；
+            缺省使用真实 :class:`LiteLanDiscovery`。
+        :return: 发现的 agent dict 列表（已剔除本机自身信标）
         :raises AcpDisabled: ``acp.lan_discovery=False``
         """
         self._require_enabled()
         if not self._lan_discovery_enabled:
             raise AcpDisabled("ACP 局域网发现已关闭（config.acp.lan_discovery=False）")
-        discovery = LiteLanDiscovery()
-        discovery.start(port=9999)
+        window = max(0.0, float(timeout or 0))
+        discovery = (discovery_factory or LiteLanDiscovery)()
         try:
-            #: 单线程下仅做当前已收集事件的快照归拢，不做阻塞式监听。
-            return [agent for agent, _addr in discovery.found_agents]
+            discovery.start(port=9999)
+            # 主动宣告一次本机存在（对端回包/对端广播均可触发 found_agents 登记）；
+            # 广播失败仅告警不阻断——发现侧仍可收集其他节点的广播。
+            try:
+                discovery.broadcast_presence(
+                    self.agent_id, agent_name="CX-A local agent"
+                )
+            except Exception as exc:  # noqa: BLE001 - 广播失败不阻断发现收集
+                LOGGER.warning("局域网发现广播失败（继续被动收集）：%s", exc)
+            # 分片睡眠检查 found_agents，避免一次性 sleep 造成不可中断的长阻塞
+            step = 0.05
+            waited = 0.0
+            while waited < window and not discovery.found_agents:
+                time.sleep(min(step, window - waited))
+                waited += min(step, window - waited)
+            # 收集并剔除本机自身信标（同机回环会把自家广播也送达本端口）
+            return [
+                agent
+                for agent, _addr in list(discovery.found_agents)
+                if agent.get("agent_id") != self.agent_id
+            ]
         finally:
             discovery.stop()
 

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import PetAvatar, { type PetMood } from './PetAvatar';
 import { PET_ENABLED_KEY } from '../hooks/usePetEnabled';
+import { closePetOverlay } from '../bridge';
 
 /**
  * PetOverlay — Electron 桌宠透明悬浮窗的独立根组件（简化版）。
@@ -9,15 +10,14 @@ import { PET_ENABLED_KEY } from '../hooks/usePetEnabled';
  * 口型 / 表情演示，不含 VRM 等重物理逻辑。
  *
  * ======================== 接线说明（Electron 环境生效） ========================
- * 1. main.js 的 createPetOverlayWindow() 已创建透明、无边框、置顶、跳过任务栏的
- *    悬浮窗（320×360，transparent:true）。
- * 2. 透明开启注意：transparent:true 时建议 BrowserWindow 先 show:false，
- *    在 ready-to-show 后再调用 win.show()，部分 Linux 上直接 show 会丢透明。
- * 3. 悬浮窗加载独立入口（二选一，当前任务范围取「方案B」仅做组件 + 注释）：
- *    - 方案A（推荐，接独立入口）：在 vite.config.js 的 rollupOptions.input
- *      增加 pet-overlay.html，另写一个 pet-overlay 入口 jsx，用 createRoot 挂载本组件。
- *    - 方案B（当前范围）：本组件只提供结构 + 接线说明，后续任务再接独立 html 入口，
- *      避免为一个占位桌宠引入多页构建的过度工程。
+ * 1. main.js 的 createPetOverlayWindow() 创建透明、无边框、置顶、跳过任务栏的
+ *    悬浮窗（320×360，transparent:true），由 IPC『pet-overlay:open』触发创建，
+ *    『pet-overlay:close』关闭；本组件经独立入口 pet-overlay.html 挂载。
+ * 2. 透明开启：BrowserWindow 以 show:false 创建，ready-to-show 后再 show()，
+ *    避免部分 Linux 上直接 show 会丢透明。
+ * 3. 关闭链路：点击「关闭」→ bridge.closePetOverlay()（IPC）让主进程关窗；
+ *    同时写 localStorage 记录关闭状态，主窗口内 usePetEnabled 经 storage
+ *    事件同步收敛开关显示。开后必有窗、关后必无窗，断链不再出现。
  * 4. 拖拽：本组件底部 .pet-overlay-drag 区域设 -webkit-app-region: drag，
  *    关闭按钮设 no-drag，保证既能拖动又能点击。
  * ======================== 鼠标穿透说明 ========================
@@ -26,22 +26,22 @@ import { PET_ENABLED_KEY } from '../hooks/usePetEnabled';
  *   - 非交互展示区设 pointer-events:none；
  *   - 并在 BrowserWindow 侧配合 setIgnoreMouseEvents(true, { forward: true })。
  * 当前简单起见整窗保留可拖拽，穿透作为后续扩展点。
- *
- * 注意：悬浮窗若需实时响应 cx-a.petEnabled 关闭，可在渲染层订阅 storage 事件。
  */
 export default function PetOverlay() {
   const [mood, setMood] = useState<PetMood>('happy');
   const [talking, setTalking] = useState(false);
 
-  // 关闭按钮：通过 toggle local storage 让主进程关闭悬浮窗
+  // 关闭按钮：优先经 IPC 桥让主进程关闭悬浮窗；localStorage 写入保留作状态记录
   const handleClose = () => {
     try {
       window.localStorage.setItem(PET_ENABLED_KEY, 'false');
     } catch {
       /* no-op */
     }
-    // 占位：后续由主进程监听该 key 变化关闭窗口；此处仅更新本地状态示意
     setTalking(false);
+    void closePetOverlay().catch(() => {
+      /* 主进程不可达时静默：窗口自身状态仍由本次写入收敛 */
+    });
   };
 
   return (

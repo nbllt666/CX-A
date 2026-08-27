@@ -289,3 +289,51 @@ def test_init_defaults_when_config_none():
     assert rt._emb_model_name == DEFAULT_EMBEDDING_MODEL
     assert rt._llm_enabled is False
     assert rt._llm_path == ""
+
+
+# ------------------------------------------------------------------ #
+# 6. M11：n_ctx 覆盖键 + prompt 溢出防护                               #
+# ------------------------------------------------------------------ #
+
+def test_init_reads_n_ctx_override():
+    """local_llm.n_ctx 可覆盖默认 2048；缺失 / 非法 / 非正值回退默认。"""
+    from lite.runtime.llama_runtime import DEFAULT_LLM_N_CTX as NC
+
+    rt_ok = LlamaRuntime(config={"local_llm": {"n_ctx": 512}})
+    assert rt_ok._n_ctx == 512
+    rt_missing = LlamaRuntime(config=None)
+    assert rt_missing._n_ctx == NC
+    for bad in ("abc", None, -1, {"a": 1}):
+        rt_bad = LlamaRuntime(config={"local_llm": {"n_ctx": bad}})
+        assert rt_bad._n_ctx == NC, f"非法 n_ctx={bad!r} 应回退默认"
+
+
+def test_fit_prompt_hard_clip_single_huge_line(llm_model, fake_llama_cpp):
+    """单条超限（无行可删）时走硬截断尾部兜底，且保底最后一轮内容仍在头部预算内。"""
+    rt = LlamaRuntime(config={"local_llm": {"n_ctx": 256}})  # judge 预算=(256-8-64)*4=736
+    rt.load_local_llm(llm_model)
+    rt.judge_should_reply("聊" * 20000)  # 判定模板+巨量输入远超 736
+    prompt = FakeLlama.last_prompt
+    assert len(prompt) <= (256 - 8 - 64) * 4
+
+
+def test_offline_chat_trims_long_history_under_budget(llm_model, fake_llama_cpp):
+    """M11 要求用例：超长历史（经 chat_window 截断仍超出预算）被裁剪后调用成功，
+    投递 prompt 长度不超过预算上限，且重建时保底 system + 最近一轮。"""
+    rt = LlamaRuntime(config=None)  # 默认 n_ctx=2048 -> offline 预算=(2048-128-64)*4=7424
+    assert rt.load_local_llm(llm_model) is True
+    rt._llm.fixed_text = "收到"
+
+    # 每轮 6000 字符：chat_window 取最近 6 条约 36k 字符，必超 7424 预算 -> 触发消息级删减
+    messages = [{"role": "system", "content": "你是 CX-A 助手"}]
+    for i in range(20):
+        messages.append({"role": "user", "content": f"历史第{i}轮：" + "聊" * 6000})
+    out = rt.offline_chat(messages)
+
+    assert out == "收到"
+    prompt = FakeLlama.last_prompt
+    limit = (2048 - 128 - 64) * 4
+    assert len(prompt) <= limit, f"prompt 长度 {len(prompt)} 超过预算 {limit}"
+    # 保底 system + 最近一轮（消息级重建绕开 chat_window 对 system 的截断）
+    assert prompt.startswith("system: ")
+    assert messages[-1]["content"] in prompt

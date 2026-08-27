@@ -141,6 +141,23 @@ def test_dedup_keeps_one_per_content(pipeline):
     assert "apple fruit sour" in contents
 
 
+# ---------------------------------------------------------------- 写入口去重一致性（M7）
+def test_add_dedup_second_similar_returns_none(pipeline):
+    """两次 add 相似内容：第二次命中写入口去重返回 None，且库中只保留一条。"""
+    first = pipeline.add("user prefers iced americano coffee")
+    second = pipeline.add("user prefers iced americano coffee")  # 相似度 1.0 >= 0.85
+    third = pipeline.add("totally different topic about mountains")
+    assert first is not None
+    assert second is None, "重复内容应在写入口被去重，返回 None"
+    assert third is not None, "不同内容不应被误去重"
+    rows = pipeline.store.list(agent_id="default", include_deleted=False)
+    assert len(rows) == 2
+    assert {r["content"] for r in rows} == {
+        "user prefers iced americano coffee",
+        "totally different topic about mountains",
+    }
+
+
 # ---------------------------------------------------------------- 注入上下文组装
 def test_context_text_contains_memories(pipeline):
     pipeline.add("记住用户偏好冷萃咖啡")

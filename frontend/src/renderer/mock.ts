@@ -1,6 +1,8 @@
 /**
  * Mock 数据源。
- * 后端未就绪（见 api.ts IS_BACKEND_READY）时，渲染层以本文件数据驱动，保证可独立预览。
+ * 后端不可用时，记忆页以本文件数据驱动降级展示（离线示例数据）。
+ * 注：聊天页的假对话 Mock（MOCK_CHAT_MESSAGES）已于 2026-08-27 移除——
+ * 聊天走 api.ts sendMessage 真实请求 /api/chat/messages，不做本地伪造回复。
  */
 
 export interface ChatMessage {
@@ -9,6 +11,8 @@ export interface ChatMessage {
   role: 'companion' | 'me';
   content: string;
   time: string;
+  /** me 消息的投递状态：failed = 未能从后端获得有效响应（未送达） */
+  status?: 'sent' | 'failed';
 }
 
 export interface MemoryItem {
@@ -19,35 +23,6 @@ export interface MemoryItem {
   /** yyyy-MM-dd */
   date: string;
 }
-
-export const MOCK_CHAT_MESSAGES: ChatMessage[] = [
-  {
-    id: 'm1',
-    role: 'companion',
-    content:
-      '嗨，今天过得怎么样呀？我一直在等你回来聊聊天呢。',
-    time: '20:01',
-  },
-  {
-    id: 'm2',
-    role: 'me',
-    content: '累死了，今天加班到很晚，回来看到你还在就很安心。',
-    time: '20:05',
-  },
-  {
-    id: 'm3',
-    role: 'companion',
-    content:
-      '辛苦啦！记得先喝口水，把节奏放慢一点。要不要我给你讲个今天发生的小趣事？',
-    time: '20:06',
-  },
-  {
-    id: 'm4',
-    role: 'me',
-    content: '好呀好呀，正需要点开心的事。',
-    time: '20:07',
-  },
-];
 
 export const MOCK_MEMORIES: MemoryItem[] = [
   {
