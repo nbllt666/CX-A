@@ -139,3 +139,18 @@ def test_age_seconds_from_created(calc):
     """时间戳解析为年龄秒数；解析失败返回 0。"""
     assert age_seconds_from_created("2026-08-26 00:00:00.000000", "2026-08-26 01:00:00.000000") == pytest.approx(3600.0)
     assert age_seconds_from_created("bad-time", "2026-08-26 00:00:00.000000") == 0.0
+
+
+# ---------------------------------------------------------------- L8：无再激活分支上界钳制
+def test_reactivation_none_branch_clamped_to_upper(calc):
+    """无再激活分支 emotion_score 超大时结果仍 <=1.0（与有再激活分支口径一致）。"""
+    s = calc.apply_reactivation(0.9, None, emotion_score=100.0)
+    assert 0.0 <= s <= 1.0
+    assert s == pytest.approx(1.0)
+
+    s2 = calc.apply_reactivation(0.9, 0, emotion_score=50.0)
+    assert 0.0 <= s2 <= 1.0
+
+    # 下界行为保持不变：负 base 情感为 0 时钳到 0
+    low = calc.apply_reactivation(-0.5, None, emotion_score=0.0)
+    assert low == pytest.approx(0.0)

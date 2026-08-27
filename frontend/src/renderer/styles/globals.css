@@ -20,9 +20,8 @@
     user-select: none;
   }
 
-  /* 文字可选（输入框 / 气泡正文允许选中复制） */
-  selectable,
-  p,
+  /* 文字可选（输入框 / 气泡正文允许选中复制；正文容器按需挂 .selectable 类） */
+  .selectable,
   input,
   textarea {
     user-select: text;

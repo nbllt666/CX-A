@@ -116,19 +116,24 @@ export default function MemoriesPage() {
       return;
     }
     let alive = true;
-    (async () => {
-      try {
-        const res = await fetchSearch(keyword, { top_k: 20 });
-        if (!alive) return;
-        setSearched(res.memories.map(rowToView));
-      } catch {
-        if (!alive) return;
-        // 搜索失败：清空后端命中，退回到 data 上的本地关键词过滤
-        setSearched(null);
-      }
-    })();
+    // 300ms 防抖：连续输入只在停顿后触发一次检索，避免逐键打满单线程后端。
+    // cleanup 同时清 timer 与 alive 标志，防止防抖窗口过期后的 stale 写入。
+    const timer = setTimeout(() => {
+      (async () => {
+        try {
+          const res = await fetchSearch(keyword, { top_k: 20 });
+          if (!alive) return;
+          setSearched(res.memories.map(rowToView));
+        } catch {
+          if (!alive) return;
+          // 搜索失败：清空后端命中，退回到 data 上的本地关键词过滤
+          setSearched(null);
+        }
+      })();
+    }, 300);
     return () => {
       alive = false;
+      clearTimeout(timer);
     };
   }, [keyword, mode]);
 
@@ -200,7 +205,7 @@ function MemoryCard({ item }: { item: ViewMemory }) {
           <h3 className="font-medium text-[var(--text-primary)]">{item.title}</h3>
           <span className="shrink-0 text-xs text-[var(--text-tertiary)]">{item.date}</span>
         </div>
-        <p className="text-sm leading-relaxed text-[var(--text-secondary)]">{item.summary}</p>
+        <p className="selectable text-sm leading-relaxed text-[var(--text-secondary)]">{item.summary}</p>
         <div className="mt-3 flex flex-wrap gap-1.5">
           {item.tags.map((t) => (
             <span

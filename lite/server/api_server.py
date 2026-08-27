@@ -45,6 +45,10 @@ CHAT_SERVICE_DISABLED = "chat_service_disabled"
 # 云端 provider 白名单（与 lite/cloud/adapter.py 支持的 provider 对齐）
 CLOUD_PROVIDER_ALLOWLIST = ("deepseek", "tongyi", "openai", "moonshot")
 
+# settings PUT 已知只读顶层键：GET 视图可见但不在 PUT 白名单的 section
+# （收到时收集进 ignored 数组回显，消除静默丢弃——L2 收口）
+_SETTINGS_READONLY_TOP_KEYS = ("acp", "remote", "vector")
+
 # CSRF/CORS 加固：受信任的跨源 Origin 白名单。
 # "null" 是 Electron 生产态（file:// 页面）发出的 Origin 字面量；
 # 不使用通配符 *，未命中白名单的一律不返回 CORS 头（浏览器侧即被同源策略拦截）。
@@ -229,11 +233,22 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
 
         def _deny_bad_host(self):
             """Host 校验失败的统一 403 响应。"""
-            self._send_json({"error": "forbidden", "message": "Host 校验失败：拒绝访问"}, 403)
+            self._send_json({"ok": False, "error": "forbidden", "message": "Host 校验失败：拒绝访问"}, 403)
 
         def _guard_internal_error(self, exc):
             """全局异常兜底：回结构化 500，确保畸形输入不致连接中断。"""
-            self._send_json({"error": "internal error", "detail": str(exc)[:200]}, 500)
+            self._send_json({"ok": False, "error": "internal error", "detail": str(exc)[:200]}, 500)
+
+        def _reject_bad_json(self):
+            """malformed / 非 dict 请求体的统一 400（L2 收口：与空 body 明确区分）。"""
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "bad_json",
+                    "message": "请求体必须是合法 JSON 对象且 Content-Type 为 application/json",
+                },
+                400,
+            )
 
         def _send_json(self, payload, status=200):
             """以 UTF-8 编码、ensure_ascii=False 输出 JSON 响应（中文不转义）。"""
@@ -303,23 +318,42 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             支持键：``cloud.provider``（须在 provider 白名单内）、``tts.voice``、
             ``local_llm.enabled``。其余键被忽略并列入 ``ignored`` 返回，供调用方校正。
             段（cloud/tts/local_llm）存在但非 dict 时回 400，避免 AttributeError 冒泡。
+
+            L2 收口语义：
+            - malformed / 非 dict JSON body → 400 ``bad_json``；
+            - 空 body（``{}``）→ 400 ``empty_body``（与 malformed 明确区分）；
+            - GET 视图可见但白名单只读的已知键（acp/remote/vector section 及
+              cloud.base_url）收集进 ``ignored`` 数组随响应回显，消除静默丢弃。
             """
             body = self._read_body_json()
             if body is None:
+                self._reject_bad_json()
+                return
+            if not body:
                 self._send_json(
-                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
+                    {"ok": False, "error": "empty_body", "message": "PUT /api/settings 要求非空配置补丁"}, 400
                 )
                 return
-            # 修复2：先做段类型校验——段存在但非 dict 一律 400，不做 .get() 取值
+            # 先做段类型校验——段存在但非 dict 一律 400，不做 .get() 取值
             invalid_sections = [
                 name for name in ("cloud", "tts", "local_llm")
                 if name in body and not isinstance(body[name], dict)
             ]
             if invalid_sections:
-                self._send_json({"error": f"invalid section type: {', '.join(invalid_sections)}"}, 400)
+                self._send_json(
+                    {"ok": False, "error": f"invalid section type: {', '.join(invalid_sections)}"}, 400
+                )
                 return
             ignored = []
             applied = []
+
+            # 已知只读键回显（GET 视图可见但不在 PUT 白名单）：不再静默丢弃
+            for key in _SETTINGS_READONLY_TOP_KEYS:
+                if key in body:
+                    ignored.append(f"{key}（GET 视图可见但白名单只读，未应用）")
+            cloud_section = body.get("cloud")
+            if isinstance(cloud_section, dict) and "base_url" in cloud_section:
+                ignored.append("cloud.base_url（GET 视图可见但白名单只读，未应用）")
 
             provider = body.get("cloud", {}).get("provider")
             if provider is not None:
@@ -425,7 +459,7 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                     self._handle_computer_status()
                     return
 
-                self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
+                self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
             except Exception as exc:  # noqa: BLE001 - 兜底：任何畸形输入都得到结构化 500 而非连接中断
                 # SystemExit / KeyboardInterrupt 继承 BaseException，不会被此处捕获
                 self._guard_internal_error(exc)
@@ -455,7 +489,7 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                 if path == "/api/computer/call":
                     self._handle_computer_call()
                     return
-                self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
+                self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
             except Exception as exc:  # noqa: BLE001 - 兜底：结构化 500 而非连接中断
                 self._guard_internal_error(exc)
 
@@ -471,7 +505,7 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                     return
                 agent_id = self._extract_agents_id(path)
                 if agent_id is None:
-                    self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
+                    self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
                     return
                 self._handle_agents_update(agent_id)
             except Exception as exc:  # noqa: BLE001 - 兜底：结构化 500 而非连接中断
@@ -492,7 +526,7 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                 if agent_id is not None:
                     self._handle_agents_delete(agent_id)
                     return
-                self._send_json({"error": "not_found", "message": f"未找到接口 {path}"}, 404)
+                self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
             except Exception as exc:  # noqa: BLE001 - 兜底：超大 int 触发 sqlite OverflowError 等畸形输入均结构化响应
                 self._guard_internal_error(exc)
 
@@ -510,12 +544,12 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
         def _delete_memory(self, raw_id):
             """软删除单条记忆（原先 do_DELETE 的记忆分支）。"""
             if not raw_id or "/" in raw_id:
-                self._send_json({"error": "bad_request", "message": "非法记忆 id"}, 400)
+                self._send_json({"ok": False, "error": "bad_request", "message": "非法记忆 id"}, 400)
                 return
             try:
                 memory_id = int(raw_id)
             except ValueError:
-                self._send_json({"error": "bad_request", "message": "id 必须是整数"}, 400)
+                self._send_json({"ok": False, "error": "bad_request", "message": "id 必须是整数"}, 400)
                 return
 
             deleted = self._store.soft_delete(memory_id)
@@ -532,7 +566,7 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                 try:
                     limit = int(query["limit"])
                 except ValueError:
-                    self._send_json({"error": "bad_request", "message": "limit 必须是整数"}, 400)
+                    self._send_json({"ok": False, "error": "bad_request", "message": "limit 必须是整数"}, 400)
                     return
             try:
                 rows = self._store.list(
@@ -542,7 +576,7 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                     include_deleted=False,
                 )
             except ValueError as exc:
-                self._send_json({"error": "bad_request", "message": str(exc)}, 400)
+                self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
                 return
             self._send_json(rows)
 
@@ -558,13 +592,13 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                 try:
                     top_k = int(query["top_k"])
                 except ValueError:
-                    self._send_json({"error": "bad_request", "message": "top_k 必须是整数"}, 400)
+                    self._send_json({"ok": False, "error": "bad_request", "message": "top_k 必须是整数"}, 400)
                     return
             agent_id = query.get("agent_id") or "default"
             try:
                 result = self._pipeline.retrieve(q, agent_id=agent_id, top_k=top_k)
             except ValueError as exc:
-                self._send_json({"error": "bad_request", "message": str(exc)}, 400)
+                self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
                 return
             self._send_json(result)
 
@@ -580,12 +614,12 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                 tuple[dict, int]: (JSON 载荷, HTTP 状态码)。
             """
             if isinstance(exc, RemoteDisabled):
-                return {"error": "remote_disabled", "message": str(exc)}, 503
+                return {"ok": False, "error": "remote_disabled", "message": str(exc)}, 503
             if isinstance(exc, RemoteUnreachable):
-                return {"error": "remote_unreachable", "message": str(exc)}, 504
+                return {"ok": False, "error": "remote_unreachable", "message": str(exc)}, 504
             if isinstance(exc, ValueError):
-                return {"error": "bad_request", "message": str(exc)}, 400
-            return {"error": "remote_error", "message": str(exc)}, 502
+                return {"ok": False, "error": "bad_request", "message": str(exc)}, 400
+            return {"ok": False, "error": "remote_error", "message": str(exc)}, 502
 
         def _handle_remote_status(self):
             """GET /api/remote/status：转发 get_status，异常按语义映射状态码。"""
@@ -601,14 +635,12 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             """POST /api/remote/control：读取 action/agent_id 并转发 control。"""
             body = self._read_body_json()
             if body is None:
-                self._send_json(
-                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
-                )
+                self._reject_bad_json()
                 return
             action = body.get("action")
             if action not in self._remote.ACTIONS:
                 self._send_json(
-                    {"error": "bad_request", "message": f"action 必须为 {'/'.join(self._remote.ACTIONS)}"},
+                    {"ok": False, "error": "bad_request", "message": f"action 必须为 {'/'.join(self._remote.ACTIONS)}"},
                     400,
                 )
                 return
@@ -625,12 +657,12 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             """POST /api/remote/push_config：读取非空 JSON 补丁并转发 push_config。"""
             patch = self._read_body_json()
             if patch is None:
-                self._send_json(
-                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
-                )
+                self._reject_bad_json()
                 return
             if not isinstance(patch, dict) or not patch:
-                self._send_json({"error": "bad_request", "message": "patch 必须为非空 JSON 对象"}, 400)
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "patch 必须为非空 JSON 对象"}, 400
+                )
                 return
             try:
                 data = self._remote.push_config(patch)
@@ -653,17 +685,15 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
         def _handle_computer_authorize(self):
             """POST /api/computer/authorize：body {enabled: bool}，开启/撤销授权。
 
-            同步 authorizer 与 computer 两端授权状态，返回最新状态。
+            同步 authorizer 与 computer 两端授权状态，返回最新状态（ok:true + 状态字段）。
             """
             body = self._read_body_json()
             if body is None:
-                self._send_json(
-                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
-                )
+                self._reject_bad_json()
                 return
             enabled = body.get("enabled")
             if not isinstance(enabled, bool):
-                self._send_json({"error": "bad_request", "message": "enabled 必须为布尔值"}, 400)
+                self._send_json({"ok": False, "error": "bad_request", "message": "enabled 必须为布尔值"}, 400)
                 return
             if enabled:
                 self._authorizer.authorize()
@@ -672,6 +702,7 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             self._computer.set_authorized(self._authorizer.is_authorized())
             self._send_json(
                 {
+                    "ok": True,
                     "authorized": self._authorizer.is_authorized(),
                     "confirm_dangerous": bool(self._authorizer.confirm_dangerous),
                 }
@@ -680,17 +711,17 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
         def _handle_computer_call(self):
             """POST /api/computer/call：body {tool, arguments}，走 ToolBridge 执行。
 
-            未授权（NotAuthorizedError）映射 403；其余协议错误按各错误码映射状态码。
+            未授权（NotAuthorizedError）映射 403 并标注 authorized:false；
+            其余 PluginError 按各自错误码映射状态码，**不误标 authorized 字段**（L3：
+            仅授权类错误才携带 authorized:false，避免语义失真）。
             """
             body = self._read_body_json()
             if body is None:
-                self._send_json(
-                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
-                )
+                self._reject_bad_json()
                 return
             tool = body.get("tool")
             if not tool:
-                self._send_json({"error": "bad_request", "message": "tool 为必填字段"}, 400)
+                self._send_json({"ok": False, "error": "bad_request", "message": "tool 为必填字段"}, 400)
                 return
             arguments = body.get("arguments") if isinstance(body.get("arguments"), dict) else {}
             try:
@@ -698,6 +729,7 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             except NotAuthorizedError as exc:
                 self._send_json(
                     {
+                        "ok": False,
                         "authorized": False,
                         "error": "需要先授权",
                         "error_code": exc.error_code,
@@ -706,14 +738,11 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                 )
                 return
             except PluginError as exc:
-                self._send_json(
-                    {
-                        "authorized": False,
-                        "error": exc.message,
-                        "error_code": exc.error_code,
-                    },
-                    exc.http_status,
-                )
+                payload = {"ok": False, "error": exc.message, "error_code": exc.error_code}
+                # L3：仅授权类错误才标注 authorized:false；其他 PluginError 省略该键
+                if isinstance(exc, NotAuthorizedError):
+                    payload["authorized"] = False
+                self._send_json(payload, exc.http_status)
                 return
             self._send_json(payload)
 
@@ -721,11 +750,13 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
         def _read_body_json(self):
             """读取请求体并解析为 dict。
 
-            返回值语义：
-            - 无 body（Content-Length<=0）：返回 {}（保持既有行为兼容）；
-            - 带 body 但 Content-Type 非 application/json 开头：返回 None（内容类型校验，
-              调用方须将 None 视为坏请求回 400）；
-            - 非法 JSON 或非 dict JSON：返回 {}（与既有语义一致，按空补丁处理）。
+            返回值语义（L2 收口：malformed 与空 body 明确区分）：
+            - 无 body（Content-Length<=0）：返回 ``{}``（空 body 语义，向后兼容）；
+            - 带 body 但 Content-Type 非 application/json 开头：返回 None；
+            - 非法 JSON（malformed）：返回 None，调用方统一回 400 ``bad_json``；
+            - 合法 JSON 但非 dict（数组/字符串/数字等）：返回 None（结构不符契约，
+              视为坏请求）。
+            调用方必须将 None 视为坏请求回 400。
             """
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -739,8 +770,8 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             try:
                 body = json.loads(self.rfile.read(length).decode("utf-8"))
             except (OSError, ValueError):
-                return {}
-            return body if isinstance(body, dict) else {}
+                return None
+            return body if isinstance(body, dict) else None
 
         def _handle_agents_list(self, query):
             """Agent 列表：支持 enabled 过滤（true/false），默认返回全部。"""
@@ -752,7 +783,7 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                 elif raw in ("false", "0"):
                     enabled = False
                 else:
-                    self._send_json({"error": "bad_request", "message": "enabled 必须为 true/false"}, 400)
+                    self._send_json({"ok": False, "error": "bad_request", "message": "enabled 必须为 true/false"}, 400)
                     return
             agents = self._manager.list(enabled=enabled)
             self._send_json([a.to_dict() for a in agents])
@@ -761,14 +792,14 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             """创建 Agent：body 必须含 name 与 persona，voice 可选。"""
             body = self._read_body_json()
             if body is None:
-                self._send_json(
-                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
-                )
+                self._reject_bad_json()
                 return
             name = (body.get("name") or "").strip()
             persona = (body.get("persona") or "").strip()
             if not name or not persona:
-                self._send_json({"error": "bad_request", "message": "name 与 persona 为必填字段"}, 400)
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "name 与 persona 为必填字段"}, 400
+                )
                 return
             voice = body.get("voice") or None
             agent = self._manager.create(name=name, persona=persona, voice=voice)
@@ -778,14 +809,12 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             """更新 Agent：body 为任意可更新字段（name/persona/voice/enabled）。"""
             body = self._read_body_json()
             if body is None:
-                self._send_json(
-                    {"error": "bad_request", "message": "请求体 Content-Type 必须为 application/json"}, 400
-                )
+                self._reject_bad_json()
                 return
             try:
                 agent = self._manager.update(agent_id, **body)
             except AgentNotFound as exc:
-                self._send_json({"error": "not_found", "message": str(exc)}, 404)
+                self._send_json({"ok": False, "error": "not_found", "message": str(exc)}, 404)
                 return
             self._send_json(agent.to_dict())
 

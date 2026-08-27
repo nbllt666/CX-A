@@ -61,7 +61,17 @@ export default function App() {
 
   // 路由与 hash 双向同步
   useEffect(() => {
-    const onHash = () => setView(parseHash(window.location.hash));
+    const onHash = () => {
+      const parsed = parseHash(window.location.hash);
+      setView(parsed);
+      // 运行期非法 hash 归一：回落视图的同时回写地址栏，消除 URL 与视图失配。
+      // 死循环防护：仅在「非空且不在路由表」时回写；写回的目标必然合法，
+      // 二次触发的 hashchange 不满足条件即短路（写入同值浏览器也不会再派发事件）。
+      const clean = window.location.hash.replace(/^#\/?/, '').split('.')[0];
+      if (clean && !VIEWS.includes(clean as View)) {
+        window.location.hash = viewToHash(parsed);
+      }
+    };
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);

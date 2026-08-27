@@ -16,12 +16,32 @@
 """
 
 import os
+import re
 import warnings
 
 from lite.config.config_manager import ConfigManager
 
 #: 默认音色标识（依赖 MeloTTS 官方模型，首次使用联网自动下载；自定义包放 data/voices/）
 DEFAULT_VOICE_ID = "cx-open"
+
+#: 音色 id 路径穿越特征：盘符前缀或含任意路径分隔符（L13）
+_VOICE_ID_TRAVERSAL_RE = re.compile(r"^[A-Za-z]:|[\\/]")
+
+
+def _is_unsafe_voice_id(voice_id) -> bool:
+    """判定音色 id 是否含路径穿越特征（L13）。
+
+    包含 ``/``、``\\``、``..`` 或盘符模式（如 ``C:``）任一即视为非法：
+    此类 id 可能逃逸 ``data/voices/`` 根目录读写任意位置。
+
+    :param voice_id: 待检音色 id（str）
+    :return: True 表示非法（应拒绝）
+    """
+    if not isinstance(voice_id, str) or not voice_id:
+        return False
+    if _VOICE_ID_TRAVERSAL_RE.search(voice_id):
+        return True
+    return ".." in voice_id
 
 
 def default_voices_dir():
@@ -144,15 +164,21 @@ class VoiceManager:
           否则返回 ``None``，回退后端内置默认音色）；
         - ``voice`` 为自定义 id -> ``data/voices/{id}``（存在则返回；
           不存在返回 ``None``）；
-        - ``voice=None`` -> 解析当前默认音色（config ``tts.voice``）。
+        - ``voice=None`` -> 解析当前默认音色（config ``tts.voice``）；
+        - 含路径穿越特征（``/`` ``\\`` ``..`` 盘符）的 id 一律视为非法音色，
+          返回 ``None``（沿用失败路径语义，回退内置默认音色；L13）。
 
         :param voice: 音色 id；留空使用默认音色
-        :return: 音色包绝对路径；不存在返回 ``None``（用内置默认音色）
+        :return: 音色包绝对路径；不存在或非法返回 ``None``（用内置默认音色）
         """
         target = voice or self._effective_default() or DEFAULT_VOICE_ID
         if not isinstance(target, str) or not target.strip():
             target = DEFAULT_VOICE_ID
-        path = os.path.join(self.voices_dir, target.strip())
+        candidate = target.strip()
+        if _is_unsafe_voice_id(candidate):
+            # 非法音色 id（路径穿越）：拒绝解析，回退内置默认音色
+            return None
+        path = os.path.join(self.voices_dir, candidate)
         if self._is_loadable_voice(path):
             return path
         return None

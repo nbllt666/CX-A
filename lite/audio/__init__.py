@@ -153,6 +153,10 @@ def _try_build_llm_judge(local_llm_cfg):
                 "model_path": model_path,
                 # M11：可选 n_ctx 覆盖键透传；缺失/None 时由 LlamaRuntime 回退默认 2048
                 "n_ctx": local_llm_cfg.get("n_ctx"),
+                # GPU 开关透传：device（cpu/gpu）与可选 n_gpu_layers 高级覆盖，
+                # 缺失/None 时由 LlamaRuntime._read_gpu_layers 按 device 推导
+                "device": local_llm_cfg.get("device"),
+                "n_gpu_layers": local_llm_cfg.get("n_gpu_layers"),
             }
         }
     )

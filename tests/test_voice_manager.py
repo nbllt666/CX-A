@@ -111,6 +111,32 @@ def test_resolve_voice_default_dir_missing_returns_none(tmp_path):
     assert vm.resolve_voice() is None
 
 
+def test_resolve_voice_rejects_traversal_ids(tmp_path):
+    """L13：含 / \\ .. 或盘符的音色 id 一律拒绝返回 None（路径穿越防护）。"""
+    voices = tmp_path / "voices"
+    # 即使对应目录真实存在（含可加载文件），穿越 id 也必须被拒绝
+    _make_voice(voices, "cx-open", "p.pt")
+    evil_target = tmp_path / "evil" / "secret.pt"
+    evil_target.parent.mkdir(parents=True, exist_ok=True)
+    evil_target.write_bytes(b"x")
+
+    vm = VoiceManager(voices_dir=str(voices))
+    malicious_ids = [
+        "../evil",
+        "..\\evil",
+        "sub/dir",
+        "sub\\dir",
+        "..",
+        "C:windows-system32",
+        "a/../..",
+    ]
+    for vid in malicious_ids:
+        assert vm.resolve_voice(vid) is None, f"非法 id 未被拒绝：{vid!r}"
+
+    # 合法 id 不受影响
+    assert vm.resolve_voice("cx-open") == str(voices / "cx-open")
+
+
 # ------------------------------------------------------------------ #
 # 4. set_default_voice                                             #
 # ------------------------------------------------------------------ #

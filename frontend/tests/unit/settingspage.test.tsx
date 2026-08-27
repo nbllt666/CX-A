@@ -80,4 +80,17 @@ describe('SettingsPage：PUT 失败 → 内联错误提示', () => {
     await screen.findByText(VOICE_ERROR);
     expect(screen.queryByText(LOCAL_MODE_ERROR)).not.toBeInTheDocument();
   });
+
+  it('localStorage 键族迁移：预置旧 cx.* 键时降级读取回落旧值并静默写入新 cx-a.* 键', async () => {
+    // 预置旧版键族状态（新键缺失）：模拟既有用户升级场景
+    window.localStorage.setItem('cx.computer.authorized', '1');
+
+    render(<SettingsPage />);
+    await screen.findByText(/设置加载失败啦/); // 全部请求失败 → 走本地记忆分支
+
+    // computer/status 请求失败后 readLsBool 触发迁移：旧键值读回并写入新键
+    await vi.waitFor(() => {
+      expect(window.localStorage.getItem('cx-a.computer.authorized')).toBe('1');
+    });
+  });
 });

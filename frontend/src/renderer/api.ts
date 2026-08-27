@@ -37,17 +37,6 @@ export const API_ENDPOINTS = {
     /** 更新可热更配置（PUT，白名单键：cloud.provider / tts.voice / local_llm.enabled） */
     update: `${API_BASE}/settings`,
   },
-  management: {
-    /** 管理面已收敛为纯 API：前端不再路由这些端点；供另一 Agent / 管理工具调用 */
-    agents: `${API_BASE}/agents`,
-    remote: `${API_BASE}/remote/status`,
-    status: `${API_BASE}/status`,
-  },
-  chatGuard: {
-    /** 聊天服务未启用守卫（避免直连误 404；本期前端走 Mock） */
-    send: `${API_BASE}/chat/messages`,
-    history: `${API_BASE}/chat/history`,
-  },
   computer: {
     /** 电脑控制授权状态 */
     status: `${API_BASE}/computer/status`,
@@ -125,32 +114,6 @@ export async function fetchSearch(
   if (opts?.agent_id) qs.set('agent_id', opts.agent_id);
   if (opts?.top_k != null) qs.set('top_k', String(opts.top_k));
   return requestJson(`${API_ENDPOINTS.memories.search}?${qs.toString()}`);
-}
-
-/** 一条 Agent 的后端原始记录（对应 lite/management/local_agents.py 的 Agent.to_dict()） */
-export interface AgentRow {
-  id: string;
-  name: string;
-  persona: string;
-  voice: string;
-  enabled: boolean;
-  created_at?: string;
-  updated_at?: string;
-  [key: string]: unknown;
-}
-
-/** 拉取本地 Agent 列表（附带 enabled 过滤可选）。 */
-export async function fetchAgents(params?: { enabled?: boolean }): Promise<AgentRow[]> {
-  const qs = new URLSearchParams();
-  if (params?.enabled != null) qs.set('enabled', String(params.enabled));
-  const query = qs.toString();
-  const url = `${API_ENDPOINTS.management.agents}${query ? `?${query}` : ''}`;
-  return requestJson<AgentRow[]>(url);
-}
-
-/** 软删除单条记忆。 */
-export async function deleteMemory(id: string | number): Promise<{ ok: boolean }> {
-  return requestJson<{ ok: boolean }>(API_ENDPOINTS.memories.delete(id), { method: 'DELETE' });
 }
 
 /** 用户可读配置视图（对应 GET /api/settings，不含 API Key）。 */

@@ -172,9 +172,13 @@ class DecayCalculator:
         return self.retention(importance, age_seconds, decay_type, params)
 
     def apply_reactivation(self, base_score, reactivation_count, emotion_score=0.0):
-        """应用再激活加成与情感加成（对齐 CX-O calculate_reactivation_score）。"""
+        """应用再激活加成与情感加成（对齐 CX-O calculate_reactivation_score）。
+
+        两个分支口径一致：下界 0.0、上界 1.0（L8 修复：无再激活分支原先缺上界，
+        emotion_score 超大时会返回 >1.0 破坏 0~1 契约）。
+        """
         if reactivation_count is None or reactivation_count <= 0:
-            return max(base_score + 0.05 * abs(emotion_score or 0.0), 0.0)
+            return min(max(base_score + 0.05 * abs(emotion_score or 0.0), 0.0), 1.0)
         enhanced = base_score * (1.0 + REACTIVATION_GAIN * reactivation_count) + REACTIVATION_BASE
         enhanced += EMOTION_BOOST * abs(emotion_score or 0.0)
         return min(enhanced, 1.0)

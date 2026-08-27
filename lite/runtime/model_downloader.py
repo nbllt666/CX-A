@@ -24,6 +24,8 @@
 """
 
 import os
+import re
+import shutil
 import time
 import urllib.request
 
@@ -183,20 +185,89 @@ class LlmDownloader:
                 f"预期 {verify_size_gb} GB。"
             )
 
+    # ------------------------------------------------------------------ #
+    # 磁盘预检与 Range 续传辅助（L10）                                    #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _disk_free_bytes(path):
+        """返回 path（或其最近存在的祖先目录）所在磁盘的可用字节数。
+
+        Args:
+            path: 目标目录；允许不存在（逐级向上找最近存在祖先）。
+        Returns:
+            int: 可用字节数；探测失败时返回 float("inf") 以不阻断下载。
+        """
+        probe = path
+        while probe and not os.path.exists(probe):
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        try:
+            return shutil.disk_usage(probe or os.getcwd()).free
+        except OSError:
+            return float("inf")
+
     @classmethod
-    def _stream_from_response(cls, read_chunks, total, tmp_path, progress_cb):
+    def _ensure_disk_space(cls, path, expected_bytes, filename=""):
+        """磁盘空间预检（L10）：可用空间 < 预期×1.05 时抛 ValueError，且不落任何文件。
+
+        Args:
+            path: 预检目标目录。
+            expected_bytes: 预期文件大小（字节），须 > 0 才生效。
+            filename: 文件名（仅用于日志/报错提示）。
+        Raises:
+            ValueError: 磁盘可用空间不足时抛出。
+        """
+        expected = int(expected_bytes)
+        if expected <= 0:
+            return
+        needed = int(expected * 1.05)
+        free = cls._disk_free_bytes(path)
+        if free < needed:
+            raise ValueError(
+                f"磁盘空间不足：{filename or '模型文件'}需约 {expected / (1024 ** 3):.2f} GB"
+                f"（含 5% 余量需 {needed / (1024 ** 3):.2f} GB），"
+                f"当前可用 {free / (1024 ** 3):.2f} GB。"
+            )
+
+    @staticmethod
+    def _content_range_total(headers, already_have):
+        """从 206 响应头推算整文件总字节数（断点续传用）。
+
+        优先解析 ``Content-Range: bytes start-end/total`` 的 total；
+        缺失时以 ``Content-Length(剩余长度) + already_have`` 兜底；仍不可得返回 0。
+        """
+        try:
+            content_range = headers.get("Content-Range") or ""
+        except AttributeError:
+            content_range = ""
+        match = re.search(r"/\s*(\d+)\s*$", str(content_range))
+        if match:
+            return int(match.group(1))
+        try:
+            rest = int(headers.get("Content-Length", 0) or 0)
+        except (AttributeError, ValueError, TypeError):
+            rest = 0
+        return already_have + rest
+
+    @classmethod
+    def _stream_from_response(cls, read_chunks, total, tmp_path, progress_cb, start_offset=0):
         """把分块迭代器流式写入临时文件，返回累计字节数。
 
         Args:
             read_chunks: 块迭代器（每次产出 bytes 或 None）。
-            total: 响应声明总长度（Content-Length，无则 0）。
+            total: 响应声明总长度（Content-Length 或续传时的整文件总长，无则 0）。
             tmp_path: 临时文件路径。
             progress_cb: 可选回调 ``cb(downloaded, total)``。
+            start_offset: 续传起点字节数（>0 时以追加模式写入，进度从该偏移量续计）。
         Returns:
-            int: 实际累计下载字节数。
+            int: 实际累计下载字节数（含 start_offset）。
         """
-        done = 0
-        with open(tmp_path, "wb") as f:
+        done = int(start_offset)
+        mode = "ab" if done > 0 else "wb"
+        with open(tmp_path, mode) as f:
             for chunk in read_chunks:
                 if not chunk:
                     continue
@@ -206,21 +277,53 @@ class LlmDownloader:
                     progress_cb(done, total)
         return done
 
-    def _download_requests(self, url, tmp_path, progress_cb):
-        """使用 requests 流式下载（分块写临时文件），返回 ``(downloaded, total)``。"""
-        resp = self._requests.get(url, stream=True, timeout=self.timeout)
+    def _download_requests(self, url, tmp_path, progress_cb, resume_size=0):
+        """使用 requests 流式下载（分块写临时文件），返回 ``(downloaded, total)``。
+
+        L10：resume_size > 0 时携带 ``Range: bytes=<resume_size>-`` 请求头；
+        服务器响应 206 则以追加模式断点续传，响应非 206（忽略 Range 返回 200）
+        则从头重写覆盖 tmp。开流写盘前按 Content-Length 做磁盘预检。
+        """
+        kwargs = {"stream": True, "timeout": self.timeout}
+        seeking = False
+        if resume_size and resume_size > 0:
+            kwargs["headers"] = {"Range": f"bytes={int(resume_size)}-"}
+            seeking = True
+        resp = self._requests.get(url, **kwargs)
         resp.raise_for_status()
-        total = int((resp.headers or {}).get("Content-Length", 0) or 0)
+        headers = resp.headers or {}
+        if seeking and getattr(resp, "status_code", None) == 206:
+            start = int(resume_size)
+            total = self._content_range_total(headers, start)
+        else:
+            start = 0
+            total = int(headers.get("Content-Length", 0) or 0)
+        self._ensure_disk_space(self.dest_dir, total, os.path.basename(tmp_path))
         downloaded = self._stream_from_response(
-            resp.iter_content(chunk_size=64 * 1024), total, tmp_path, progress_cb
+            resp.iter_content(chunk_size=64 * 1024), total, tmp_path, progress_cb,
+            start_offset=start,
         )
         return downloaded, total
 
-    def _download_urllib(self, url, tmp_path, progress_cb):
-        """使用 urllib.request 兜底流式下载，返回 ``(downloaded, total)``（未装 requests 时）。"""
+    def _download_urllib(self, url, tmp_path, progress_cb, resume_size=0):
+        """使用 urllib.request 兜底流式下载，返回 ``(downloaded, total)``（未装 requests 时）。
+
+        L10：resume_size > 0 时携带 ``Range`` 头；resp.status==206 追加续传，
+        否则从头重写覆盖。开流写盘前按 Content-Length 做磁盘预检。
+        """
         req = urllib.request.Request(url)
+        seeking = False
+        if resume_size and resume_size > 0:
+            req.add_header("Range", f"bytes={int(resume_size)}-")
+            seeking = True
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310 - 下载源为固定白名单双源
-            total = int((resp.headers or {}).get("Content-Length", 0) or 0)
+            headers = resp.headers or {}
+            if seeking and getattr(resp, "status", None) == 206:
+                start = int(resume_size)
+                total = self._content_range_total(headers, start)
+            else:
+                start = 0
+                total = int(headers.get("Content-Length", 0) or 0)
 
             def _iterator():
                 while True:
@@ -229,11 +332,13 @@ class LlmDownloader:
                         break
                     yield chunk
 
-            downloaded = self._stream_from_response(_iterator(), total, tmp_path, progress_cb)
+            downloaded = self._stream_from_response(
+                _iterator(), total, tmp_path, progress_cb, start_offset=start
+            )
             return downloaded, total
 
     def download(self, repo, filename, source=None, progress_cb=None, verify_size_gb=None) -> Path:
-        """流式下载 GGUF 模型到存储目录（临时文件 + 原子改名）。
+        """流式下载 GGUF 模型到存储目录（临时文件 + 原子改名 + 断点续传）。
 
         Args:
             repo: 仓库标识（org/name 双段）。
@@ -244,7 +349,15 @@ class LlmDownloader:
         Returns:
             Path: 下载/已存在模型的绝对路径。
         Raises:
-            ValueError: 入参非法、未知下载源、或大小校验失败时抛出。
+            ValueError: 入参非法、未知下载源、磁盘空间不足或大小校验失败时抛出。
+
+        L10 行为：
+        - 下载前磁盘预检：verify_size_gb 可推算预期大小时，可用空间 < 预期×1.05
+          直接抛 ValueError，不落任何文件（响应头 Content-Length 提前得知时，
+          开流写盘前按同一口径二次预检）；
+        - 断点续传：网络中断保留 ``<filename>.tmp``；重入时若 tmp 存在则携带
+          Range 头请求，206 追加续传、200 从头重写覆盖；
+        - 最终校验逻辑（done==total / verify_size 容差 / 失败删 tmp）不变。
         """
         self._validate_repo(repo)
         self._validate_filename(filename)
@@ -252,6 +365,11 @@ class LlmDownloader:
         if src not in _SOURCE_ALIASES:
             raise ValueError(f"未知下载源：{source!r}，仅支持 modelscope / huggingface。")
         url = self.build_url(src, repo, filename)
+
+        # L10：预期大小可由 verify_size_gb 推算时，先做磁盘预检再创建目录/写文件
+        if verify_size_gb is not None and float(verify_size_gb) > 0:
+            expected_bytes = int(float(verify_size_gb) * (1024 ** 3))
+            self._ensure_disk_space(self.dest_dir, expected_bytes, filename)
 
         os.makedirs(self.dest_dir, exist_ok=True)
         dest = os.path.join(self.dest_dir, filename)
@@ -263,25 +381,31 @@ class LlmDownloader:
                 self._check_size(os.path.getsize(dest), verify_size_gb, filename)
             return Path(dest)
 
+        # L10：断点重入检测——已有 .tmp 时从其大小处请求续传
+        tmp = dest + ".tmp"
+        resume_size = 0
+        if os.path.isfile(tmp):
+            try:
+                resume_size = max(0, os.path.getsize(tmp))
+            except OSError:
+                resume_size = 0
+        if resume_size > 0:
+            self._log("INFO", f"发现未完成的临时文件（{resume_size} 字节），尝试断点续传：{filename}")
+
         if self._using_requests and self._requests is not None:
             self._log("INFO", f"开始下载：{url}")
-            tmp = dest + ".tmp"
+            # 异常时不再删除 .tmp（L10）：保留供下次断点续传
             try:
-                downloaded, total = self._download_requests(url, tmp, progress_cb)
-            except Exception as exc:  # noqa: BLE001 - 网络/写入异常统一清理临时文件后上抛
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-                self._log("ERROR", f"下载失败：{filename}（{exc}）")
+                downloaded, total = self._download_requests(url, tmp, progress_cb, resume_size=resume_size)
+            except Exception as exc:  # noqa: BLE001 - 网络/写入异常统一记录后上抛
+                self._log("ERROR", f"下载失败（已保留 .tmp 供断点续传）：{filename}（{exc}）")
                 raise
         else:
             self._log("INFO", f"开始下载（urllib 兜底）：{url}")
-            tmp = dest + ".tmp"
             try:
-                downloaded, total = self._download_urllib(url, tmp, progress_cb)
+                downloaded, total = self._download_urllib(url, tmp, progress_cb, resume_size=resume_size)
             except Exception as exc:  # noqa: BLE001
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-                self._log("ERROR", f"下载失败：{filename}（{exc}）")
+                self._log("ERROR", f"下载失败（已保留 .tmp 供断点续传）：{filename}（{exc}）")
                 raise
 
         # M12 修复：所有校验前置于 os.replace——损坏/伪造大小的模型不得落到正式位。

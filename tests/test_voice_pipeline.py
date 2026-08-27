@@ -612,3 +612,84 @@ def test_custom_judge_exception_defaults_to_reply():
     pipe = _pipeline(judge=ToxicJudge(), cloud=cloud)
     out = pipe.feed_audio(b"x")
     assert out["should_reply"] is True          # 判定越界也默认回复（不哑巴）
+
+
+# ------------------------------------------------------------------ #
+# L11 feed_audio 并发封口                                            #
+# ------------------------------------------------------------------ #
+
+def test_feed_audio_and_start_session_mutually_exclusive():
+    """L11：feed_audio 与 start_session 经 _feed_lock 互斥（同持一线程内串行）。"""
+    pipe = _pipeline()
+
+    class ProbeVAD(FakeVAD):
+        """在 VAD 回调中尝试 start_session——重入同一把锁，普通 Lock 应死锁吗？
+        不会进入该路径：feed_audio 的实现不调 start_session；此探针仅验证
+        detect_speech_end 执行期间锁处于持有状态。"""
+
+        def __init__(self):
+            super().__init__()
+            self.lock_held_during_detect = False
+
+        def detect_speech_end(self, chunk):
+            self.lock_held_during_detect = pipe._feed_lock.locked()
+            return False  # 不触发完整对话链路
+
+    vad = ProbeVAD()
+    pipe.vad = vad
+    assert pipe.feed_audio(b"chunk") is None
+    assert vad.lock_held_during_detect is True   # 喂入全程持锁
+    # 锁已释放
+    assert pipe._feed_lock.locked() is False
+
+
+def test_concurrent_feed_and_session_serialized():
+    """L11：多线程同时喂音频/开会话不崩、缓冲无交错污染（无异常即封口生效）。"""
+    import threading
+
+    class OnceEndVAD:
+        """第 N 次触发结束的 VAD：前 4 次未结束入缓冲，之后每帧判结束。"""
+
+        def __init__(self):
+            self.calls = 0
+            self._lock = threading.Lock()
+
+        def reset(self):
+            pass
+
+        def detect_speech_end(self, chunk):
+            with self._lock:
+                self.calls += 1
+                return self.calls > 4
+
+    pipe = _pipeline(vad=OnceEndVAD(), asr=_asr("并发"), cloud=FakeCloud())
+
+    errors = []
+
+    def feeder():
+        try:
+            for _ in range(50):
+                pipe.feed_audio(b"c" * 8)
+        except Exception as exc:  # noqa: BLE001 - 线程内异常收集到主线程断言
+            errors.append(exc)
+
+    def sessioner():
+        try:
+            for _ in range(20):
+                pipe.start_session()
+        except Exception as exc:  # noqa: BLE001 - 同上
+            errors.append(exc)
+
+    threads = [threading.Thread(target=feeder) for _ in range(2)] + [
+        threading.Thread(target=sessioner) for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert errors == []
+    # 最终状态自洽：锁空闲、messages 为列表、缓冲为列表
+    assert pipe._feed_lock.locked() is False
+    assert isinstance(pipe.messages, list)
+    assert isinstance(pipe._utterance_buffer, list)

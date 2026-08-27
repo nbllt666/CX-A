@@ -161,7 +161,7 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
       <div className={`max-w-[70%] flex flex-col ${isMe ? 'items-end' : 'items-start'}`}>
         <div
           className={[
-            'rounded-2xl px-3.5 py-2 text-sm leading-relaxed whitespace-pre-wrap',
+            'selectable rounded-2xl px-3.5 py-2 text-sm leading-relaxed whitespace-pre-wrap',
             isMe
               ? 'bg-gradient-to-r from-[var(--color-secondary)] to-[var(--color-primary)] text-white'
               : 'bg-[var(--glass-bg-strong)] text-[var(--text-primary)] shadow-sm',

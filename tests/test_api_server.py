@@ -16,7 +16,45 @@ from urllib.parse import urlencode
 
 import pytest
 
-from lite.server.api_server import create_app
+from lite.computer_control import ComputerControl, ToolBridge
+from lite.computer_control.security import ControlAuthorizer
+from lite.server.api_server import build_deps, create_app, make_handler
+
+
+@pytest.fixture()
+def computer_env(tmp_path):
+    """L3 测试用电脑控制依赖：fake 键盘后端 + authorizer + bridge 起服，返回 (base, authorizer, keyboard)。"""
+
+    class _FakeKeyboard:
+        def __init__(self):
+            self.clicks = []
+
+        def click(self, x, y):
+            self.clicks.append((x, y))
+
+        def type_text(self, text):
+            pass
+
+    store, pipeline, manager, _remote = build_deps(data_dir=str(tmp_path))
+    authorizer = ControlAuthorizer(data_dir=str(tmp_path))
+    keyboard = _FakeKeyboard()
+    computer = ComputerControl(authorized=authorizer.is_authorized(), keyboard_backend=keyboard)
+    bridge = ToolBridge(computer=computer, authorizer=authorizer)
+    handler = make_handler(
+        store, pipeline, manager,
+        computer=computer, authorizer=authorizer, bridge=bridge,
+    )
+    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    port = httpd.server_address[1]
+    base_url = f"http://127.0.0.1:{port}"
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield base_url, authorizer, keyboard
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
 
 
 @pytest.fixture()
@@ -389,3 +427,134 @@ def test_create_app_default_memory_config_unchanged(tmp_path):
     assert pipeline.manager.dedup_threshold == pytest.approx(0.85)
     assert pipeline.manager._permanent_threshold == pytest.approx(0.95)
     assert len(store.list()) == 0
+
+
+# ---------------------------------------------------------------- L2/L3 收口与外壳统一（20260827_模块0_低危清理_服务通信侧）
+def http_raw_body(url, raw, method="POST", content_type="application/json"):
+    """发送任意原始 body（协议边界场景：malformed JSON 等），返回 (status, JSON)。"""
+    headers = {"Content-Type": content_type} if content_type else {}
+    req = urllib.request.Request(url, data=raw, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def test_settings_malformed_json_returns_bad_json(api_server):
+    """L2：settings PUT malformed JSON → 400 bad_json（不再吞错按空补丁处理）。"""
+    _store, _pipeline, base = api_server
+    status, body = http_raw_body(f"{base}/api/settings", b"{not-valid-json", method="PUT")
+    assert status == 400
+    assert body["error"] == "bad_json"
+    assert body["ok"] is False
+
+
+def test_settings_non_dict_json_returns_bad_json(api_server):
+    """L2：合法 JSON 但非 dict（数组）→ 视为结构不符的坏请求 400 bad_json。"""
+    _store, _pipeline, base = api_server
+    status, body = http_raw_body(f"{base}/api/settings", b"[1,2,3]", method="PUT")
+    assert status == 400
+    assert body["error"] == "bad_json"
+
+
+def test_settings_empty_body_returns_empty_body_error(api_server):
+    """L2：settings PUT 空 body {} 与 malformed 区分 → 400 empty_body。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/settings", {}, method="PUT")
+    assert status == 400
+    assert body["error"] == "empty_body"
+    assert body["ok"] is False
+
+
+def test_other_endpoints_empty_body_keep_semantics(api_server):
+    """L2：其余端点空 body 维持既有语义（agents create 走必填字段校验而非 bad_json）。"""
+    _store, _pipeline, base = api_server
+    # 空 dict 补丁对 agents/create：既非 None 也非非法 -> 走 name/persona 必填校验
+    status, body = http_post(f"{base}/api/agents", {})
+    assert status == 400
+    assert body["error"] == "bad_request"
+    assert "persona" in body["message"]
+
+
+def test_agents_update_malformed_json_returns_bad_json(api_server):
+    """L2：agents update malformed JSON → 400 bad_json。"""
+    _store, _pipeline, base = api_server
+    status, body = http_raw_body(f"{base}/api/agents/default", b"@@", method="PUT")
+    assert status == 400
+    assert body["error"] == "bad_json"
+
+
+def test_settings_readonly_known_keys_echo_in_ignored(api_server):
+    """L2：GET 可见但白名单只读键（acp/remote section、cloud.base_url）进 ignored 回显。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/settings",
+        {
+            "cloud": {"provider": "openai", "base_url": "https://mirror.example.com/v1"},
+            "acp": {"enabled": True},
+            "remote": {"enabled": True},
+            "vector": {"dim": 64},
+        },
+        method="PUT",
+    )
+    assert status == 200
+    assert body["ok"] is True
+    assert body["applied"] == ["cloud.provider"]
+    ignored_text = "\n".join(body["ignored"])
+    assert "acp" in ignored_text
+    assert "remote" in ignored_text
+    assert "vector" in ignored_text
+    assert "cloud.base_url" in ignored_text
+    # provider 本身仍正常生效
+    assert body["config"]["cloud"]["provider"] == "openai"
+
+
+def test_settings_put_response_ok_true_and_applied(api_server):
+    """L3 外壳统一：settings PUT 正常响应带 ok:true 与 applied 数组。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/settings", {"tts": {"voice": "ling"}}, method="PUT")
+    assert status == 200
+    assert body["ok"] is True
+    assert body["applied"] == ["tts.voice"]
+
+
+def test_computer_call_plugin_error_without_authorized_field(computer_env):
+    """L3：非授权类 PluginError 不误标 authorized 字段（键不存在）。"""
+    base, authorizer, _kb = computer_env
+    http_post(f"{base}/api/computer/authorize", payload={"enabled": True}, method="POST")
+
+    status, body = http_post(
+        f"{base}/api/computer/call",
+        payload={"tool": "no_such_tool", "arguments": {}},
+        method="POST",
+    )
+    assert status == 400
+    assert body["ok"] is False
+    assert body["error_code"] == "INVALID_ARGUMENT"
+    assert "authorized" not in body  # 非授权类错误不得携带该字段
+
+
+def test_computer_call_unauthorized_keeps_authorized_false(computer_env):
+    """L3：NotAuthorizedError 分支仍显式携带 authorized:false（语义保留）。"""
+    base, _authorizer, _kb = computer_env
+    status, body = http_post(
+        f"{base}/api/computer/call",
+        payload={"tool": "computer_keyboard_control", "arguments": {}},
+        method="POST",
+    )
+    assert status == 403
+    assert body["authorized"] is False
+    assert body["ok"] is False
+    assert body["error_code"] == "NOT_AUTHORIZED"
+
+
+def test_computer_authorize_success_ok_true(computer_env):
+    """L3 外壳统一：authorize 成功响应增量补 ok:true。"""
+    base, _authorizer, _kb = computer_env
+    status, body = http_post(
+        f"{base}/api/computer/authorize", payload={"enabled": True}, method="POST"
+    )
+    assert status == 200
+    assert body["ok"] is True
+    assert body["authorized"] is True

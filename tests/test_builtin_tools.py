@@ -315,3 +315,91 @@ def test_list_tools_reports_source_builtin():
         assert t["source"] == "builtin"
         assert "description" in t and t["description"]
         assert t["category"] in ("computer_control", "memory_tools", "system_tools")
+
+
+# --------------------------------------------------------------------------- #
+# tools_provider 实时开关（L1）                                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_tools_provider_runtime_toggle_applies():
+    """注入 tools_provider 后，运行期翻动类别开关 call_tool 行为随之变化。"""
+    live = {"computer_control": False, "memory_tools": True, "system_tools": True}
+    reg = BuiltinToolRegistry(
+        config=_CONFIG_COMPUTER_ON,  # 注册期快照为 computer_control=True
+        tools_provider=lambda: live,
+    )
+
+    # 实时开关为关 -> 即使注册期快照开启也被拒绝
+    res = reg.call("system_info", {"category": "status"})
+    assert res["success"] is True
+
+    live["system_tools"] = False
+    res = reg.call("system_info", {"category": "status"})
+    assert res["success"] is False
+    assert res["error"] == "系统信息工具未启用"
+
+    # 再翻回来恢复可用
+    live["system_tools"] = True
+    res = reg.call("system_info", {"category": "status"})
+    assert res["success"] is True
+
+
+def test_tools_provider_overrides_stale_snapshot():
+    """provider 实时值优先于注册期快照：注册期关闭、实时打开则放行。"""
+    bridge = MockBridge()
+    live = {"computer_control": True}
+    reg = BuiltinToolRegistry(
+        config=_CONFIG_ALL_OFF,  # 注册期快照 computer_control=False
+        computer_bridge=bridge,
+        tools_provider=lambda: live,
+    )
+    res = reg.call("computer_run_command", {"command": "echo hi"})
+    assert res["success"] is True
+    assert len(bridge.calls) == 1
+
+
+def test_no_provider_keeps_snapshot_semantics():
+    """未注入 tools_provider 时保持注册期快照行为不变（兼容旧用法）。"""
+    reg = BuiltinToolRegistry(config=_CONFIG_COMPUTER_ON)
+    res = reg.call("computer_run_command", {"command": "echo hi"})
+    # 无后端注入，但快照判定已放行到 handler -> 返回"后端未注入"而非"未授权"
+    assert res["success"] is False
+    assert "后端未注入" in res["error"]
+
+    reg2 = BuiltinToolRegistry(config=_CONFIG_ALL_OFF)
+    res2 = reg2.call("memory_write", {"content": "x"})
+    assert res2["success"] is False
+    assert "记忆存储后端未注入" in res2["error"]
+
+
+def test_tools_provider_missing_key_falls_back_default():
+    """provider 返回的 dict 键缺失时按 _CATEGORY_KEYS 默认值兜底。"""
+    reg = BuiltinToolRegistry(config=_CONFIG_COMPUTER_ON, tools_provider=lambda: {})
+    # memory_tools 缺失 -> 默认 True，可用
+    res = reg.call("memory_write", {"content": "x"})
+    assert "后端未注入" in (res.get("error") or "") or res["success"] is True
+    # computer_control 缺失 -> 默认 False，禁用
+    res2 = reg.call("computer_run_command", {"command": "echo hi"})
+    assert res2["success"] is False
+    assert res2["error"] == "电脑控制未授权"
+
+
+def test_tools_provider_failure_falls_back_snapshot():
+    """provider 抛异常 / 返回非 dict 时回落注册期快照（不抛）。"""
+    def bad_provider():
+        raise RuntimeError("config busy")
+
+    reg = BuiltinToolRegistry(config=_CONFIG_COMPUTER_ON, tools_provider=bad_provider)
+    res = reg.call("computer_run_command", {"command": "echo hi"})
+    # 快照为开 -> 走 handler -> 后端未注入错误；若误判被禁用则会是"电脑控制未授权"
+    assert res["success"] is False
+    assert "后端未注入" in res["error"]
+
+    reg2 = BuiltinToolRegistry(
+        config=_CONFIG_COMPUTER_ON,
+        tools_provider=lambda: "not-a-dict",
+    )
+    res2 = reg2.call("computer_screen_control", {})
+    assert res2["success"] is False
+    assert "后端未注入" in res2["error"]

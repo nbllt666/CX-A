@@ -133,4 +133,26 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
 
     await app.close();
   });
+
+  test('场景5：手输非法 hash → 地址栏归一回写 #/chat 且聊天页可见', async () => {
+    const { app, win } = await launchApp();
+
+    // 模拟地址栏手输非法 hash（不在伴侣面路由表内）
+    await win.evaluate(() => {
+      window.location.hash = '#/bogus';
+    });
+
+    // App.tsx hashchange 归一逻辑：回落视图的同时回写地址栏，消除 URL 与视图失配
+    await expect
+      .poll(() => win.evaluate(() => window.location.hash), {
+        timeout: 10_000,
+        intervals: [100, 250, 500],
+      })
+      .toBe('#/chat');
+
+    // 视图落在聊天页而非空白崩溃
+    await expect(win.getByRole('heading', { name: '聊天' })).toBeVisible({ timeout: 20_000 });
+
+    await app.close();
+  });
 });

@@ -12,6 +12,8 @@
 """
 
 import os
+import shutil
+import types
 import urllib.request
 
 import pytest
@@ -242,6 +244,184 @@ def test_download_content_length_match_still_passes(tmp_path):
     result = dl.download(MODELSCOPE_REPO, MODELSCOPE_FILE)
     assert result.is_file()
     assert result.read_bytes() == data
+
+
+# ------------------------------------------------------------------ #
+# 3c. L10：磁盘空间预检 + 断点续传                                     #
+# ------------------------------------------------------------------ #
+
+def test_download_disk_insufficient_raises_before_any_file(tmp_path, monkeypatch):
+    """verify_size_gb 推算预期大小、磁盘可用 < 预期×1.05 → ValueError 且不落任何文件。"""
+    dl = make_loader(tmp_path, data=b"x" * 64)
+    # 模拟磁盘仅 10 字节可用（verify_size_gb=0.001GB≈1073742 字节）
+    monkeypatch.setattr(
+        shutil, "disk_usage",
+        lambda p: types.SimpleNamespace(free=10),
+    )
+    with pytest.raises(ValueError, match="磁盘空间不足"):
+        dl.download(MODELSCOPE_REPO, MODELSCOPE_FILE, verify_size_gb=0.001)
+    assert list(tmp_path.iterdir()) == []          # 目录内未落任何文件
+    assert dl._requests.calls == []                # 未发起任何网络请求
+
+
+def test_download_disk_insufficient_from_content_length(tmp_path, monkeypatch):
+    """Content-Length 提前得知且磁盘不足 → 开流写盘前抛错，无 .tmp 残留。"""
+    big_total = 10 * 1024 * 1024
+    dl = make_loader(
+        tmp_path,
+        data=b"\x00" * 128,
+        headers={"Content-Length": str(big_total)},
+    )
+    monkeypatch.setattr(
+        shutil, "disk_usage",
+        lambda p: types.SimpleNamespace(free=1024),
+    )
+    with pytest.raises(ValueError, match="磁盘空间不足"):
+        dl.download(MODELSCOPE_REPO, MODELSCOPE_FILE)
+    assert list(tmp_path.iterdir()) == []          # 未创建 .tmp
+
+
+class _FakeRangedURLResponse:
+    """模拟 urllib 响应：携带 status，支持上下文管理器与 read。"""
+
+    def __init__(self, payload, status=None, headers=None):
+        self._payload = payload
+        self._off = 0
+        self.status = status  # 真实 HTTPResponse 有 status；None 表示不携带
+        self.headers = headers if headers is not None else {"Content-Length": str(len(payload))}
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            n = len(self._payload) - self._off
+        chunk = self._payload[self._off : self._off + n]
+        self._off += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _make_urllib_dl(tmp_path):
+    dl = LlmDownloader(dest_dir=str(tmp_path))
+    dl._using_requests = False
+    dl._requests = None
+    return dl
+
+
+def test_download_urllib_resume_206_appends_from_offset(tmp_path, monkeypatch):
+    """tmp 存在 + 服务器响应 206 → 从断点追加续传，最终 done==total 落盘完整文件。"""
+    full = b"HELLOPART2"
+    partial = full[:6]
+    (tmp_path / (MODELSCOPE_FILE + ".tmp")).write_bytes(partial)
+    remaining = full[len(partial):]
+
+    resp = _FakeRangedURLResponse(
+        remaining,
+        status=206,
+        headers={
+            "Content-Length": str(len(remaining)),
+            "Content-Range": f"bytes {len(partial)}-{len(full) - 1}/{len(full)}",
+        },
+    )
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return resp
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    dl = _make_urllib_dl(tmp_path)
+    result = dl.download(MODELSCOPE_REPO, MODELSCOPE_FILE, source="modelscope")
+
+    dest = tmp_path / MODELSCOPE_FILE
+    assert result == dest
+    assert dest.read_bytes() == full                     # 断点前后拼接完整
+    assert not any(p.suffix == ".tmp" for p in tmp_path.iterdir())
+    # 请求头带 Range，起点为 tmp 当前大小
+    assert captured["req"].headers.get("Range") == f"bytes={len(partial)}-"
+
+
+def test_download_urllib_restart_overwrites_tmp_on_200(tmp_path, monkeypatch):
+    """tmp 存在但服务器忽略 Range 返回 200 → 从头重写覆盖 tmp（不留旧断点残留）。"""
+    stale = b"STALE-OLD-PARTIAL-DATA"
+    tmp_file = tmp_path / (MODELSCOPE_FILE + ".tmp")
+    tmp_file.write_bytes(stale)
+
+    fresh = b"FRESH"
+    resp = _FakeRangedURLResponse(fresh)  # 无 status 属性 → 视作 200
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: resp)
+    dl = _make_urllib_dl(tmp_path)
+    result = dl.download(MODELSCOPE_REPO, MODELSCOPE_FILE, source="modelscope")
+
+    dest = tmp_path / MODELSCOPE_FILE
+    assert dest.read_bytes() == fresh                    # 干净重写，无旧内容
+    assert result == dest
+
+
+class _FakeRangedStreamResponse:
+    """模拟 requests 流式响应：记录状态码与 Range 相关头。"""
+
+    def __init__(self, payload, status_code=200, headers=None):
+        self._payload = payload or b""
+        self.status_code = status_code
+        self.headers = headers if headers is not None else {"Content-Length": str(len(self._payload))}
+        self._offset = 0
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, chunk_size=8192):
+        while self._offset < len(self._payload):
+            chunk = self._payload[self._offset : self._offset + chunk_size]
+            self._offset += len(chunk)
+            yield chunk
+
+
+class _FakeRangedRequests:
+    """模拟支持 Range 的 requests.get：206 走截断体，200 走全量体。"""
+
+    def __init__(self, data):
+        self.data = data
+        self.calls = []
+
+    def get(self, url, stream=False, timeout=None, headers=None):
+        headers = headers or {}
+        self.calls.append(headers)
+        rng = headers.get("Range")
+        if rng:
+            start = int(rng.split("=", 1)[1].rstrip("-"))
+            body = self.data[start:]
+            return _FakeRangedStreamResponse(
+                body,
+                status_code=206,
+                headers={
+                    "Content-Length": str(len(body)),
+                    "Content-Range": f"bytes {start}-{len(self.data) - 1}/{len(self.data)}",
+                },
+            )
+        return _FakeRangedStreamResponse(self.data, status_code=200)
+
+
+def test_download_requests_resume_206_appends(tmp_path):
+    """requests 路径：tmp 存在 + 206 → 追加续传并完整落盘。"""
+    full = bytes(range(10))
+    partial = full[:5]
+    (tmp_path / (MODELSCOPE_FILE + ".tmp")).write_bytes(partial)
+
+    dl = LlmDownloader(dest_dir=str(tmp_path))
+    dl._requests = _FakeRangedRequests(full)
+    dl._using_requests = True
+
+    result = dl.download(MODELSCOPE_REPO, MODELSCOPE_FILE, source="modelscope")
+
+    dest = tmp_path / MODELSCOPE_FILE
+    assert result == dest
+    assert dest.read_bytes() == full
+    assert dl._requests.calls[0].get("Range") == f"bytes={len(partial)}-"
 
 
 # ------------------------------------------------------------------ #

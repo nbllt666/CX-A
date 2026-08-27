@@ -263,3 +263,108 @@ def test_factory_judge_enabled_without_model_path_stays_none():
     cfg = {"local_llm": {"enabled": True}}
     pipe = build_default_pipeline(cfg)
     assert pipe["judge"] is None
+
+
+# ------------------------------------------------------------------ #
+# L9：PCM float32→int16 越界钳制                                      #
+# ------------------------------------------------------------------ #
+
+def test_tts_pcm_clip_out_of_range_samples():
+    """越界样本（2.0/-2.0）clip 后不回绕：32767 / -32768，dtype 为 int16。"""
+    np = pytest.importorskip("numpy")
+    from lite.audio.tts import _audio_to_pcm16
+
+    pcm = _audio_to_pcm16([2.0, -2.0])
+    assert int(pcm[0]) == 32767
+    assert int(pcm[1]) == -32768
+    assert pcm.dtype == np.int16
+
+
+def test_tts_pcm_conversion_preserves_in_range_values():
+    """区间内样本转换保持保真（0.5 → 约 16383）。"""
+    pytest.importorskip("numpy")
+    from lite.audio.tts import _audio_to_pcm16
+
+    pcm = _audio_to_pcm16([0.0, 0.5, -0.5])
+    assert pcm.tolist() == [0, 16383, -16383]
+
+
+# ------------------------------------------------------------------ #
+# L12：ASR 输入健壮化与结果双形态解析                                  #
+# ------------------------------------------------------------------ #
+
+class _FakeFunasrModel:
+    """可捕获 generate 入参并按预设返回形态响应的 fake 模型。"""
+
+    def __init__(self, result):
+        self.result = result
+        self.captured_kwargs = {}
+
+    def generate(self, input=None, **kwargs):
+        self.captured_kwargs["input"] = input
+        self.captured_kwargs.update(kwargs)
+        return self.result
+
+
+_FLAT_RESULT = [{"text": "<|zh|><|NEUTRAL|><|Speech|>你好"}]
+_NESTED_RESULT = [[{"text": "<|zh|><|HAPPY|><|Laughter|>在吗"}]]
+
+
+def _make_loaded_backend(fake_model):
+    backend = SenseVoiceBackend()
+    backend._model = fake_model
+    backend._loaded = True  # 跳过 funasr 真实加载
+    return backend
+
+
+def test_asr_sensevoice_bytes_converted_and_flat_dict_parsed():
+    """bytes 输入转 float32 波形投递 generate；平铺 dict-list 结果解析正确。"""
+    np = pytest.importorskip("numpy")
+    model = _FakeFunasrModel(_FLAT_RESULT)
+    backend = _make_loaded_backend(model)
+
+    out = backend.transcribe(struct.pack("<hh", 32767, -32768))
+
+    arr = model.captured_kwargs["input"]
+    assert isinstance(arr, np.ndarray)
+    assert arr.dtype == np.float32
+    assert arr.tolist() == pytest.approx([32767 / 32768.0, -1.0])
+    assert out["text"] == "你好"
+    assert out["emotion"] == "NEUTRAL"
+    assert out["event"] == "Speech"
+
+
+def test_asr_sensevoice_nested_dict_list_parsed():
+    """嵌套双层形态 res[0][0]["text"] 解析正确。"""
+    pytest.importorskip("numpy")
+    backend = _make_loaded_backend(_FakeFunasrModel(_NESTED_RESULT))
+
+    out = backend.transcribe([0.1, -0.2])
+
+    assert out["text"] == "在吗"
+    assert out["emotion"] == "HAPPY"
+    assert out["event"] == "Laughter"
+
+
+def test_asr_sensevoice_ndarray_input_passthrough_float32(capsys):
+    """ndarray 输入按需 asarray 为 float32；解析异常路径打印告警不静默。"""
+    np = pytest.importorskip("numpy")
+    # 返回未识别形态 → 兜底空文本且打印 ERROR 告警
+    model = _FakeFunasrModel({"unexpected": "shape"})
+    backend = _make_loaded_backend(model)
+
+    wave = np.array([0.5, -0.5], dtype=np.int16).astype(np.float64)  # 非 float32 输入
+    out = backend.transcribe(wave)
+
+    assert model.captured_kwargs["input"].dtype == np.float32
+    assert out == {"text": "", "emotion": "", "event": None}
+    assert "[ERROR]" in capsys.readouterr().out
+
+
+def test_asr_sensevoice_empty_result_warns_not_silent(capsys):
+    """funasr 返回空列表时打印告警并返回空结构，不再静默吞掉失败。"""
+    pytest.importorskip("numpy")
+    backend = _make_loaded_backend(_FakeFunasrModel([]))
+    out = backend.transcribe(b"\x00\x00")
+    assert out == {"text": "", "emotion": "", "event": None}
+    assert "ASR" in capsys.readouterr().out

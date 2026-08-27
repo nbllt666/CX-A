@@ -19,10 +19,13 @@ import {
  * - 本页默认值与后端 config 默认值一致：deepseek / 本地模式关 / cx-open。
  */
 
-/** localStorage 键：电脑控制授权开关 */
-const LS_AUTH_KEY = 'cx.computer.authorized';
-/** localStorage 键：高危二次确认开关（仅展示，后端常态化开启） */
-const LS_CONFIRM_KEY = 'cx.computer.confirm_dangerous';
+/** localStorage 键（cx-a.* 家族）：电脑控制授权开关 */
+const LS_AUTH_KEY = 'cx-a.computer.authorized';
+/** localStorage 键（cx-a.* 家族）：高危二次确认开关（仅展示，后端常态化开启） */
+const LS_CONFIRM_KEY = 'cx-a.computer.confirm_dangerous';
+/** 旧版键名（cx.* 家族）：仅用于读取回退迁移，写入一律走新键（见 readLsBool） */
+const LEGACY_LS_AUTH_KEY = 'cx.computer.authorized';
+const LEGACY_LS_CONFIRM_KEY = 'cx.computer.confirm_dangerous';
 
 /** 云端 provider 白名单（与后端 /api/settings 一致） */
 const CLOUD_PROVIDERS = ['deepseek', 'tongyi', 'openai', 'moonshot'];
@@ -33,12 +36,23 @@ const FALLBACK_PROVIDER = 'deepseek';
 const FALLBACK_LOCAL_MODE = false;
 const FALLBACK_VOICE = 'cx-open';
 
-/** 读取 localStorage 布尔值；缺失 / 异常时回落默认值 */
-function readLsBool(key: string, fallback: boolean): boolean {
+/**
+ * 读取 localStorage 布尔值；新键缺失时回落旧版键并顺手写入新键（静默迁移，
+ * 防既有用户状态丢失）；均缺失 / 异常时回落默认值。
+ */
+function readLsBool(key: string, fallback: boolean, legacyKey?: string): boolean {
   try {
     const raw = localStorage.getItem(key);
-    if (raw === null) return fallback;
-    return raw === '1';
+    if (raw !== null) return raw === '1';
+    if (legacyKey !== undefined) {
+      const legacy = localStorage.getItem(legacyKey);
+      if (legacy !== null) {
+        const value = legacy === '1';
+        writeLsBool(key, value);
+        return value;
+      }
+    }
+    return fallback;
   } catch {
     return fallback;
   }
@@ -96,8 +110,8 @@ export default function SettingsPage() {
       // 电脑控制授权状态
       if (!IS_BACKEND_READY) {
         setComputerOnline(false);
-        setControlAuth(readLsBool(LS_AUTH_KEY, false));
-        setConfirmDangerous(readLsBool(LS_CONFIRM_KEY, true));
+        setControlAuth(readLsBool(LS_AUTH_KEY, false, LEGACY_LS_AUTH_KEY));
+        setConfirmDangerous(readLsBool(LS_CONFIRM_KEY, true, LEGACY_LS_CONFIRM_KEY));
         return;
       }
       try {
@@ -112,8 +126,8 @@ export default function SettingsPage() {
         if (!alive) return;
         // 后端不可用：降级到本地记忆
         setComputerOnline(false);
-        setControlAuth(readLsBool(LS_AUTH_KEY, false));
-        setConfirmDangerous(readLsBool(LS_CONFIRM_KEY, true));
+        setControlAuth(readLsBool(LS_AUTH_KEY, false, LEGACY_LS_AUTH_KEY));
+        setConfirmDangerous(readLsBool(LS_CONFIRM_KEY, true, LEGACY_LS_CONFIRM_KEY));
       }
     })();
     return () => {

@@ -17,6 +17,23 @@ from lite.audio.asr import data_dir  # noqa: F401  （re-export 供既有引用�
 __all__ = ["TTSBackend", "MeloTTSBackend", "MockTTSBackend", "LiteTTS", "data_dir"]
 
 
+def _audio_to_pcm16(audio):
+    """把 float 音频数组转换为 16-bit PCM int16 数组（L9：clip 防越界回绕爆音）。
+
+    - 先统一 asarray 为 float32，再乘 32767 后做 [-32768, 32767] 采样值钳制，
+      最后 astype(np.int16)；越界样本（如 2.0 / -2.0）不再回绕。
+    - numpy 在函数内延迟导入（本仓 tts 未强依赖 numpy 场景保持可构造）。
+
+    :param audio: 数组形态的合成音频（float32 波形或数值序列）
+    :return: np.int16 PCM 数组
+    """
+    import numpy as np
+
+    return np.clip(
+        np.asarray(audio, dtype=np.float32) * 32767.0, -32768, 32767
+    ).astype(np.int16)
+
+
 class TTSBackend:
     """语音合成后端抽象基类。"""
 
@@ -109,11 +126,10 @@ class MeloTTSBackend(TTSBackend):
         audio = tts.tts_to_file(text, speaker_id, output_path=None, speed=1.0, quiet=True)
         import io
 
-        import numpy as np
         import soundfile as sf
 
         sr = tts.hps.data.sampling_rate
-        pcm = (np.asarray(audio, dtype=np.float32) * 32767.0).astype(np.int16)
+        pcm = _audio_to_pcm16(audio)  # L9：clip 钳制在 helper 内完成
         buf = io.BytesIO()
         sf.write(buf, pcm, sr, format="WAV")
         return buf.getvalue()

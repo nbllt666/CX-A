@@ -3,8 +3,11 @@
 
 提供 memories 表建表、新增、按 id 查询、更新（自动刷新 updated_at）、软删除、
 列表查询与 agent_id 过滤能力。同步预留字段仅随建表登记，本阶段不实现同步逻辑。
+TEXT 结构字段（metadata/decay_params/tags）写读均有 JSON 序列化防线（L7）：
+写入 dict/list 自动 dumps；读取 try loads 失败回落原字符串。
 """
 
+import json
 import os
 import sqlite3
 from datetime import datetime
@@ -28,8 +31,40 @@ def _now() -> str:
 
 
 def _row_to_dict(row):
-    """sqlite3.Row 转 dict；空行返回 None。"""
-    return dict(row) if row is not None else None
+    """sqlite3.Row 转 dict；空行返回 None。
+
+    读取侧 JSON 防线（L7）：TEXT 结构字段（metadata/decay_params/tags）逐列
+    try json.loads，解析成功返回结构化值（dict/list），失败回落原字符串——
+    保证消费方总能拿到 dict/list 或 None，或调用方有意写入的纯文本。
+    """
+    data = dict(row) if row is not None else None
+    if data is not None:
+        for col in _JSON_TEXT_COLUMNS:
+            if col in data:
+                data[col] = _parse_json_text(data[col])
+    return data
+
+
+def _parse_json_text(value):
+    """尝试把字符串解析为 JSON 结构；非字符串、解析失败一律原样返回。"""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return value
+    return value
+
+
+def _serialize_json_text(value):
+    """写入口正规化（L7）：dict/list 自动 JSON 序列化，str 原样存，None 保持 None。
+
+    防止 dict 直接传给 sqlite3 抛 InterfaceError；也防止既有代码忘记序列化。
+    """
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
 
 
 # 插入/更新可操作的列（id 由自动增量维护，created_at 默认由本类写入）
@@ -40,6 +75,10 @@ _INSERT_COLUMNS = [
     "created_at", "updated_at", "is_deleted", "source", "agent_id",
     "global_id", "version", "sync_status", "origin",
 ]
+
+# TEXT 结构字段（JSON 序列化防线作用域，L7）：仅限这三个语义为结构的文本列，
+# content 等自由文本列不做解析（避免"恰好是合法 JSON 的正文"被误转换）。
+_JSON_TEXT_COLUMNS = ("metadata", "decay_params", "tags")
 
 
 class MemoryStore:
@@ -129,6 +168,9 @@ class MemoryStore:
             if col in ("created_at", "updated_at"):
                 # 时间戳缺失时自动填充当前时间
                 values.append(memory.get(col, None) or now)
+            elif col in _JSON_TEXT_COLUMNS:
+                # L7：TEXT 结构字段写入口正规化，dict/list 自动序列化防 InterfaceError
+                values.append(_serialize_json_text(memory.get(col, default)))
             else:
                 values.append(memory.get(col, default))
         placeholders = ",".join("?" for _ in values)
@@ -147,7 +189,11 @@ class MemoryStore:
             return 0
         if "type" in fields:
             self._validate_type(fields["type"])
-        updates = {k: v for k, v in fields.items() if k in _INSERT_COLUMNS}
+        updates = {
+            k: (_serialize_json_text(v) if k in _JSON_TEXT_COLUMNS else v)
+            for k, v in fields.items()
+            if k in _INSERT_COLUMNS
+        }
         updates["updated_at"] = _now()
         if not updates:
             return 0

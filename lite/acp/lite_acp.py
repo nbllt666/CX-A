@@ -5,8 +5,11 @@
 消息路由 / 心跳核心；局域网发现与分组协作降为可选（默认关）；新增云端中转
 （跨公网通信）。消息结构 ``{action, request_id, data}`` 对齐 CX-O §3.3。
 
-轻量设计（不复用 CX-O 的重型 asyncio/单例/锁/广播，单线程内存实现）：
-- 存储：内存 dict（agent registry / 路由信箱 / 事件 handler / 分组），无持久化、无线程。
+轻量设计（不复用 CX-O 的重型 asyncio/单例/锁/广播）：主路径为**单线程内存实现**
+（无锁设计以此前提成立）；自 T2 起 :meth:`LiteACP.start_heartbeat` 会拉起一个
+后台 **daemon 线程**并发清扫 agents 注册表——多线程接入前须外部串行化或后续加锁：
+- 存储：内存 dict（agent registry / 路由信箱 / 事件 handler / 分组），无持久化；
+  主路径无线程，唯心跳清扫运行在独立后台 daemon 线程。
 - 开关：``enabled=False`` 时核心操作抛 :class:`AcpDisabled`；
   ``lan_discovery=False`` / ``group_enabled=False`` / ``cloud_relay=False``
   时对应能力抛 :class:`AcpDisabled`。
@@ -53,7 +56,9 @@ class AcpAgentNotFound(KeyError):
 class LiteACP:
     """轻量版 ACP：Agent 注册 / 消息路由 / 心跳 + 可选局域网发现 + 云端中转。
 
-    单线程内存实现：所有状态存于内存 dict，无异步、无锁、无持久化。
+    主路径单线程内存实现：所有状态存于内存 dict，无异步、无锁、无持久化
+    （无锁以单线程前提成立）。注意：:meth:`start_heartbeat` 会拉起后台 daemon
+    线程并发清扫 agents 注册表——多线程接入前须外部串行化或后续加锁。
     构造时从配置 ``acp`` 段读取开关与默认参数。
     """
 

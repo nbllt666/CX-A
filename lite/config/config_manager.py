@@ -33,9 +33,23 @@ _KEY_FILENAME = ".cxa_key"
 
 #: 全局默认配置。对应工程文档 §13.2「主要配置段」
 DEFAULTS = {
-    "cloud": {"provider": "deepseek", "api_key": "", "base_url": ""},
-    "local_llm": {"enabled": False, "model_path": "", "source": "modelscope"},
-    "embedding": {"model": "qwen3-embedding:0.6b", "runtime": "llama.cpp"},
+    #: temperature/model 为云端推理参数契约键（L5 收口：消除 adapter 硬编码违约）
+    "cloud": {
+        "provider": "deepseek",
+        "api_key": "",
+        "base_url": "",
+        "temperature": 0.7,
+        "model": "",
+    },
+    # device：推理设备开关（"cpu"(默认)/"gpu"）。gpu 时 LlamaRuntime 以
+    # n_gpu_layers=-1 全层卸载（可用 local_llm.n_gpu_layers 高级覆盖）。
+    "local_llm": {
+        "enabled": False,
+        "model_path": "",
+        "source": "modelscope",
+        "device": "cpu",
+    },
+    "embedding": {"model": "qwen3-embedding:0.6b", "runtime": "llama.cpp", "device": "cpu"},
     "vector": {"backend": "lancedb", "path": "data/lancedb"},
     "tts": {"engine": "melotts", "voice": "cx-open"},
     "asr": {"engine": "sensevoice", "device": "cpu"},

@@ -46,6 +46,12 @@ N_CTX_RESERVE_TOKENS = 64
 #: prompt 长度估算比例：约 4 字符 ≈ 1 token
 _CHARS_PER_TOKEN = 4
 
+#: GPU 卸载层数——device="cpu" 且未显式配置 n_gpu_layers 时使用（0 = 全部层驻留 CPU）
+GPU_LAYERS_CPU = 0
+
+#: GPU 卸载层数——device="gpu" 且未显式配置 n_gpu_layers 时使用（-1 = 尽量全部层卸载）
+GPU_LAYERS_ALL = -1
+
 #: 「是否回复」判定提示词（中文，要求只答 是/否）
 JUDGE_PROMPT_TEMPLATE = (
     "你是本助手的「是否应当回复」判定器。\n"
@@ -116,6 +122,9 @@ class LlamaRuntime:
         except (TypeError, ValueError):
             parsed_n_ctx = DEFAULT_LLM_N_CTX
         self._n_ctx = parsed_n_ctx if parsed_n_ctx > 0 else DEFAULT_LLM_N_CTX
+        #: GPU 卸载层数意向：嵌入模型 / 本地小 LLM 各自独立解析（默认 0 = 纯 CPU）
+        self._emb_n_gpu_layers = self._read_gpu_layers(config, "embedding")
+        self._llm_n_gpu_layers = self._read_gpu_layers(config, "local_llm")
 
         #: 已加载的嵌入模型实例（Llama），未加载为 None
         self._emb_model = None
@@ -150,6 +159,31 @@ class LlamaRuntime:
         if isinstance(sec, dict) and key in sec:
             return sec.get(key, default)
         return default
+
+    @staticmethod
+    def _read_gpu_layers(config, section) -> int:
+        """解析指定配置段的 GPU 卸载层数意向。
+
+        规则：
+        - 显式 ``{section}.n_gpu_layers``（可转 int）优先于 device 推导；
+        - 缺失 / None / 非法时按 ``{section}.device`` 推导：
+          ``"gpu" -> -1``（全层卸载），其余回 ``0``（纯 CPU）；
+        - 默认 cpu，与历史行为一致。
+
+        Args:
+            config: 配置来源（None / dict / ConfigManager），语义同 ``_read_cfg``。
+            section: 配置段名（"embedding" 或 "local_llm"）。
+        Returns:
+            int: 传给 ``Llama(n_gpu_layers=...)`` 的层数。
+        """
+        raw_layers = LlamaRuntime._read_cfg(config, section, "n_gpu_layers", None)
+        if raw_layers is not None:
+            try:
+                return int(raw_layers)
+            except (TypeError, ValueError):
+                pass  # 非法覆盖值 → 按 device 推导
+        device = str(LlamaRuntime._read_cfg(config, section, "device", "cpu") or "cpu")
+        return GPU_LAYERS_ALL if device.strip().lower() == "gpu" else GPU_LAYERS_CPU
 
     @staticmethod
     def _extract_text(result):
@@ -245,7 +279,9 @@ class LlamaRuntime:
             return self._record_load_failure("emb", f"嵌入模型文件不存在：{path}（配置意向：{self._emb_model_name}）")
         llama_cls = _import_llama()  # 导入失败抛 RuntimeError（提示安装）
         try:
-            self._emb_model = llama_cls(model_path=path, embedding=True)
+            self._emb_model = llama_cls(
+                model_path=path, embedding=True, n_gpu_layers=self._emb_n_gpu_layers
+            )
         except Exception as exc:  # noqa: BLE001 - 加载异常按降级处理，不崩溃
             self._emb_model = None
             return self._record_load_failure("emb", f"嵌入模型加载失败：{exc}")
@@ -267,7 +303,12 @@ class LlamaRuntime:
             return self._record_load_failure("llm", f"本地小 LLM 文件不存在：{path}（配置意向：{self._llm_path}）")
         llama_cls = _import_llama()  # 导入失败抛 RuntimeError（提示安装）
         try:
-            self._llm = llama_cls(model_path=path, embedding=False, n_ctx=self._n_ctx)
+            self._llm = llama_cls(
+                model_path=path,
+                embedding=False,
+                n_ctx=self._n_ctx,
+                n_gpu_layers=self._llm_n_gpu_layers,
+            )
         except Exception as exc:  # noqa: BLE001 - 加载异常按降级处理，不崩溃
             self._llm = None
             return self._record_load_failure("llm", f"本地小 LLM 加载失败：{exc}")

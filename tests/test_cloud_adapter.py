@@ -204,3 +204,99 @@ def test_cloud_package_exports():
     from lite.cloud import CloudAdapter as ExportedAdapter
 
     assert ExportedAdapter is CloudAdapter
+
+
+# ------------------------------------------------------------------ #
+# 8. L5 配置契约：temperature / model 自 cloud 段读取                  #
+# ------------------------------------------------------------------ #
+
+def _capture_sse_payload(adapter, messages=None):
+    """monkeypatch _post_sse 捕获 chat 请求 payload（不发真实网络）。"""
+    captured = {}
+
+    def fake_post_sse(endpoint, payload, headers):
+        captured["endpoint"] = endpoint
+        captured["payload"] = payload
+        captured["headers"] = headers
+        return iter([])
+
+    adapter._post_sse = fake_post_sse
+    list(adapter.chat(messages or [{"role": "user", "content": "hi"}]))
+    return captured
+
+
+def test_temperature_defaults_and_config_override(tmp_path):
+    """payload.temperature 默认 0.7；cloud.temperature 配置后取配置值。"""
+    adapter, cm = _make_adapter(tmp_path)
+    captured = _capture_sse_payload(adapter)
+    assert captured["payload"]["temperature"] == pytest.approx(0.7)
+
+    cm.set("cloud", "temperature", 0.2)
+    adapter.reload()
+    captured2 = _capture_sse_payload(adapter)
+    assert captured2["payload"]["temperature"] == pytest.approx(0.2)
+
+
+def test_temperature_invalid_config_falls_back(tmp_path):
+    """cloud.temperature 非法时 reload 回落默认 0.7，不抛异常。"""
+    adapter, cm = _make_adapter(tmp_path)
+    cm.set("cloud", "temperature", "not-a-number")
+    adapter.reload()
+    assert adapter._temperature == pytest.approx(0.7)
+
+
+def test_model_default_mapping_by_provider(tmp_path):
+    """model 未配置时按 provider 官方缺省映射（不再回退 provider 名）。"""
+    from lite.cloud.adapter import PROVIDER_DEFAULT_MODELS
+
+    adapter, _ = _make_adapter(tmp_path)  # deepseek
+    assert adapter._model == ""
+    captured = _capture_sse_payload(adapter)
+    assert captured["payload"]["model"] == PROVIDER_DEFAULT_MODELS["deepseek"]
+    assert captured["payload"]["model"] == "deepseek-chat"
+
+
+def test_model_config_then_param_priority(tmp_path):
+    """model 优先级：构造参数 > cloud.model 配置 > provider 缺省映射。"""
+    # 仅配置
+    adapter_a, cm = _make_adapter(tmp_path)
+    cm.set("cloud", "model", "my-finetuned")
+    adapter_a.reload()
+    captured = _capture_sse_payload(adapter_a)
+    assert captured["payload"]["model"] == "my-finetuned"
+
+    # 构造参数覆盖配置
+    adapter_b, cm_b = _make_adapter(tmp_path, model="param-model")
+    cm_b.set("cloud", "model", "cfg-model")
+    adapter_b.reload()
+    captured_b = _capture_sse_payload(adapter_b)
+    assert captured_b["payload"]["model"] == "param-model"
+
+
+def test_model_without_mapping_omits_key_with_warning(tmp_path, caplog):
+    """provider 无映射且未配置 model 时，payload 不含 model 键并打 WARN。"""
+    import logging
+
+    adapter, _ = _make_adapter(tmp_path, provider="tongyi")
+    with caplog.at_level(logging.WARNING, logger="lite.cloud.adapter"):
+        captured = _capture_sse_payload(adapter)
+    assert "model" not in captured["payload"]
+    assert any(("model" in rec.getMessage() and "网关" in rec.getMessage()) for rec in caplog.records)
+
+
+def test_model_resolution_survives_reload(tmp_path):
+    """reload 后 model/temperature 配置仍然生效（热更新链路完整）。"""
+    adapter, cm = _make_adapter(tmp_path, model="keep-me")
+    cm.set("cloud", "temperature", 0.5)
+    adapter.reload()
+    assert adapter._model == "keep-me"  # 构造参数在 reload 后仍优先
+    captured = _capture_sse_payload(adapter)
+    assert captured["payload"]["temperature"] == pytest.approx(0.5)
+
+    # 清除构造优先后（新实例），配置 model 生效
+    cm.set("cloud", "model", "from-config")
+    adapter2, _ = _make_adapter(tmp_path)
+    adapter2._config_manager = cm
+    adapter2.reload()
+    captured2 = _capture_sse_payload(adapter2)
+    assert captured2["payload"]["model"] == "from-config"

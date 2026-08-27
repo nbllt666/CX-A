@@ -159,3 +159,58 @@ def test_default_db_path_is_absolute_under_data():
     assert os.path.isabs(s.db_path)
     assert os.path.basename(s.db_path) == "memories.db"
     assert os.path.basename(os.path.dirname(s.db_path)) == "data"
+
+
+# ---------------------------------------------------------------- TEXT 结构字段 JSON 防线（L7）
+def test_add_dict_text_fields_roundtrip(store):
+    """dict/list 写入 metadata/decay_params/tags 不抛 InterfaceError，读取自动解析回结构化值。"""
+    params = {"t50": 30.0, "k": 2.0}
+    meta = {"origin": "chat", "turn": 3}
+    tags = ["偏好", "咖啡"]
+    mid = store.add(
+        {
+            "type": "short_term",
+            "content": "结构字段往返",
+            "decay_params": params,
+            "metadata": meta,
+            "tags": tags,
+        }
+    )
+    row = store.get(mid)
+    assert row["decay_params"] == params
+    assert row["metadata"] == meta
+    assert row["tags"] == tags
+
+
+def test_update_dict_text_fields_roundtrip(store):
+    """update 同样支持 dict/list 直写，读取回结构化值。"""
+    mid = store.add({"type": "short_term", "content": "更新前"})
+    rows = store.update(mid, {"tags": ["x"], "decay_params": {"t50": 10}})
+    assert rows == 1
+    row = store.get(mid)
+    assert row["tags"] == ["x"]
+    assert row["decay_params"] == {"t50": 10}
+
+
+def test_str_text_fields_stay_string_with_nonjson_tolerated(store):
+    """str 原样存原样读；非 JSON 字符串读侧容错回落原值，不抛异常。"""
+    mid = store.add(
+        {
+            "type": "short_term",
+            "content": "字符串形态",
+            "tags": "游戏",
+            "metadata": "not-json{",
+            "decay_params": None,
+        }
+    )
+    row = store.get(mid)
+    assert row["tags"] == "游戏"
+    assert row["metadata"] == "not-json{"
+    assert row["decay_params"] is None
+
+
+def test_list_and_get_parse_consistently(store):
+    """list 查询与 get 走同一行映射，结构化字段解析一致。"""
+    store.add({"type": "long_term", "content": "a", "tags": ["t1"]})
+    rows = store.list(type="long_term")
+    assert [r["tags"] for r in rows] == [["t1"]]

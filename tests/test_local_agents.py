@@ -187,3 +187,40 @@ def test_file_missing_creates_empty_list_then_seed(tmp_path):
     assert isinstance(parsed, list)
     assert parsed[0]["id"] == "default"
     assert mgr.list()[0].name == "软软"
+
+
+# ---------------------------------------------------------------- L6a 原子写
+def test_save_atomic_preserves_original_on_dump_failure(tmp_path, monkeypatch):
+    """L6a：json.dump 抛错时 agents.json 原内容完好，tmp 被清理且异常上抛。"""
+    path = tmp_path / "agents.json"
+    mgr = AgentManager(path=str(path))
+    mgr.create(name="小夜", persona="原有数据")
+    original_raw = path.read_text("utf-8")
+    assert "小夜" in original_raw
+
+    import lite.management.local_agents as la
+
+    def broken_dump(obj, fh, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(la.json, "dump", broken_dump)
+
+    with pytest.raises(OSError, match="disk full"):
+        mgr.create(name="崩溃写", persona="不应落盘")
+
+    # 原 agents.json 内容完好无损
+    assert path.read_text("utf-8") == original_raw
+    # 同目录无残留 .tmp 文件
+    leftovers = [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
+
+
+def test_save_atomic_no_leftover_tmp_on_success(tmp_path):
+    """L6a：正常写入后同目录无 .tmp 残留，内容可解析。"""
+    path = tmp_path / "agents.json"
+    mgr = AgentManager(path=str(path))
+    mgr.create(name="小夜", persona="原子写成功路径")
+    leftovers = [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
+    parsed = json.loads(path.read_text("utf-8"))
+    assert [a["name"] for a in parsed] == ["软软", "小夜"]

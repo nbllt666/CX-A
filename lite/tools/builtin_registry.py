@@ -84,7 +84,11 @@ class BuiltinToolRegistry:
     :param pipeline: 可选记忆检索管线（``MemoryRetrievalPipeline.retrieve``）
     :param config: 配置（ConfigManager / 裸 dict / None）；按 ``tools`` 段读取各
         类别开关；缺省/缺失时用内置默认（computer_control=False、memory_tools=True、
-        system_tools=True）
+        system_tools=True）。注意：config 仅在**注册期**做一次类别开关快照；
+    :param tools_provider: 可选可调用对象（返回当前 ``tools`` 配置段 dict）；注入后
+        每次 :meth:`call` 判定类别开关时**优先实时调用** provider 读取最新开关，
+        运行期改动 ``tools.*`` 即时生效（键缺失按 ``_CATEGORY_KEYS`` 默认值兜底）。
+        provider 未注入或调用失败/返回非 dict 时回落注册期快照，行为与旧版一致。
     """
 
     def __init__(
@@ -95,6 +99,7 @@ class BuiltinToolRegistry:
         memory_store: Any = None,
         pipeline: Any = None,
         config: Any = None,
+        tools_provider: Optional[Callable[[], Dict[str, Any]]] = None,
     ) -> None:
         self.computer = computer
         self.computer_bridge = computer_bridge
@@ -102,6 +107,8 @@ class BuiltinToolRegistry:
         self.memory_store = memory_store
         self.pipeline = pipeline
         self.config = config
+        #: 可选的实时 tools 开关提供者（覆盖注册期快照）
+        self.tools_provider = tools_provider
 
         #: 注册表：tool_id -> 工具描述 dict（含 handler / category / enabled）
         self._tools: Dict[str, Dict[str, Any]] = {}
@@ -130,6 +137,30 @@ class BuiltinToolRegistry:
     def _tools_enabled(self, key: str, default: bool) -> bool:
         """读取 ``tools.<key>`` 类别开关；缺失 / 非法回退 default。"""
         return bool(self._get_config(self.config, "tools", key, default))
+
+    def _current_enabled(self, tool_id: str, registered_enabled: bool) -> bool:
+        """判定类别开关**当前值**：tools_provider 实时读取优先，未注入回落注册期快照。
+
+        :param tool_id: 工具稳定标识
+        :param registered_enabled: 注册期快照值（provider 未注入 / 失败时兜底）
+        :return: 当前该类别是否启用
+        """
+        mapping = _CATEGORY_KEYS.get(tool_id)
+        if self.tools_provider is None or mapping is None:
+            return registered_enabled
+        key, default = mapping
+        try:
+            live = self.tools_provider()
+        except Exception as exc:  # noqa: BLE001 - provider 失败回落快照
+            LOGGER.warning("tools_provider 调用失败，回落注册期开关快照：%s", exc)
+            return registered_enabled
+        if not isinstance(live, dict):
+            return registered_enabled
+        # 兼容误传完整配置 dict（含 tools 段）的情形：剥一层取 tools 段本身
+        section = live.get("tools") if isinstance(live.get("tools"), dict) else live
+        # 键缺失按 _CATEGORY_KEYS 默认值兜底（与注册期 _tools_enabled 语义一致：
+        # memory_tools/system_tools 缺失即 True、computer_control 缺失即 False）
+        return bool(section.get(key, default))
 
     # ------------------------------------------------------------------ #
     # 注册辅助                                                          #
@@ -561,7 +592,9 @@ class BuiltinToolRegistry:
                 "error": f"未知内置工具：{tool_id!r}",
                 "result": None,
             }
-        if not entry["enabled"]:
+        # 类别开关实时判定：tools_provider 注入时读当前值（运行期改 tools.* 即时生效），
+        # 未注入/失败回落注册期快照
+        if not self._current_enabled(tool_id, bool(entry["enabled"])):
             return {
                 "success": False,
                 "tool": tool_id,

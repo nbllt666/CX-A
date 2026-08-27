@@ -24,6 +24,7 @@
 保证全链路任何一层故障都不中断 ``feed_audio`` 循环、始终有文本产出（不哑巴）。
 """
 
+from threading import Lock
 from typing import Dict, Optional
 
 from lite.audio.judge import judge_should_reply_text
@@ -48,6 +49,10 @@ class LiteVoicePipeline:
     :param judge: 是否回复判定器（ShouldReplyJudge），可为 None（未注入→默认回复）
     :param offline_local: 本地兜底生成函数，签名为 ``callable(messages) -> 回复文本``
         或返回文本块迭代器；可为 None（无本地兜底）
+
+    线程契约（L11 封口）：本实例按单线程消费设计；多线程录音场景（如独立录音
+    线程喂音频 + 主线程控制会话）必须经 :attr:`_feed_lock`——``feed_audio`` 与
+    ``start_session`` 已在实例内互斥串行，禁止再于持锁期间调用会重入自身的路径。
     """
 
     def __init__(self, vad, asr, tts, cloud, judge=None, offline_local=None):
@@ -63,6 +68,9 @@ class LiteVoicePipeline:
         #: 话语缓冲（H3 修复）：自上一轮结束信号以来累积的 PCM 字节块列表，
         #: end 帧触发转写或 start_session 复位时清空
         self._utterance_buffer: list = []
+        #: feed_audio / start_session 互斥锁（L11：普通 Lock 即可，两方法体
+        #: 无嵌套互调、不重入自身）
+        self._feed_lock = Lock()
 
     # ------------------------------------------------------------------ #
     # 会话生命周期                                                     #
@@ -71,8 +79,15 @@ class LiteVoicePipeline:
     def start_session(self):
         """开启新一轮会话：清空对话历史、话语缓冲并复位 VAD 内部状态。
 
+        与 ``feed_audio`` 经 ``_feed_lock`` 互斥（L11 并发封口）。
+
         :return: self，便于链式调用
         """
+        with self._feed_lock:
+            return self._start_session_locked()
+
+    def _start_session_locked(self):
+        """``start_session`` 的锁内主体（调用方须已持 ``_feed_lock``）。"""
         self.messages = []
         # H3：会话复位必须同时清空话语缓冲，防止上一轮残留语音跨轮污染
         self._utterance_buffer = []
@@ -86,6 +101,9 @@ class LiteVoicePipeline:
 
     def feed_audio(self, chunk) -> Optional[Dict]:
         """逐块喂入 PCM 音频，VAD 判"说完了"时走一轮完整对话。
+
+        与 ``start_session`` 经 ``_feed_lock`` 互斥（L11 并发封口）：
+        实例非线程安全设计，多线程录音场景必须经锁或队列串行化喂入。
 
         话语缓冲（H3 修复）：VAD 未判结束时，chunk 先进入 ``_utterance_buffer``
         累积并返回 None（仍在听）；判结束时把「缓冲累积的全部音频 + 当前结束帧」
@@ -102,6 +120,11 @@ class LiteVoicePipeline:
             - ``{"should_reply": True, "text": str, "audio": bytes}``：已回复
               （TTS 失败时 audio 为空 bytes，返回结构保持稳定）
         """
+        with self._feed_lock:
+            return self._feed_audio_locked(chunk)
+
+    def _feed_audio_locked(self, chunk) -> Optional[Dict]:
+        """``feed_audio`` 的锁内主体（调用方须已持 ``_feed_lock``）。"""
         # VAD 异常按"未结束"处理并照常入缓冲，保证喂入循环不中断（M10 兜底）
         is_end = False
         if self.vad is not None:

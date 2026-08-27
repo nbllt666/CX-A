@@ -45,9 +45,25 @@ def test_first_run_generates_default_config(tmp_path):
 
 def test_defaults_values():
     """DEFAULTS 与工程文档 §13.2 严格一致。"""
-    assert DEFAULTS["cloud"] == {"provider": "deepseek", "api_key": "", "base_url": ""}
-    assert DEFAULTS["local_llm"] == {"enabled": False, "model_path": "", "source": "modelscope"}
-    assert DEFAULTS["embedding"] == {"model": "qwen3-embedding:0.6b", "runtime": "llama.cpp"}
+    assert DEFAULTS["cloud"] == {
+        "provider": "deepseek",
+        "api_key": "",
+        "base_url": "",
+        "temperature": 0.7,
+        "model": "",
+    }
+    # device 为 GPU 开关键（cpu 默认 / gpu），打通 llama.cpp CPU/GPU 推理切换
+    assert DEFAULTS["local_llm"] == {
+        "enabled": False,
+        "model_path": "",
+        "source": "modelscope",
+        "device": "cpu",
+    }
+    assert DEFAULTS["embedding"] == {
+        "model": "qwen3-embedding:0.6b",
+        "runtime": "llama.cpp",
+        "device": "cpu",
+    }
     assert DEFAULTS["vector"] == {"backend": "lancedb", "path": "data/lancedb"}
     assert DEFAULTS["tts"] == {"engine": "melotts", "voice": "cx-open"}
     assert DEFAULTS["asr"] == {"engine": "sensevoice", "device": "cpu"}
@@ -98,6 +114,9 @@ def test_missing_key_autofill(tmp_path):
     # 缺失键补齐
     assert cfg.get("cloud", "api_key") == ""
     assert cfg.get("cloud", "base_url") == ""
+    # L5 新增契约键同样自动补齐
+    assert cfg.get("cloud", "temperature") == 0.7
+    assert cfg.get("cloud", "model") == ""
 
 
 def test_missing_section_autofill(tmp_path):

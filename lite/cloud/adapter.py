@@ -16,11 +16,15 @@
 """
 
 import json
+import logging
 import urllib.error
 import urllib.request
 from typing import Dict, Iterator, List, Optional
 
 from lite.config import ConfigManager
+
+#: 原生日志记录器
+LOGGER = logging.getLogger(__name__)
 
 #: requests 为可选依赖，未安装时降级到 urllib 标准库实现
 try:  # pragma: no cover - 依赖探测
@@ -55,6 +59,15 @@ PROVIDER_BASE_URLS: Dict[str, str] = {
     "tongyi": "https://dashscope.aliyuncs.com/compatible-mode/v1",
 }
 
+#: 各云端提供商的官方缺省模型名（L5：model 缺省不再回退 provider 名——该名会被网关拒绝）。
+#: 以代码现有 provider 集合（deepseek/tongyi/openai/moonshot）为准；tongyi 暂无既定
+#: 缺省模型，未配置 cloud.model 时不发 model 键并告警。
+PROVIDER_DEFAULT_MODELS: Dict[str, str] = {
+    "deepseek": "deepseek-chat",
+    "openai": "gpt-4o-mini",
+    "moonshot": "moonshot-v1-8k",
+}
+
 
 class CloudAdapter:
     """云端主 LLM 适配器（兼容 deepseek / tongyi / openai / moonshot）"""
@@ -62,7 +75,8 @@ class CloudAdapter:
     #: 支持的提供商列表（工程文档 §10.1）
     providers = list(PROVIDER_BASE_URLS.keys())
 
-    #: 默认模型名。可在构造时以 model 参数覆盖，未设置时以 provider 名命名。
+    #: 默认模型名。可在构造时以 model 参数覆盖；为空时依次回落 cloud.model 配置
+    #: 与 provider 官方缺省映射，均无则请求不带 model 键（附 WARN）。
     DEFAULT_MODEL = ""
 
     def __init__(self, config_manager: Optional[ConfigManager] = None,
@@ -70,12 +84,14 @@ class CloudAdapter:
         """构造适配器。
 
         :param config_manager: ConfigManager 实例；缺省时内部自动创建并加载项目根 config.json
-        :param model: 可选，云端模型名；缺省用 provider 名作缺省模型
+        :param model: 可选，云端模型名；优先级：构造参数 > 配置 ``cloud.model`` >
+            provider 官方缺省映射（:data:`PROVIDER_DEFAULT_MODELS`）> 不发 model 键
         :param transport: 可选，注入的底层传输对象；测试用内存 mock 以避免真实网络。
             为 None 时使用内置 requests / urllib 传输。
         """
         self._config_manager = config_manager or ConfigManager()
-        self._model = model or self.DEFAULT_MODEL
+        #: 构造参数显式指定的模型名（最高优先级；reload 后仍保留）
+        self._model_override = model
         self._transport = transport
         #: deepseek 等 provider 各自会重新创建底层客户端；热更新重载即重建。
         self._client = None
@@ -88,16 +104,27 @@ class CloudAdapter:
     def reload(self) -> None:
         """重新读取 cloud 配置段并重建客户端（热更新支持）。
 
-        切换 provider / 修改 api_key / base_url 后调用本方法立即生效，
-        无需重启进程。
+        切换 provider / 修改 api_key / base_url / temperature / model 后调用本方法
+        立即生效，无需重启进程。
         """
         provider = self._config_manager.get("cloud", "provider", "deepseek")
         api_key = self._config_manager.get("cloud", "api_key", "") or ""
         configured_base_url = self._config_manager.get("cloud", "base_url", "") or ""
+        temperature = self._config_manager.get("cloud", "temperature", 0.7)
+        configured_model = str(self._config_manager.get("cloud", "model", "") or "").strip()
 
         self._provider = str(provider)
         self._api_key = str(api_key)
         self._configured_base_url = str(configured_base_url).rstrip("/")
+        #: 推理温度（配置契约键 cloud.temperature；缺省 0.7 与历史硬编码一致）
+        try:
+            self._temperature = float(temperature)
+        except (TypeError, ValueError):
+            LOGGER.warning("cloud.temperature=%r 非法，回落默认 0.7", temperature)
+            self._temperature = 0.7
+        #: 模型名解析：构造参数 > cloud.model > DEFAULT_MODEL；
+        #: 运行期请求体的最终模型名再经 PROVIDER_DEFAULT_MODELS 兜底（见 _stream_chat）
+        self._model = self._model_override or configured_model or self.DEFAULT_MODEL
         # base_url 延迟解析并缓存；切换 provider 后需清除缓存
         self._resolved_base_url = None
         # 重建底层客户端——工厂按 provider 选择对应的传输实现
@@ -208,11 +235,20 @@ class CloudAdapter:
 
         endpoint = self.base_url + "/chat/completions"
         payload = {
-            "model": self._model or self._provider,
             "messages": messages,
             "stream": True,
-            "temperature": 0.7,
+            "temperature": self._temperature,
         }
+        # L5：模型名解析——实例配置优先，provider 官方缺省映射兜底；均无时不发
+        # model 键并告警（回退 provider 名会被网关拒绝，历史行为已移除）
+        model_name = self._model or PROVIDER_DEFAULT_MODELS.get(self._provider)
+        if model_name:
+            payload["model"] = model_name
+        else:
+            LOGGER.warning(
+                "云端 provider %r 未配置 cloud.model 且无官方缺省映射，请求不含 model 键，可能被网关拒绝",
+                self._provider,
+            )
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",

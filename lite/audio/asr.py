@@ -76,33 +76,73 @@ class SenseVoiceBackend(ASRBackend):
         self._loaded = True
 
     def transcribe(self, audio):
-        """识别音频并返回 ``{text, emotion, event}``。"""
+        """识别音频并返回 ``{text, emotion, event}``。
+
+        L12：bytes（裸 int16 PCM）先转换为 funasr 公开支持的 numpy 波形数组
+        （float32，取值 [-1, 1]）再投递 generate；ndarray/list 按需 asarray 为
+        float32。numpy 延迟导入。
+        """
         self._load()
-        res = self._model.generate(input=audio, language="auto", use_itn=True)
+        res = self._model.generate(input=_coerce_to_waveform(audio), language="auto", use_itn=True)
         return _parse_funasr_result(res)
+
+
+def _coerce_to_waveform(audio):
+    """把各类音频输入正规化为 funasr 可靠消费的 numpy 波形数组（L12）。
+
+    - bytes / bytearray：按裸 int16 PCM 解析，转 float32 并归一化到 [-1, 1]
+      （funasr 对裸 PCM bytes 解析不可靠，numpy 波形是其公开支持形态）；
+    - ndarray：按需转 float32；
+    - list/tuple 等序列：asarray 为 float32。
+    numpy 延迟导入（本仓 asr 未强依赖 numpy 场景保持可构造）。
+    """
+    import numpy as np
+
+    if isinstance(audio, (bytes, bytearray)):
+        return np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+    return np.asarray(audio, dtype=np.float32)
 
 
 def _parse_funasr_result(res):
     """把 funasr 输出解析为统一 ``{text, emotion, event}`` dict。
 
+    L12 双形态兼容：
+    - 平铺 dict-list：``res[0]`` 直接是 ``{"text": ...}``（funasr 常见形态）；
+    - 嵌套双层：``res[0][0]`` 是 ``{"text": ...}``（SenseVoice 富文本旧形态）。
     SenseVoice 富文本文案形如 ``<|zh|><|NEUTRAL|><|Speech|>你好``，
     从 raw text 提取情感与事件标签，产出去掉标签的纯净文本。
-    解析失败时返回空结果（text=""，emotion=""，event=None）。
+    解析失败时打印告警并返回空结果（text=""，emotion=""，event=None）——
+    宽 except 兜底保留，但不再静默吞掉全部转写失败。
     """
     import re
 
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        raw = res[0][0].get("text", "")
-    except Exception:  # noqa: BLE001 - 空/异常结果兜底
+        first = res[0] if res else None
+        if isinstance(first, dict):
+            raw = first.get("text", "")
+        elif isinstance(first, (list, tuple)) and first:
+            raw = (
+                first[0].get("text", "")
+                if isinstance(first[0], dict)
+                else str(first[0])
+            )
+        else:
+            print(f"{timestamp} [ERROR] ASR 结果解析失败：未识别的返回形态 {type(res).__name__}，已回退空文本")
+            return {"text": "", "emotion": "", "event": None}
+    except Exception as exc:  # noqa: BLE001 - 空/异常结果兜底（含告警防静默）
+        print(f"{timestamp} [ERROR] ASR 结果解析异常（返回空文本）：{exc}")
         return {"text": "", "emotion": "", "event": None}
 
-    clean = re.sub(r"<\|.*?\|>", "", raw, count=0, flags=re.MULTILINE).strip()
+    clean = re.sub(r"<\|.*?\|>", "", str(raw), count=0, flags=re.MULTILINE).strip()
     emo_match = re.search(
-        r"<\|(HAPPY|SAD|ANGRY|NEUTRAL|FEARFUL|DISGUSTED|SURPRISED)\|>", raw
+        r"<\|(HAPPY|SAD|ANGRY|NEUTRAL|FEARFUL|DISGUSTED|SURPRISED)\|>", str(raw)
     )
     event_match = re.search(
         r"<\|(BGM|Speech|Applause|Laughter|Cry|Sneeze|Breath|Cough|Sing|Speech_Noise)\|>",
-        raw,
+        str(raw),
     )
     return {
         "text": clean,

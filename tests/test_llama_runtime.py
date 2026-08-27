@@ -42,6 +42,8 @@ class FakeLlama:
         self.embedding = embedding
         self.n_ctx = n_ctx
         self.fixed_text = fixed_text
+        # 记录额外构造参数（如 n_gpu_layers），供 GPU 开关透传断言使用
+        self.init_kwargs = dict(kwargs)
         FakeLlama.instances.append(self)
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(f"模型文件不存在：{self.model_path}")
@@ -337,3 +339,65 @@ def test_offline_chat_trims_long_history_under_budget(llm_model, fake_llama_cpp)
     # 保底 system + 最近一轮（消息级重建绕开 chat_window 对 system 的截断）
     assert prompt.startswith("system: ")
     assert messages[-1]["content"] in prompt
+
+
+# ------------------------------------------------------------------ #
+# 7. GPU 开关：device / n_gpu_layers 意向解析与构造透传               #
+# ------------------------------------------------------------------ #
+
+from lite.runtime.llama_runtime import GPU_LAYERS_ALL, GPU_LAYERS_CPU  # noqa: E402
+
+
+def test_gpu_layers_default_is_cpu():
+    """默认（config=None / 无设备键）嵌入与 LLM 卸载层数均为 0 = 纯 CPU。"""
+    rt = LlamaRuntime(config=None)
+    assert GPU_LAYERS_CPU == 0
+    assert rt._emb_n_gpu_layers == GPU_LAYERS_CPU
+    assert rt._llm_n_gpu_layers == GPU_LAYERS_CPU
+
+
+def test_device_gpu_derives_all_layers_offload():
+    """device="gpu" 且未显式配置 n_gpu_layers 时推导 -1（全层卸载）；大小写不敏感。"""
+    cfg = {"embedding": {"device": "GPU"}, "local_llm": {"device": "gpu"}}
+    rt = LlamaRuntime(config=cfg)
+    assert rt._emb_n_gpu_layers == GPU_LAYERS_ALL == -1
+    assert rt._llm_n_gpu_layers == GPU_LAYERS_ALL
+
+
+def test_explicit_n_gpu_layers_overrides_device():
+    """显式 n_gpu_layers 优先于 device 推导；None 视为未配置走 device 推导。"""
+    cfg = {
+        "embedding": {"device": "cpu", "n_gpu_layers": 8},
+        "local_llm": {"device": "gpu", "n_gpu_layers": 5},
+    }
+    rt = LlamaRuntime(config=cfg)
+    assert rt._emb_n_gpu_layers == 8  # cpu 但显式给层数 → 尊重显式值
+    assert rt._llm_n_gpu_layers == 5  # 显式层数覆盖 device=gpu 的 -1 推导
+
+    rt_none = LlamaRuntime(config={"local_llm": {"device": "gpu", "n_gpu_layers": None}})
+    assert rt_none._llm_n_gpu_layers == GPU_LAYERS_ALL
+
+
+@pytest.mark.parametrize("bad", ["abc", [1], {"a": 1}, float("nan")])
+def test_invalid_n_gpu_layers_falls_back_to_device(bad):
+    """非法 n_gpu_layers 按 device 推导回退：gpu→-1，其余→0。"""
+    try:
+        int(bad)
+        pytest.skip("int() 可转换的值不属于非法样例")
+    except (TypeError, ValueError):
+        pass
+    rt_gpu = LlamaRuntime(config={"local_llm": {"device": "gpu", "n_gpu_layers": bad}})
+    assert rt_gpu._llm_n_gpu_layers == GPU_LAYERS_ALL
+    rt_cpu = LlamaRuntime(config={"embedding": {"device": "cpu", "n_gpu_layers": bad}})
+    assert rt_cpu._emb_n_gpu_layers == GPU_LAYERS_CPU
+
+
+def test_load_passes_gpu_layers_to_constructor(emb_model, llm_model, fake_llama_cpp):
+    """加载时把解析出的 n_gpu_layers 透传到 Llama 构造参数。"""
+    cfg = {"embedding": {"device": "gpu"}, "local_llm": {"device": "cpu", "n_gpu_layers": 8}}
+    rt = LlamaRuntime(config=cfg)
+    assert rt.load_embedding_model(emb_model) is True
+    assert rt.load_local_llm(llm_model) is True
+    emb_inst, llm_inst = FakeLlama.instances[-2], FakeLlama.instances[-1]
+    assert emb_inst.init_kwargs.get("n_gpu_layers") == GPU_LAYERS_ALL
+    assert llm_inst.init_kwargs.get("n_gpu_layers") == 8

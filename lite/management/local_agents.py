@@ -191,9 +191,25 @@ class AgentManager:
         )
 
     def _save(self):
-        """将全量 Agent 列表以 UTF-8 / ensure_ascii=False 写回 agents.json。"""
-        with open(self._path, "w", encoding="utf-8") as f:
-            json.dump([a.to_dict() for a in self._agents], f, ensure_ascii=False, indent=2)
+        """将全量 Agent 列表原子写回 agents.json（UTF-8 / ensure_ascii=False）。
+
+        L6a 原子写流程：先写同目录临时文件（uuid 后缀 .tmp），成功后
+        ``os.replace`` 原子替换目标文件；写失败时清理 tmp 并抛出，
+        agents.json 原内容完好无损（消除崩溃/断电导致的静默重置）。
+        """
+        tmp_path = f"{self._path}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump([a.to_dict() for a in self._agents], f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._path)
+        except Exception:
+            # 写入或替换失败：清理残留 tmp，原文件保持不变
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:  # noqa: B014 - 清理失败不影响原错误抛出
+                pass
+            raise
 
     # ------------------------------------------------------------ 查询
     def list(self, enabled=None):
