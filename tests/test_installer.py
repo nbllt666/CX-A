@@ -12,6 +12,7 @@
 import json
 import os
 import sqlite3
+import sys
 
 import pytest
 
@@ -229,3 +230,111 @@ def test_first_run_api_key_blank_skips(tmp_path):
     # 未填写则不写入 key
     raw = json.loads(open(os.path.join(root, "config.json"), encoding="utf-8").read())
     assert raw["cloud"]["api_key"] == ""
+
+
+# ------------------------------------------------------------------ #
+# backend_entry：后端可执行入口（打包链路步骤1）                       #
+# ------------------------------------------------------------------ #
+
+def test_backend_entry_dev_root_and_args(tmp_path, monkeypatch):
+    """开发态：root=项目根（installer 上级），build_args 指向 <root>/data，端口 8600。"""
+    from installer import backend_entry
+
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert backend_entry.resolve_root() == os.path.dirname(os.path.dirname(os.path.abspath(backend_entry.__file__)))
+
+    args = backend_entry.build_args(str(tmp_path))
+    assert args == [
+        "--host", "127.0.0.1",
+        "--port", "8600",
+        "--data-dir", os.path.join(str(tmp_path), "data"),
+    ]
+
+
+def test_backend_entry_frozen_root(tmp_path, monkeypatch):
+    """冻结态：root = exe 目录上溯 2 级（<root>/runtime/backend/backend.exe）。"""
+    from installer import backend_entry
+
+    fake_exe = tmp_path / "runtime" / "backend" / "backend.exe"
+    fake_exe.parent.mkdir(parents=True)
+    fake_exe.write_bytes(b"")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe), raising=False)
+
+    assert backend_entry.resolve_root() == str(tmp_path)
+    args = backend_entry.build_args()
+    assert args[5] == os.path.join(str(tmp_path), "data")
+
+
+def test_backend_entry_main_creates_data_dir(tmp_path, monkeypatch):
+    """main() 起服前自愈数据目录；并以组装参数进入 api_server.main（注入 fake 验证）。"""
+    from installer import backend_entry
+
+    root = str(tmp_path / "portable")
+    os.makedirs(os.path.join(root, "runtime", "backend"))
+    fake_exe = os.path.join(root, "runtime", "backend", "backend.exe")
+    with open(fake_exe, "wb") as fh:
+        fh.write(b"")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe), raising=False)
+
+    captured = {}
+
+    def fake_api_main(argv):
+        captured["argv"] = list(argv)
+
+    import lite.server.api_server as api_server_mod
+    monkeypatch.setattr(api_server_mod, "main", fake_api_main)
+
+    backend_entry.main()  # 正常返回即未进入 serve_forever
+
+    assert os.path.isdir(os.path.join(root, "data"))
+    assert captured["argv"][0] == "--host"
+    assert captured["argv"][2] == "--port"
+    assert captured["argv"][5] == os.path.join(root, "data")
+
+
+# ------------------------------------------------------------------ #
+# build：便携包组装与压缩（打包链路步骤4）                             #
+# ------------------------------------------------------------------ #
+
+def test_build_assemble_and_zip(tmp_path):
+    """assemble 平铺壳产物 + 落位后端 + bootstrap 初始化；zip 含关键条目。"""
+    import zipfile
+
+    from installer import build as build_mod
+
+    # 伪造 Electron 壳产物（CX-A.exe 位于根）
+    electron_dist = tmp_path / "win-unpacked"
+    (electron_dist / "resources").mkdir(parents=True)
+    (electron_dist / "CX-A.exe").write_bytes(b"fake-exe")
+    (electron_dist / "resources" / "app.asar").write_bytes(b"fake-asar")
+
+    # 伪造 PyInstaller 后端产物（onedir：exe + _internal/）
+    backend_dist = tmp_path / "backend-dist"
+    (backend_dist / "_internal").mkdir(parents=True)
+    (backend_dist / "backend.exe").write_bytes(b"fake-backend")
+    (backend_dist / "_internal" / "lib.dll").write_bytes(b"fake-dll")
+
+    portable_root = str(tmp_path / "portable")
+    build_mod.assemble(str(electron_dist), str(backend_dist), portable_root)
+
+    # 壳产物平铺
+    assert os.path.isfile(os.path.join(portable_root, "CX-A.exe"))
+    assert os.path.isfile(os.path.join(portable_root, "resources", "app.asar"))
+    # 后端落位 runtime/backend/
+    assert os.path.isfile(os.path.join(portable_root, "runtime", "backend", "backend.exe"))
+    assert os.path.isfile(os.path.join(portable_root, "runtime", "backend", "_internal", "lib.dll"))
+    # bootstrap 初始化产物：数据目录 + 默认 config
+    assert os.path.isdir(os.path.join(portable_root, "data", "lancedb"))
+    assert os.path.isfile(os.path.join(portable_root, "config.json"))
+
+    # zip：含 exe 与后端条目
+    release_dir = str(tmp_path / "rel")
+    zip_path = build_mod.zip_portable(portable_root, release_dir)
+    assert os.path.isfile(zip_path)
+    assert os.path.getsize(zip_path) > 0
+    with zipfile.ZipFile(zip_path) as zf:
+        names = [n.replace("\\", "/") for n in zf.namelist()]
+    assert any(n.endswith("CX-A.exe") for n in names)
+    assert any("runtime/backend/backend.exe" in n for n in names)
