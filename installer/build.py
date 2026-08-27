@@ -44,6 +44,8 @@ BUNDLED_DIR = os.path.join(_INSTALLER_DIR, "bundled")
 RELEASE_DIR = os.path.join(PROJECT_ROOT, "release")
 #: Electron --dir 产物目录（electron-builder 约定名）。
 ELECTRON_UNPACKED = os.path.join(FRONTEND_DIR, "release", "win-unpacked")
+#: 壳产物关键文件（完整性校验口径：目录存在且该文件存在才算可用壳产物）。
+ELECTRON_SHELL_EXE = "CX-A.exe"
 #: PyInstaller 后端产物目录名（--distpath 下的 backend/）。
 BACKEND_DIST_NAME = "backend"
 #: 便携根目录名。
@@ -155,9 +157,8 @@ def build_electron_shell():
             "Electron 壳打包失败",
             "确认已 npm install（electron/electron-builder 二进制经 npmmirror 拉取）",
         )
-    exe_name = "CX-A.exe"
-    if not os.path.isfile(os.path.join(ELECTRON_UNPACKED, exe_name)):
-        _die(f"壳产物缺失：{os.path.join(ELECTRON_UNPACKED, exe_name)}")
+    if not os.path.isfile(os.path.join(ELECTRON_UNPACKED, ELECTRON_SHELL_EXE)):
+        _die(f"壳产物缺失：{os.path.join(ELECTRON_UNPACKED, ELECTRON_SHELL_EXE)}")
     _log_info(f"Electron 壳打包完成：{ELECTRON_UNPACKED}")
 
 
@@ -333,9 +334,14 @@ def main(argv=None):
     if not args.skip_frontend:
         build_renderer()
     if args.skip_electron:
-        # 跳过壳构建 = 复用已有产物：产物必须已存在
-        if not os.path.isdir(ELECTRON_UNPACKED):
-            _die(f"壳产物不存在且已跳过构建：{ELECTRON_UNPACKED}", "去掉 --skip-electron 重新打包")
+        # 跳过壳构建 = 复用已有产物：目录与关键文件必须齐备（残缺产物不得静默组装）
+        if not os.path.isdir(ELECTRON_UNPACKED) or not os.path.isfile(
+            os.path.join(ELECTRON_UNPACKED, ELECTRON_SHELL_EXE)
+        ):
+            _die(
+                f"壳产物不存在或残缺且已跳过构建：{ELECTRON_UNPACKED}",
+                "去掉 --skip-electron 重新打包",
+            )
     else:
         build_electron_shell()
 

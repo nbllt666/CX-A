@@ -338,3 +338,44 @@ def test_build_assemble_and_zip(tmp_path):
         names = [n.replace("\\", "/") for n in zf.namelist()]
     assert any(n.endswith("CX-A.exe") for n in names)
     assert any("runtime/backend/backend.exe" in n for n in names)
+
+
+def test_build_skip_electron_rejects_incomplete_artifacts(tmp_path, monkeypatch):
+    """--skip-electron 时：目录缺失或缺 CX-A.exe 均应报错退出，不静默组装坏包。"""
+    from installer import build as build_mod
+
+    # 壳产物目录指到临时区，避免触碰真实 frontend/release
+    fake_unpacked = str(tmp_path / "win-unpacked")
+    monkeypatch.setattr(build_mod, "ELECTRON_UNPACKED", fake_unpacked)
+
+    # 场景1：目录不存在 → 报错
+    alt_out = str(tmp_path / "alt-out")
+    with pytest.raises(SystemExit):
+        build_mod.main([
+            "--skip-frontend", "--skip-electron", "--skip-backend", "--skip-zip",
+            "--output", alt_out,
+        ])
+
+    # 场景2：目录存在但缺 CX-A.exe（残缺产物）→ 同样报错
+    os.makedirs(fake_unpacked, exist_ok=True)
+    with open(os.path.join(fake_unpacked, "stale.tmp"), "w", encoding="utf-8") as fh:
+        fh.write("leftover")
+    with pytest.raises(SystemExit):
+        build_mod.main([
+            "--skip-frontend", "--skip-electron", "--skip-backend", "--skip-zip",
+            "--output", alt_out,
+        ])
+
+    # 场景3（对照）：补上 CX-A.exe 与后端产物后应通过校验继续组装
+    with open(os.path.join(fake_unpacked, build_mod.ELECTRON_SHELL_EXE), "wb") as fh:
+        fh.write(b"fake-exe")
+    work_dist = os.path.join(alt_out, "_work", "dist", "backend")
+    os.makedirs(work_dist, exist_ok=True)
+    with open(os.path.join(work_dist, "backend.exe"), "wb") as fh:
+        fh.write(b"fake-backend")
+    build_mod.main([
+        "--skip-frontend", "--skip-electron", "--skip-backend", "--skip-zip",
+        "--output", alt_out,
+    ])
+    assert os.path.isfile(os.path.join(alt_out, "portable", build_mod.ELECTRON_SHELL_EXE))
+    assert os.path.isfile(os.path.join(alt_out, "portable", "runtime", "backend", "backend.exe"))
