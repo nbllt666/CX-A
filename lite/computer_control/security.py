@@ -96,15 +96,22 @@ class ControlAuthorizer:
     # ------------------------------------------------------------------ #
 
     def _save_state(self) -> None:
-        """将当前授权三要素持久化到 data/security_state.json。"""
+        """将当前授权三要素持久化到 data/security_state.json。
+
+        L-1：tmp + ``os.replace`` 原子写（对齐 local_agents / config_manager
+        口径），防止崩溃 / 断电留下截断文件导致授权状态静默丢失。
+        """
         os.makedirs(self._data_dir, exist_ok=True)
         state: Dict[str, Any] = {
             "authorized": bool(self.authorized),
             "confirm_dangerous": bool(self.confirm_dangerous),
             "audit_enabled": bool(self.audit_enabled),
         }
-        with open(self._state_path(), "w", encoding="utf-8") as fh:
+        path = self._state_path()
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
 
     def _load_state(self) -> None:
         """从 data/security_state.json 载入历史授权状态；文件缺失 / 损坏则保持默认。"""
@@ -125,6 +132,41 @@ class ControlAuthorizer:
     # 授权总开关                                                          #
     # ------------------------------------------------------------------ #
 
+    def _safe_audit(
+        self,
+        action: str,
+        tool: str,
+        arguments_summary: str,
+        authorized: bool,
+        result_summary: str,
+    ) -> None:
+        """审计写入的容错包装（M-2）：写失败仅告警，不中断授权状态变更。
+
+        修复前 authorize 中 ``authorized=True`` 已生效并持久化后，audit 抛
+        OSError（data 目录只读 / 磁盘满）会向上传播，调用方误判"开启失败"，
+        而实际本机动作闸门已全部打开——异常路径状态不一致。现改为状态提交
+        与审计解耦：审计失败打印告警（留缺失痕迹），授权语义保持一致。
+
+        :param action: 操作事件
+        :param tool: 工具稳定标识或空串
+        :param arguments_summary: 参数摘要
+        :param authorized: 操作时的授权状态
+        :param result_summary: 结果摘要
+        """
+        try:
+            self.audit(
+                action=action,
+                tool=tool,
+                arguments_summary=arguments_summary,
+                authorized=authorized,
+                result_summary=result_summary,
+            )
+        except OSError as exc:
+            print(
+                f"[WARN] 电脑控制审计写入失败（action={action}）：{exc}"
+                f"——授权状态已变更，但本条审计记录缺失"
+            )
+
     def authorize(self) -> bool:
         """开启授权总开关（用户显式开启）。
 
@@ -139,7 +181,8 @@ class ControlAuthorizer:
             self.authorized = True
             self._save_state()
             # N4：授权开启为关键安全事件，落盘后补审计（记录来源，便于 CSRF 场景回溯）
-            self.audit(
+            # M-2：审计写失败不回滚授权（fail-visible：告警留痕缺失）
+            self._safe_audit(
                 action="authorize",
                 tool="",
                 arguments_summary="source=api",
@@ -159,7 +202,7 @@ class ControlAuthorizer:
             self.authorized = False
             self._save_state()
             # N4：撤销亦为关键安全事件，落盘后补审计
-            self.audit(
+            self._safe_audit(
                 action="revoke",
                 tool="",
                 arguments_summary="source=api",

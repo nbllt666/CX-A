@@ -24,6 +24,10 @@ MSG_TYPE = "ACP_BEACON"
 #: 防恶意信标刷包撑大内存；超限丢弃并按每秒至多一条告警限频。
 MAX_FOUND_AGENTS = 256
 
+#: 去重集合上限（L-12，第三轮体检批次5）：超限整体重置，防 _seen_agents
+#: 在恶意源持续变换 agent_id 时成为内存放大点。
+_MAX_SEEN_AGENTS = 4096
+
 
 class AcpDiscoveryError(Exception):
     """局域网发现错误（未启动即广播 / socket 异常等）。"""
@@ -166,9 +170,11 @@ class LiteLanDiscovery:
             "capabilities": list(capabilities or []),
             "port": announce_port,
         }
+        # L-11（第三轮体检批次5）：sendto 目标与宣告端口一致——修复前报文
+        # 宣告 announce_port 却固定发往 self.port，语义分裂
         self._socket.sendto(
             json.dumps(message).encode("utf-8"),
-            (self.broadcast_address, self.port),
+            (self.broadcast_address, announce_port),
         )
 
     def parse_packet(self, data, addr):
@@ -213,6 +219,11 @@ class LiteLanDiscovery:
                         f"丢弃新信标 agent_id={agent_id!r} addr={addr}"
                     )
                 return agent
+            # L-12（第三轮体检批次5）：去重集合同样设上限——恶意源持续变换
+            # agent_id 时整体重置（found_agents 已有 MAX_FOUND_AGENTS 兜底），
+            # 防止 _seen_agents 本身成为内存放大点
+            if len(self._seen_agents) >= _MAX_SEEN_AGENTS:
+                self._seen_agents.clear()
             self._seen_agents.add(key)
             self.found_agents.append((agent, addr))
         return agent

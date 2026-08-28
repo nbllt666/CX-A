@@ -409,11 +409,13 @@ class BuiltinToolRegistry:
                 if self.manager is not None:
                     # G-1 统一写入口：优先走 manager.add_memory（相似去重 + 向量化）。
                     # 返回 None 表示被去重跳过（未实际写入），如实返回标记。
+                    # M-12：补传 tags——修复前 manager 路径静默丢弃 tags
                     mem_id = self.manager.add_memory(
                         content=content,
                         type=mem_type,
                         importance=importance,
                         agent_id=args.get("agent_id", "default"),
+                        tags=tags,
                     )
                     if mem_id is None:
                         return {

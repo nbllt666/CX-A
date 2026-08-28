@@ -269,9 +269,9 @@ class RecordingManager:
         self.calls = []
         self._dedup_content = dedup_content
 
-    def add_memory(self, content, type="short_term", importance=3, agent_id="default"):
+    def add_memory(self, content, type="short_term", importance=3, agent_id="default", tags=None):
         self.calls.append(
-            {"content": content, "type": type, "importance": importance, "agent_id": agent_id}
+            {"content": content, "type": type, "importance": importance, "agent_id": agent_id, "tags": tags}
         )
         if self._dedup_content is not None and content == self._dedup_content:
             return None  # 模拟去重命中
@@ -287,11 +287,23 @@ def test_memory_write_prefers_manager_injection(tmp_path):
     res = reg.call("memory_write", {"content": "用户喜欢蓝色", "type": "long_term", "importance": 4})
     assert res["success"] is True, res
     assert manager.calls == [
-        {"content": "用户喜欢蓝色", "type": "long_term", "importance": 4, "agent_id": "default"}
+        {"content": "用户喜欢蓝色", "type": "long_term", "importance": 4, "agent_id": "default", "tags": "[]"}
     ]
     assert res["result"]["id"] == 1
     # 直连 store 未被写入
     assert store.list(type="long_term") == []
+
+
+def test_memory_write_manager_path_passes_tags(tmp_path):
+    """M-12：manager 路径不再静默丢弃 tags——tags 序列化后透传 add_memory。"""
+    store = MemoryStore(db_path=str(tmp_path / "memories.db"))
+    manager = RecordingManager()
+    reg = BuiltinToolRegistry(memory_store=store, manager=manager, config=_CONFIG_ALL_OFF)
+
+    res = reg.call("memory_write", {"content": "用户喜欢蓝色", "tags": ["颜色", "偏好"]})
+    assert res["success"] is True, res
+    # list 形态 tags 已序列化为 JSON 字符串后透传
+    assert manager.calls[0]["tags"] == '["颜色", "偏好"]'
 
 
 def test_memory_write_manager_dedup_reports_flag():

@@ -140,6 +140,24 @@ class MemoryManager:
             self.vector_store.upsert(str(memory_id), vector, metadata={"memory_id": memory_id, "agent_id": agent_id})
         return memory_id
 
+    def soft_delete(self, memory_id):
+        """软删除一条记忆，并同步清理向量库中的对应向量（M-10，第三轮体检批次3）。
+
+        修复前软删除只置 is_deleted=1，向量库中对应向量永不清理——孤儿向量
+        既占内存又挤占 retrieve 的 top_k 候选名额。向量 id 与写入约定一致为
+        ``str(memory_id)``；向量清理失败仅告警（软删除语义不回滚）。
+
+        :param memory_id: 记忆 id
+        :return: bool 是否命中（store 侧软删成功）
+        """
+        deleted = self.store.soft_delete(memory_id)
+        if deleted:
+            try:
+                self.vector_store.delete(str(memory_id))
+            except Exception as exc:  # noqa: BLE001 - 向量清理失败不回滚软删
+                print(f"[WARN] 软删除后向量清理失败（memory_id={memory_id}）：{exc}")
+        return deleted
+
     # -------------------------------------------------------- 写：再激活 / 分层
     def _get_memory(self, memory_id):
         """取单条记忆（未软删除）；不存在返回 None。"""

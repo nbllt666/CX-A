@@ -200,6 +200,22 @@ def test_route_message_unregistered_raises():
         acp.route_message("alice", "ghost", {"text": "hi"})
 
 
+def test_route_mailbox_capped():
+    """M-18（第三轮体检批次5）：信箱超 MAX_MAILBOX 截断最旧，长度恒有界。"""
+    from lite.acp.lite_acp import MAX_MAILBOX
+
+    acp = LiteACP(config=_config())
+    acp.register_agent("alice")
+    acp.register_agent("bob")
+    for i in range(MAX_MAILBOX + 20):
+        acp.route_message("alice", "bob", {"seq": i})
+    mailbox = acp.get_messages("bob")
+    assert len(mailbox) == MAX_MAILBOX
+    # 截掉的是最旧：首条 seq 为 20
+    assert mailbox[0]["data"]["payload"] == {"seq": 20}
+    assert mailbox[-1]["data"]["payload"] == {"seq": MAX_MAILBOX + 19}
+
+
 # ------------------------------------------------------------------ #
 # 3. call_agent + on() handler 派发                                    #
 # ------------------------------------------------------------------ #

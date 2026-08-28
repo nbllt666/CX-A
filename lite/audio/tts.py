@@ -15,6 +15,7 @@ import warnings
 # data/ 目录推导统一收敛到 asr.data_dir（三级 dirname），消除复制漂移。
 from lite.audio.asr import data_dir  # noqa: F401  （re-export 供既有引用使用）
 from lite.audio.asr import resolve_torch_device
+from lite.audio.voice_manager import DEFAULT_VOICE_ID, is_unsafe_voice_id
 
 __all__ = ["TTSBackend", "MeloTTSBackend", "MockTTSBackend", "LiteTTS", "data_dir"]
 
@@ -74,6 +75,10 @@ class MeloTTSBackend(TTSBackend):
         #: 必须按音色配置组合缓存复用，禁止每次合成重建。
         self._engines = {}
 
+    #: 引擎缓存容量上限（M-8，第三轮体检批次3）：每引擎加载百 MB 级权重，
+    #: 超限淘汰最旧条目，防止多引擎常驻内存。
+    _MAX_CACHED_ENGINES = 3
+
     def _ensure_lib(self):
         """校验 MeloTTS 库可导入；未安装时抛 RuntimeError（附准确安装指引）。"""
         if self._TTSType is not None:
@@ -89,23 +94,37 @@ class MeloTTSBackend(TTSBackend):
         self._TTSType = TTS
 
     def _get_engine(self, config_path=None, ckpt_path=None):
-        """取（或惰性构建并缓存）某音色配置组合对应的 TTS 引擎实例。"""
+        """取（或惰性构建并缓存）某音色配置组合对应的 TTS 引擎实例（LRU 限容）。"""
         self._ensure_lib()
         key = (config_path or "", ckpt_path or "")
         engine = self._engines.get(key)
-        if engine is None:
-            engine = self._TTSType(
-                language="ZH",
-                device=self.device,
-                use_hf=True,
-                config_path=config_path,
-                ckpt_path=ckpt_path,
-            )
-            self._engines[key] = engine
+        if engine is not None:
+            # LRU：命中提升到最新位（dict 保序）
+            self._engines[key] = self._engines.pop(key)
+            return engine
+        engine = self._TTSType(
+            language="ZH",
+            device=self.device,
+            use_hf=True,
+            config_path=config_path,
+            ckpt_path=ckpt_path,
+        )
+        self._engines[key] = engine
+        while len(self._engines) > self._MAX_CACHED_ENGINES:
+            oldest = next(iter(self._engines))
+            self._engines.pop(oldest)
+            warnings.warn(f"TTS 引擎缓存超过上限 {self._MAX_CACHED_ENGINES}，已淘汰最旧引擎：{oldest}")
         return engine
 
     def _voice_path(self, voice):
-        """推导某音色的模型目录路径：``data/voices/<voice>``（M13：删除永不填充的 _voice_map 死分支）。"""
+        """推导某音色的模型目录路径：``data/voices/<voice>``（M13：删除永不填充的 _voice_map 死分支）。
+
+        H-2（第三轮体检批次3）：voice 含路径穿越特征（``/``、``\\``、``..``、盘符）
+        时返回 None——不再拼接逃逸 ``data/voices/`` 根目录的任意路径，由调用方
+        回退默认音色。与 VoiceManager.resolve_voice 的 L13 校验同口径。
+        """
+        if is_unsafe_voice_id(voice):
+            return None
         return os.path.join(self.voice_dir, voice)
 
     def synthesize(self, text, voice=None):
@@ -120,6 +139,17 @@ class MeloTTSBackend(TTSBackend):
         """
         self._ensure_lib()
         _voice = voice or self.default_voice
+        # H-2：非法音色标识（路径穿越特征）告警并回退默认音色，不拼接逃逸路径；
+        # default_voice 亦非法（构造参数异常）时最终兜底官方默认 cx-open
+        if is_unsafe_voice_id(_voice):
+            warnings.warn(
+                f"音色标识含路径穿越特征，已拒绝并回退官方默认音色：{_voice!r}",
+                UserWarning,
+                stacklevel=2,
+            )
+            _voice = self.default_voice
+            if is_unsafe_voice_id(_voice):
+                _voice = DEFAULT_VOICE_ID
         _voice_path = self._voice_path(_voice)
         cfg = os.path.join(_voice_path, "config.json")
         ckpt = os.path.join(_voice_path, "ckpt.txt")  # 训练产物常见名；视后端而定

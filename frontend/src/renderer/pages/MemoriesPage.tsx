@@ -26,19 +26,21 @@ function mockToView(m: MemoryItem): ViewMemory {
   return { id: m.id, title: m.title, summary: m.summary, tags: m.tags, date: m.date };
 }
 
-/** tags 字段解析：兼容 sqlite TEXT（可能是 JSON 数组字符串 / 逗号串）与真数组 */
+/** tags 字段解析：兼容 sqlite TEXT（可能是 JSON 数组字符串 / 逗号串）与真数组。
+ * F-9（第三轮体检批次6）：返回前去重——后端 tags 存重复值（如 "音乐,音乐"）时
+ * 渲染处 key 重复会触发 React 告警。 */
 function parseTags(raw: unknown): string[] {
-  if (Array.isArray(raw)) return raw.map(String).filter(Boolean);
+  if (Array.isArray(raw)) return Array.from(new Set(raw.map(String).filter(Boolean)));
   if (typeof raw === 'string') {
     const t = raw.trim();
     if (!t) return [];
     try {
       const arr = JSON.parse(t);
-      if (Array.isArray(arr)) return arr.map(String).filter(Boolean);
+      if (Array.isArray(arr)) return Array.from(new Set(arr.map(String).filter(Boolean)));
     } catch {
       /* 非 JSON，走逗号切分 */
     }
-    return t.split(',').map((s) => s.trim()).filter(Boolean);
+    return Array.from(new Set(t.split(',').map((s) => s.trim()).filter(Boolean)));
   }
   return [];
 }

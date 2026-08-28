@@ -170,17 +170,22 @@ export default function SettingsPage() {
     });
   };
 
-  // 切换授权：在线走 POST authorize；离线/失败则本地记忆
+  // 切换授权：在线走 POST authorize；离线/失败则本地记忆。
+  // F-8（第三轮体检批次6）：补序号守卫（F3 修复未覆盖此处）——快速连点时
+  // 并发 POST 响应可乱序，迟到的旧响应不得把 UI 拉回与后端真相背离的状态。
   const handleControlAuthChange = async (next: boolean) => {
     setControlAuth(next);
+    const seq = ++saveSeqRef.current;
     if (computerOnline) {
       try {
         const st = await setComputerAuthorized(next);
+        if (seq !== saveSeqRef.current) return; // 已有更新的操作接管，丢弃迟到响应
         setControlAuth(st.authorized);
         setConfirmDangerous(st.confirm_dangerous);
         writeLsBool(LS_AUTH_KEY, st.authorized);
         writeLsBool(LS_CONFIRM_KEY, st.confirm_dangerous);
       } catch {
+        if (seq !== saveSeqRef.current) return; // 同上：迟到失败丢弃
         // 后端请求失败：降到本地记忆交互
         setComputerOnline(false);
         writeLsBool(LS_AUTH_KEY, next);

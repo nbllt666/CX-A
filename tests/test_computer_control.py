@@ -365,3 +365,86 @@ def test_requires_confirmation_allows_plain_commands():
     assert ComputerControl._requires_confirmation(f'"{PY}" -c "print(1)"') is False
     assert ComputerControl._requires_confirmation("notepad") is False
     assert ComputerControl._requires_confirmation("dir /s") is False
+
+
+# ------------------------------------------------------------------ #
+# 11. 批次1（第三轮体检）：组合命令黑名单 / 脱敏 / 超时下界             #
+# ------------------------------------------------------------------ #
+
+
+@pytest.mark.parametrize(
+    "combined",
+    [
+        "echo hi & rd /s /q C:\\x",
+        "echo hi && del dirty.tmp",
+        "cd temp&&del x",
+        "echo a | format q:",
+        "echo a; shutdown /s",
+        "echo a\nrm -rf /",
+        "(rd /s /q C:\\x)",
+        "(del dirty.tmp)",
+        "echo x & del",
+    ],
+)
+def test_combined_dangerous_command_blocked(combined):
+    """H-1：组合命令中任何一段命中黑名单即整体 BLOCKED，不执行本机动作。"""
+    ctrl = _make()
+    res = ctrl.run_command(combined)
+    assert res.success is False
+    assert res.error_code == BLOCKED
+    assert "黑名单" in (res.error or "")
+
+
+def test_combined_wrapper_requires_confirmation():
+    """H-1：包裹器段藏在组合命令后段仍进确认闸。"""
+    assert ComputerControl._requires_confirmation("echo hi & cmd /c echo ok") is True
+    assert ComputerControl._requires_confirmation("echo hi | powershell -c dir") is True
+
+
+def test_combined_harmless_commands_not_flagged():
+    """H-1：无危险段且无包裹器段的组合命令不误伤。"""
+    assert ComputerControl._is_dangerous("echo hi & echo bye") is False
+    assert ComputerControl._requires_confirmation("echo hi & echo bye") is False
+    # 路径含 & 的合法引用形态不误判（& 在引号内仍是分隔符，属保守方向）
+    assert ComputerControl._is_dangerous('"{PY}" -c "print(1)"'.replace("{PY}", PY)) is False
+
+
+def test_redact_covers_bearer_token():
+    """M-4：Bearer 令牌形态纳入脱敏。"""
+    from lite.computer_control import _redact
+
+    out = _redact("Authorization: Bearer sk-abc123456")
+    assert "sk-abc123456" not in out
+    assert "Bearer ***" in out
+
+
+def test_log_extra_is_redacted(capsys):
+    """M-4：_log 的 extra 经 _redact，密钥不进终端日志。"""
+    ctrl = _make()
+    ctrl._log("action", TOOL_COMMAND, extra="set TOKEN=sk-secret123")
+    captured = capsys.readouterr()
+    assert "sk-secret123" not in captured.out
+    assert "TOKEN=***" in captured.out
+
+
+def test_command_timeout_lower_bound():
+    """L-2：timeout_s=0 / 负数被钳制为 >= 1.0，不再立即误杀。"""
+    ctrl = _make()
+    res = ctrl.run_command(f'"{PY}" -c "print(\'SLOW_OK\')"', timeout_s=0)
+    # 若被 0 超时误杀则 success=False 且 timed_out=True；钳制后应正常完成
+    assert res.timed_out is False
+    assert res.success is True
+    assert "SLOW_OK" in (res.result or "")
+
+    res_neg = ctrl.run_command(f'"{PY}" -c "print(\'NEG_OK\')"', timeout_s=-5)
+    assert res_neg.timed_out is False
+    assert res_neg.success is True
+
+
+def test_windows_output_decoded_with_locale_encoding():
+    """M-3：Windows 子进程按 locale 编码解码（中文系统 GBK），中文输出不再是 U+FFFD。"""
+    ctrl = _make()
+    res = ctrl.run_command(f'"{PY}" -c "print(\'中文输出测试\')"')
+    assert res.success is True
+    assert "中文输出测试" in (res.stdout or "")
+    assert "\ufffd" not in (res.stdout or "")

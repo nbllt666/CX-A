@@ -67,6 +67,10 @@ _TRANSITIONS = {
 #: 质量拒绝阈值（对齐 CX-O rubric.quality_reject_threshold 默认 0.3）
 QUALITY_REJECT_THRESHOLD = 0.3
 
+#: 单次蒸馏的切块数上限（H-5 遗留，第三轮体检批次3）：每块一次云端调用，
+#: 超限截断并告警，防超长消息触发大量云端请求。
+MAX_DISTILL_CHUNKS = 50
+
 
 def _is_normal_char(ch: str) -> bool:
     """判断字符是否属「正常内容字符」：常见 ASCII（含 JSON 结构） / 中文 / 常用中文标点。
@@ -199,7 +203,16 @@ class MemoryDistiller:
             )
 
         sessions: List[Dict] = []
-        for chunk in self._split_messages(messages, chunk_token_estimate):
+        # H-5 遗留（批次2移交，第三轮体检批次3）：切块数上限——防超长消息
+        # 切出大量 chunk 串行发起大量云端调用；超限截断并告警
+        chunks = self._split_messages(messages, chunk_token_estimate)
+        if len(chunks) > MAX_DISTILL_CHUNKS:
+            print(
+                f"[WARN] 蒸馏切块数 {len(chunks)} 超上限 {MAX_DISTILL_CHUNKS}，"
+                f"仅处理前 {MAX_DISTILL_CHUNKS} 块（建议减小单次提交的对话长度）"
+            )
+            chunks = chunks[:MAX_DISTILL_CHUNKS]
+        for chunk in chunks:
             sessions.append(self._distill_chunk(chunk, agent_id))
         self.last_sessions = sessions
         return sessions
@@ -286,7 +299,9 @@ class MemoryDistiller:
             #    继续落其余事实，不再中断整个 chunk；已成功条目如实保留在 added。
             self._set_state(session, S_COMMIT)
             fact_errors: List[str] = []
-            for fact in facts:
+            # L-6：enumerate 取真实序号——原 `len(added)+len(fact_errors)+1`
+            # 未计入被去重跳过的条目，诊断编号与实际位置错位
+            for fact_index, fact in enumerate(facts, start=1):
                 try:
                     content = fact["content"]
                     importance = int(fact.get("importance") or 3)
@@ -313,7 +328,7 @@ class MemoryDistiller:
                         # 去重跳过：该条未落库，继续处理后续事实
                         continue
                 except Exception as fact_exc:  # noqa: BLE001 - 单条失败不放大为整块失败
-                    fact_errors.append(f"第 {len(session['added']) + len(fact_errors) + 1} 条落库失败：{fact_exc}")
+                    fact_errors.append(f"第 {fact_index} 条落库失败：{fact_exc}")
                     continue
                 session["added"].append(
                     {
@@ -440,11 +455,17 @@ class MemoryDistiller:
                 content = item.get("content") or item.get("fact")
                 if not isinstance(content, str) or not content.strip():
                     continue
-                importance = item.get("importance", 3)
+                # M-11：importance 解析容错——畸形值（非数字字符串等）回落默认 3，
+                # 不再让单条解析失败放大为整个 chunk 失败（与落库阶段防护粒度对齐）
+                importance_raw = item.get("importance", 3)
+                try:
+                    importance = int(importance_raw) if importance_raw is not None else 3
+                except (TypeError, ValueError):
+                    importance = 3
                 facts.append(
                     {
                         "content": content.strip(),
-                        "importance": int(importance) if importance is not None else 3,
+                        "importance": importance,
                     }
                 )
         return facts

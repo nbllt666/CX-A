@@ -604,6 +604,49 @@ def test_none_output_falls_through_to_hint():
     assert out["audio"] == CAN_AUDIO
 
 
+# ------------------------------------------------------------------ #
+# M-9 话语缓冲字节上限（第三轮体检批次3）                              #
+# ------------------------------------------------------------------ #
+
+
+def test_utterance_buffer_bounded_under_sustained_audio():
+    """M-9：VAD 永不判结束时缓冲有界——超上限丢弃最旧块，字节数不超上限。"""
+    from lite.audio.pipeline import _MAX_UTTERANCE_BYTES
+
+    cloud = FakeCloud()
+    pipe = _pipeline(vad=None, cloud=cloud)  # vad=None → 恒按未结束处理
+    big = b"\x00" * 65536  # 64KB/块
+    for _ in range(_MAX_UTTERANCE_BYTES // 65536 + 10):
+        assert pipe.feed_audio(big) is None
+
+    total = sum(len(c) for c in pipe._utterance_buffer)
+    assert total <= _MAX_UTTERANCE_BYTES
+    # 缓冲非空（仍在听），且计数器与缓冲一致
+    assert pipe._utterance_buffer
+    assert pipe._utterance_bytes == total
+
+
+def test_utterance_buffer_counter_reset_on_end_frame():
+    """M-9：end 帧转写后缓冲与字节计数一并清零（FakeVAD 首块即判结束）。"""
+    cloud = FakeCloud()
+    pipe = _pipeline(cloud=cloud)
+    out = pipe.feed_audio(b"abc")
+    assert out["should_reply"] is True
+    assert pipe._utterance_buffer == []
+    assert pipe._utterance_bytes == 0
+
+
+def test_utterance_buffer_counter_reset_on_start_session():
+    """M-9：start_session 复位时缓冲字节计数同步归零。"""
+    cloud = FakeCloud()
+    pipe = _pipeline(vad=None, cloud=cloud)
+    pipe.feed_audio(b"x" * 4096)
+    assert pipe._utterance_bytes > 0
+    pipe.start_session()
+    assert pipe._utterance_buffer == []
+    assert pipe._utterance_bytes == 0
+
+
 def test_asr_exception_returns_structured_false_and_loop_survives():
     """asr.transcribe 抛异常时返回结构化 should_reply=False 且后续轮次存活。"""
     class BoomASRBackend:

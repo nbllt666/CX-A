@@ -157,6 +157,8 @@ class RemoteController:
         #: 公网遥控预留端点（Task F4，P2 后置；None 表示未配置）
         #: 本期仅存储 URL，不做连接/认证，不影响局域网 endpoint 既有行为。
         self.public_endpoint = None
+        #: M-16（第三轮体检批次4）：明文 HTTP 告警是否已发出（仅告警一次）
+        self._plain_http_warned = False
 
     # ------------------------------------------------------------------ #
     # 内部：启用判定 / 统一请求封装                                        #
@@ -166,6 +168,22 @@ class RemoteController:
         """功能未启用时抛 RemoteDisabled（其余调用方不可见）。"""
         if not self.enabled:
             raise RemoteDisabled("远端遥控未启用（config remote.enabled=false）")
+
+    def _warn_plain_http_once(self):
+        """endpoint 为 http:// 明文传输时打印一次性显著安全告警（M-16）。
+
+        本期传输层无认证头、不强制 TLS 为 F4 预留的设计取舍；启用态 + 明文
+        HTTP 的组合下控制指令与配置补丁可被局域网嗅探/伪造，至少显式告警
+        提示用户，不静默。
+        """
+        if self._plain_http_warned:
+            return
+        if self.endpoint.lower().startswith("http://"):
+            print(
+                f"[WARN] 远端遥控 endpoint 为明文 HTTP（{self.endpoint}）："
+                "控制指令与配置补丁可被局域网嗅探/伪造，建议尽快切换 HTTPS（TLS+令牌为 F4 预留）"
+            )
+        self._plain_http_warned = True
 
     def _request(self, method, path, json_body=None, timeout=10):
         """统一 HTTP 请求封装：拼接 URL、调用 transport 并映射异常。
@@ -184,6 +202,7 @@ class RemoteController:
             RemoteError: 远端返回非 2xx。
         """
         url = f"{self.endpoint}{path}"
+        self._warn_plain_http_once()
         try:
             return self._transport.request(
                 method, url, json_body=json_body, timeout=timeout

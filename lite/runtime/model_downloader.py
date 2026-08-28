@@ -289,20 +289,22 @@ class LlmDownloader:
         if resume_size and resume_size > 0:
             kwargs["headers"] = {"Range": f"bytes={int(resume_size)}-"}
             seeking = True
-        resp = self._requests.get(url, **kwargs)
-        resp.raise_for_status()
-        headers = resp.headers or {}
-        if seeking and getattr(resp, "status_code", None) == 206:
-            start = int(resume_size)
-            total = self._content_range_total(headers, start)
-        else:
-            start = 0
-            total = int(headers.get("Content-Length", 0) or 0)
-        self._ensure_disk_space(self.dest_dir, total, os.path.basename(tmp_path))
-        downloaded = self._stream_from_response(
-            resp.iter_content(chunk_size=64 * 1024), total, tmp_path, progress_cb,
-            start_offset=start,
-        )
+        # L-13（第三轮体检批次5）：with 确定性关闭响应——修复前 _ensure_disk_space
+        # 抛出 / 写盘 IO 异常时连接只能等 GC 回收
+        with self._requests.get(url, **kwargs) as resp:
+            resp.raise_for_status()
+            headers = resp.headers or {}
+            if seeking and getattr(resp, "status_code", None) == 206:
+                start = int(resume_size)
+                total = self._content_range_total(headers, start)
+            else:
+                start = 0
+                total = int(headers.get("Content-Length", 0) or 0)
+            self._ensure_disk_space(self.dest_dir, total, os.path.basename(tmp_path))
+            downloaded = self._stream_from_response(
+                resp.iter_content(chunk_size=64 * 1024), total, tmp_path, progress_cb,
+                start_offset=start,
+            )
         return downloaded, total
 
     def _download_urllib(self, url, tmp_path, progress_cb, resume_size=0):

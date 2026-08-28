@@ -82,6 +82,8 @@ def ensure_dirs(root):
     """创建数据目录（幂等）。
 
     创建 data/（memories.db、lancedb/、local_llm/、voices/）、logs/ 等数据目录。
+    M-15（第三轮体检批次4）：子目录清单从 ``REQUIRED_DATA_DIRS`` 派生（单一
+    真相源），消除与 verify_components 双份维护的漂移风险。
     重复调用不会报错或产生重复目录。
 
     :param root: 安装根目录（真实使用 PROJECT_ROOT，测试可传 tmp_path）。
@@ -89,13 +91,9 @@ def ensure_dirs(root):
     """
     root = root or PROJECT_ROOT
     _log_info("开始初始化数据目录...")
-    dirs = [
-        os.path.join(root, "data"),
-        os.path.join(root, "data", "lancedb"),
-        os.path.join(root, "data", "local_llm"),
-        os.path.join(root, "data", "voices"),
-        os.path.join(root, "logs"),
-    ]
+    dirs = [os.path.join(root, "data")]
+    dirs.extend(os.path.join(root, rel) for rel in REQUIRED_DATA_DIRS)
+    dirs.append(os.path.join(root, "logs"))
     for directory in dirs:
         os.makedirs(directory, exist_ok=True)
 

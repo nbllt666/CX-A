@@ -189,6 +189,28 @@ def test_file_missing_creates_empty_list_then_seed(tmp_path):
     assert mgr.list()[0].name == "软软"
 
 
+# ---------------------------------------------------------------- 批次5（第三轮体检）：脏数据兜底
+def test_dirty_entry_without_id_skipped_not_fatal(tmp_path, capsys):
+    """M-17：单条脏数据缺 id 键仅跳过并告警，AgentManager 构造不再被拖垮。"""
+    path = tmp_path / "agents.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"name": "坏条目无id", "persona": "p"},  # 缺 id：KeyError
+                {"id": "a2", "name": "好条目", "persona": "ok"},
+                "非 dict 条目",
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    mgr = AgentManager(path=str(path))
+    names = [a.name for a in mgr.list()]
+    assert "好条目" in names
+    assert "坏条目无id" not in names
+    assert "已跳过" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------- L6a 原子写
 def test_save_atomic_preserves_original_on_dump_failure(tmp_path, monkeypatch):
     """L6a：json.dump 抛错时 agents.json 原内容完好，tmp 被清理且异常上抛。"""

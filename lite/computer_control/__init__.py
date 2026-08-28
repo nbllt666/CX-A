@@ -24,13 +24,14 @@ from lite.computer_control.control import (
     TOOL_SCREEN,
     CommandResult,
     ComputerControl,
+    ControlTimeoutError,
     ExecutionError,
     InvalidArgumentError,
     KeyboardResult,
     NotAuthorizedError,
     PluginError,
     ScreenResult,
-    TimeoutError,
+    TimeoutError,  # 兼容别名（L-14 重命名后保留）
     ToolResult,
     _redact,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "PluginError",
     "NotAuthorizedError",
     "InvalidArgumentError",
+    "ControlTimeoutError",
     "TimeoutError",
     "ExecutionError",
     "DANGEROUS_COMMANDS",

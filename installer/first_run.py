@@ -17,12 +17,13 @@
 
 import os
 
+from lite.cloud.adapter import PROVIDER_BASE_URLS
 from lite.config.config_manager import ConfigManager
 
 from .bootstrap import PROJECT_ROOT
 
-#: 可选的云端提供商列表（对齐 config.cloud.provider 可选值）。
-DEFAULT_PROVIDERS = ("deepseek", "tongyi", "openai", "moonshot")
+#: 可选的云端提供商列表（L-8：从 adapter.PROVIDER_BASE_URLS 派生，单一真相源）。
+DEFAULT_PROVIDERS = tuple(PROVIDER_BASE_URLS.keys())
 
 
 class FirstRunDriver:

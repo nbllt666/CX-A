@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import type { ChatMessage } from '../mock';
 import { sendMessage } from '../api';
 
@@ -19,6 +19,16 @@ export default function ChatPage() {
   /** 聊天通道实际连通状态：unknown=尚未探测；connected=收到过真实回复；unavailable=最近一次发送不可达 */
   const [channel, setChannel] = useState<'unknown' | 'connected' | 'unavailable'>('unknown');
   const listRef = useRef<HTMLDivElement>(null);
+
+  // F-7（第三轮体检批次6）：消息变化后自动滚动到底部——修复前 listRef 为
+  // 死引用，消息超一屏后新气泡（尤其伴侣回复）出现在视口外。
+  // scrollTo 存在性防御：jsdom 测试环境未实现 Element.scrollTo
+  useEffect(() => {
+    const el = listRef.current;
+    if (el && typeof el.scrollTo === 'function') {
+      el.scrollTo({ top: el.scrollHeight });
+    }
+  }, [messages.length]);
 
   async function send() {
     const text = draft.trim();
@@ -112,7 +122,10 @@ export default function ChatPage() {
         <input
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && void send()}
+          onKeyDown={(e) => {
+            // F-6（第三轮体检批次6）：中文输入法组合期（选候选词）的 Enter 不触发发送
+            if (e.key === 'Enter' && !e.nativeEvent.isComposing) void send();
+          }}
           placeholder="跟你的伴侣说点什么吧…"
           className="h-10 flex-1 rounded-xl border border-[var(--glass-border)] bg-[rgba(255,255,255,0.5)] px-3 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)]"
         />

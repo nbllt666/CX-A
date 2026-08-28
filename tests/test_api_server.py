@@ -798,3 +798,145 @@ def test_create_app_wires_runtime_deps(tmp_path):
     # voice 三件套就位（Mock 兜底装配零失败）
     assert handler._voice.asr is not None
     assert handler._voice.tts is not None
+
+
+# ---------------------------------------------------------------- 第三轮体检批次2：输入加固
+
+
+def test_limit_negative_rejected(api_server):
+    """M-6：limit=-1 回 400（SQLite LIMIT -1 语义为无限制，与意图相反）。"""
+    _store, _pipeline, base = api_server
+    try:
+        status, payload, _raw = http_get(f"{base}/api/memories?" + urlencode({"limit": "-1"}))
+    except urllib.error.HTTPError as exc:
+        status, payload = exc.code, json.loads(exc.read().decode("utf-8"))
+    assert status == 400
+    assert payload["error"] == "bad_request"
+
+
+def test_limit_above_cap_clamped(api_server):
+    """M-6：limit 超上限被钳制到 1000，正常返回 200 而非 500。"""
+    _store, _pipeline, base = api_server
+    status, _payload, _raw = http_get(
+        f"{base}/api/memories?" + urlencode({"limit": "99999999999999999999"})
+    )
+    assert status == 200
+
+
+def test_top_k_negative_rejected(api_server):
+    """M-6：top_k=-1 回 400。"""
+    _store, _pipeline, base = api_server
+    try:
+        status, payload, _raw = http_get(
+            f"{base}/api/memories/search?" + urlencode({"q": "test", "top_k": "-1"})
+        )
+    except urllib.error.HTTPError as exc:
+        status, payload = exc.code, json.loads(exc.read().decode("utf-8"))
+    assert status == 400
+    assert payload["error"] == "bad_request"
+
+
+def test_distill_messages_over_limit_400(api_server):
+    """H-5：messages 超过 200 条上限回 400，不触发云端调用。"""
+    _store, _pipeline, base = api_server
+    messages = [{"role": "user", "content": f"msg-{i}"} for i in range(201)]
+    status, payload = http_post(f"{base}/api/memory/distill", {"messages": messages})
+    assert status == 400
+    assert "上限" in payload["message"]
+
+
+def test_synthesize_text_over_limit_400(api_server):
+    """M-5：synthesize text 超过 5000 字符上限回 400，不触发合成。"""
+    _store, _pipeline, base = api_server
+    status, payload = http_post(f"{base}/api/voice/synthesize", {"text": "啊" * 5001})
+    assert status == 400
+    assert "上限" in payload["message"]
+
+
+def test_computer_call_arguments_non_dict_400(computer_env):
+    """L-3：arguments 为非 dict（如字符串）时显式 400，不再静默替换 {}。"""
+    base, authorizer, _keyboard = computer_env
+    authorizer.authorize()
+    status, payload = http_post(f"{base}/api/computer/call", {"tool": "computer_run_command", "arguments": "oops"})
+    assert status == 400
+    assert payload["error"] == "bad_request"
+
+
+def test_tools_call_arguments_non_dict_400(api_server):
+    """L-3：tools/call 的 arguments 为非 dict 时显式 400。"""
+    _store, _pipeline, base = api_server
+    status, payload = http_post(f"{base}/api/tools/call", {"name": "system_info", "arguments": [1, 2]})
+    assert status == 400
+    assert payload["error"] == "bad_request"
+
+
+def test_distill_agent_id_sanitized(api_server):
+    """L-5：超长 agent_id 被限长到 100 字符（未配置云端时走 400 cloud_not_configured 前无异常）。"""
+    _store, _pipeline, base = api_server
+    status, payload = http_post(
+        f"{base}/api/memory/distill",
+        {"messages": [{"role": "user", "content": "hi"}], "agent_id": "x" * 500},
+    )
+    # 未配置云端 api_key 的测试环境：服务端在蒸馏前先拒绝（400 cloud_not_configured），
+    # 关键断言是不因超长 agent_id 出现 500
+    assert status == 400
+    assert payload["error"] == "cloud_not_configured"
+
+
+def test_payload_too_large_bounded_read(tmp_path):
+    """H-4：声明超大 Content-Length 的慢客户端不再让服务永久阻塞。
+
+    raw socket 发送声明 10MB body 的请求头但只发 1 字节——修复前服务按声明值
+    read(10MB) 永久等待；修复后有界丢弃（64KB）+ ApiHandler.timeout socket
+    超时，最坏阻塞 timeout 秒后仍能回 413。
+    """
+    _store, _pipeline, handler = create_app(data_dir=str(tmp_path))
+    handler.timeout = 2  # 缩短 socket 超时以加速测试（生产为 30s）
+    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        try:
+            # POST /api/computer/authorize 先读 body 再处理（chat/messages 有
+            # 不读 body 的未启用守卫前置、memories 无 POST 路由，均不适合本场景）
+            sock.sendall(
+                b"POST /api/computer/authorize HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 10485760\r\n"
+                b"\r\n"
+                b"x"  # 声明 10MB 实际只发 1 字节（恶意慢客户端形态）
+            )
+            data = sock.recv(4096)
+            # recv 可能只拿到响应头，补收一次确保 JSON body（43 字节）到手
+            try:
+                data += sock.recv(4096)
+            except OSError:
+                pass
+        finally:
+            sock.close()
+        status_line = data.split(b"\r\n", 1)[0]
+        assert b"413" in status_line
+        assert b"payload_too_large" in data
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_agents_update_unknown_fields_ignored(api_server):
+    """L-4：PUT /api/agents 只接受白名单字段，未知字段被忽略而非透传底层。"""
+    _store, _pipeline, base = api_server
+    status, agent = http_post(
+        f"{base}/api/agents", {"name": "A1", "persona": "P1"}
+    )
+    assert status == 201
+    agent_id = agent["id"]
+    status, updated = http_post(
+        f"{base}/api/agents/{agent_id}", {"name": "A2", "hacker_field": "evil"}, method="PUT"
+    )
+    assert status == 200
+    assert updated["name"] == "A2"
+    assert "hacker_field" not in updated

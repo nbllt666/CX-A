@@ -176,3 +176,37 @@ def test_min_score_filter(mgr):
     mgr.add_memory("unrelated token banana", importance_score=0.1, embed_fn=_embed)
     results = mgr.retrieve("apple", embed_fn=_embed, top_k=5, max_memories=5, min_score=0.2)
     assert all(r["content"] != "unrelated token banana" for r in results)
+
+
+# ---------------------------------------------------------------- 批次3（第三轮体检）：软删除清向量
+def test_soft_delete_also_removes_vector(mgr):
+    """M-10：soft_delete 命中后向量库中对应向量同步删除，不再成为孤儿。"""
+    mid = mgr.add_memory("orphan vector cleanup token", embed_fn=_embed)
+    assert mid is not None
+    assert str(mid) in mgr.vector_store._vectors
+
+    assert mgr.soft_delete(mid) is True
+    assert str(mid) not in mgr.vector_store._vectors
+    # 记录软删除后检索不可见（is_deleted 过滤既有行为不变）
+    assert mgr.retrieve("orphan vector cleanup", embed_fn=_embed, top_k=5) == []
+
+
+def test_soft_delete_miss_returns_false(mgr):
+    """M-10：soft_delete 未命中返回 False，不触碰向量库。"""
+    assert mgr.soft_delete(99999) is False
+
+
+def test_soft_delete_survives_vector_store_error(mgr):
+    """M-10：向量清理抛异常时仅告警，软删除语义不回滚。"""
+    class _BoomVectorStore(InMemoryVectorStore):
+        def delete(self, vector_id):
+            raise RuntimeError("boom")
+
+    m = MemoryManager(
+        store=MemoryStore(db_path=str(mgr.store.db_path) + ".x.db"),
+        vector_store=_BoomVectorStore(),
+    )
+    mid = m.add_memory("boom cleanup token", embed_fn=_embed)
+    assert m.soft_delete(mid) is True
+    # 软删除已生效（get 侧 is_deleted=1）
+    assert m.store.get(mid)["is_deleted"] == 1

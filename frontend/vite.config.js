@@ -29,6 +29,8 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
-    host: true,
+    // F-10（第三轮体检批次6）：仅绑定回环——修复前 host:true 监听 0.0.0.0，
+    // 局域网设备可加载 dev 页面（Electron dev 走 wait-on tcp:5173 不受影响）
+    host: 'localhost',
   },
 });

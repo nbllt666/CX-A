@@ -169,3 +169,21 @@ def test_non_2xx_maps_to_remote_error():
     ctrl = _enabled_controller(transport, endpoint="http://remote-cxo")
     with pytest.raises(RemoteError):
         ctrl.get_status()
+
+
+# ---------------------------------------------------------------- 批次4（第三轮体检）：明文 HTTP 告警
+def test_plain_http_endpoint_warns_once(capsys):
+    """M-16：endpoint 为 http:// 时首次请求打印一次性明文传输告警，https 不告警。"""
+    transport = _RecorderTransport({"status": "success"})
+    ctrl = _enabled_controller(transport, endpoint="http://remote-cxo")
+    ctrl.get_status()
+    ctrl.get_status()  # 第二次请求不再重复告警
+    out = capsys.readouterr().out
+    assert out.count("明文 HTTP") == 1
+    assert "F4 预留" in out
+
+    https_ctrl = _enabled_controller(
+        _RecorderTransport({"status": "success"}), endpoint="https://remote-cxo"
+    )
+    https_ctrl.get_status()
+    assert "明文 HTTP" not in capsys.readouterr().out

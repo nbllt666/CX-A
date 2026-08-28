@@ -278,3 +278,61 @@ def test_authorize_revoke_write_audit(tmp_path):
     assert "api" in by_action["authorize"]["args"]
     assert by_action["revoke"]["authorized"] is False
     assert "api" in by_action["revoke"]["args"]
+
+
+# ------------------------------------------------------------------ #
+# 批次1（第三轮体检）：审计容错 / 原子写 / 组合命令确认链               #
+# ------------------------------------------------------------------ #
+
+
+def test_authorize_audit_failure_does_not_rollback_state(tmp_path, monkeypatch):
+    """M-2：audit 写失败（OSError）时 authorize 仍生效且不向上抛异常。"""
+    auth = ControlAuthorizer(data_dir=str(tmp_path))
+
+    def _boom(*args, **kwargs):
+        raise OSError("磁盘已满")
+
+    monkeypatch.setattr(auth, "audit", _boom)
+    # 修复前：audit 抛 OSError 上传，authorized=True 却已生效（状态不一致）
+    assert auth.authorize() is True
+    assert auth.is_authorized() is True
+
+    monkeypatch.setattr(auth, "audit", _boom)
+    assert auth.revoke() is True
+    assert auth.is_authorized() is False
+
+
+def test_save_state_atomic_no_tmp_left(tmp_path):
+    """L-1：_save_state 原子写完成后不残留 .tmp 中间文件。"""
+    auth = ControlAuthorizer(data_dir=str(tmp_path))
+    auth.authorize()
+    state_path = tmp_path / "security_state.json"
+    assert state_path.exists()
+    assert not (tmp_path / "security_state.json.tmp").exists()
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["authorized"] is True
+
+
+def test_needs_confirmation_combined_command_segments(tmp_path):
+    """H-1：组合命令（& / && / | / ; / 换行 / 括号分组）逐段判定防绕过。
+
+    修复前 ``echo hi & rd /s /q C:\\x`` 三道闸全部穿透（首 token 为 echo、
+    黑名单前缀匹配不中、无 rmtree/remove/delete/drop 子串）。
+    """
+    auth = ControlAuthorizer(data_dir=str(tmp_path))
+    # 黑名单段藏在组合命令后段 -> 整体命中（rd 本身在黑名单，直接 BLOCKED 级）
+    assert auth.needs_confirmation("echo hi & rd /s /q C:\\x") is True
+    # 括号分组改变首 token 的形态
+    assert auth.needs_confirmation("(rd /s /q C:\\x)") is True
+    # && 串接
+    assert auth.needs_confirmation("cd temp&&del x") is True
+    # 管道与分号
+    assert auth.needs_confirmation("echo x | format q:") is True
+    assert auth.needs_confirmation("echo a; shutdown /s") is True
+    # 换行串接
+    assert auth.needs_confirmation("echo a\nrm -rf /") is True
+    # 包裹器段藏在组合命令后段 -> 进确认闸
+    assert auth.needs_confirmation("echo hi & cmd /c echo ok") is True
+    # 无危险段且无包裹器段的组合命令不误报
+    assert auth.needs_confirmation("echo hi & echo bye") is False
+    assert auth.needs_confirmation("dir /s & whoami") is False

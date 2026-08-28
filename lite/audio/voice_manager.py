@@ -28,11 +28,12 @@ DEFAULT_VOICE_ID = "cx-open"
 _VOICE_ID_TRAVERSAL_RE = re.compile(r"^[A-Za-z]:|[\\/]")
 
 
-def _is_unsafe_voice_id(voice_id) -> bool:
-    """判定音色 id 是否含路径穿越特征（L13）。
+def is_unsafe_voice_id(voice_id) -> bool:
+    """判定音色 id 是否含路径穿越特征（L13；第三轮体检批次3 升为公开接口）。
 
     包含 ``/``、``\\``、``..`` 或盘符模式（如 ``C:``）任一即视为非法：
     此类 id 可能逃逸 ``data/voices/`` 根目录读写任意位置。
+    tts.MeloTTSBackend 的 ``_voice_path`` 亦以本函数为统一校验入口（H-2）。
 
     :param voice_id: 待检音色 id（str）
     :return: True 表示非法（应拒绝）
@@ -44,17 +45,19 @@ def _is_unsafe_voice_id(voice_id) -> bool:
     return ".." in voice_id
 
 
+#: 兼容别名：既有引用沿用私有名（公开名升级后保留，避免破坏 import）
+_is_unsafe_voice_id = is_unsafe_voice_id
+
+
 def default_voices_dir():
     """推导默认音色根目录：``<root>/data/voices``。
 
-    本文件位于 ``<root>/lite/audio/voice_manager.py``，逐级向上取两次
-    dirname 即得 ``<root>``。路径推导一律基于
-    ``os.path.dirname(os.path.abspath(__file__))``，禁止相对路径。
+    M-14（第三轮体检批次4）：根解析统一收敛到 ``lite.config.paths.app_root()``
+    （frozen-aware），冻结态不再误指向 ``_internal/data``。
     """
-    _audio_dir = os.path.dirname(os.path.abspath(__file__))  # <root>/lite/audio
-    _lite_dir = os.path.dirname(_audio_dir)                  # <root>/lite
-    _root = os.path.dirname(_lite_dir)                       # <root>
-    return os.path.join(_root, "data", "voices")
+    from lite.config.paths import data_root
+
+    return os.path.join(data_root(), "voices")
 
 
 class VoiceManager:
@@ -140,7 +143,8 @@ class VoiceManager:
     def list_voices(self):
         """扫描音色根目录，返回当前可用音色包列表。
 
-        每个子目录=一个音色包；内含任意文件即判定存在（宽松探测）。
+        每个子目录=一个音色包；须含 config.json / ckpt.txt / *.pth / *.ckpt
+        任一训练产物才可加载（G-4 修复后的 ``_is_loadable_voice`` 严格探测）。
         返回 ``[{id, path, is_default, size}]``：``cx-open`` 恒标记
         ``is_default=True``。音色根目录不存在/为空时返回空列表。
         """

@@ -36,6 +36,12 @@ class _FakeResponse:
         self.headers = headers if headers is not None else {"Content-Length": str(len(self._data))}
         self._offset = 0
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False  # 修复后生产代码以 with 持有响应（L-13），替身补上下文协议
+
     def raise_for_status(self):
         if self._status >= 400:
             raise RuntimeError(f"HTTP {self._status}")
@@ -387,6 +393,12 @@ class _FakeRangedStreamResponse:
         self.status_code = status_code
         self.headers = headers if headers is not None else {"Content-Length": str(len(self._payload))}
         self._offset = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False  # 修复后生产代码以 with 持有响应（L-13），替身补上下文协议
 
     def raise_for_status(self):
         pass

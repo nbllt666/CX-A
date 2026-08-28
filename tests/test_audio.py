@@ -521,3 +521,60 @@ def test_melotts_with_voice_config_no_fallback_warning(tmp_path, monkeypatch):
     assert not any("已回退官方默认音色" in str(w.message) for w in caught)
     assert _StopAfterEngine.config_path.endswith("config.json")
     assert _StopAfterEngine.ckpt_path.endswith("ckpt.txt")
+
+
+# ------------------------------------------------------------------ #
+# 批次3（第三轮体检）：voice 路径穿越 / 引擎 LRU                        #
+# ------------------------------------------------------------------ #
+
+
+@pytest.mark.parametrize("evil", ["../evil", "a/b", "a\\b", "C:pack", ".."])
+def test_voice_path_rejects_traversal_ids(tmp_path, evil):
+    """H-2：含路径穿越特征的 voice id 一律返回 None，不拼接逃逸路径。"""
+    backend = MeloTTSBackend(voice_dir=str(tmp_path / "voices"))
+    assert backend._voice_path(evil) is None
+
+
+def test_voice_path_allows_normal_id(tmp_path):
+    """H-2：正常音色 id 照常拼接目录路径。"""
+    voice_dir = tmp_path / "voices"
+    backend = MeloTTSBackend(voice_dir=str(voice_dir))
+    assert backend._voice_path("myvoice") == str(voice_dir / "myvoice")
+
+
+def test_melotts_unsafe_voice_falls_back_with_warning(tmp_path, monkeypatch):
+    """H-2：synthesize 收到非法 voice 时告警并回退官方默认音色（cx-open）。"""
+    import warnings
+
+    backend = _make_melotts_backend(tmp_path, monkeypatch, {})
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(_StopAfterEngine):
+            backend.synthesize("你好", voice="../evil_pack")
+
+    assert any("路径穿越特征" in str(w.message) for w in caught), [str(w.message) for w in caught]
+    # 回退默认音色 cx-open（目录缺产物）→ 引擎收到 None/None
+    assert _StopAfterEngine.config_path is None
+    assert _StopAfterEngine.ckpt_path is None
+
+
+def test_engine_cache_lru_eviction(tmp_path, monkeypatch):
+    """M-8：引擎缓存超上限（3）时淘汰最旧条目，命中刷新最新位。"""
+    voice_dir = tmp_path / "voices"
+    voice_dir.mkdir(parents=True)
+    backend = MeloTTSBackend(voice_dir=str(voice_dir))
+    backend._TTSType = lambda **kwargs: object()  # 跳过真实 melo 导入，引擎占位 object()
+
+    keys = [(f"cfg{i}.json", f"ckpt{i}.txt") for i in range(4)]
+    for cfg, ckpt in keys[:3]:
+        backend._get_engine(config_path=cfg, ckpt_path=ckpt)
+    assert len(backend._engines) == 3
+    assert keys[0] in backend._engines
+
+    # 命中 keys[0] → 刷新为最新位；随后新增 keys[3] → 淘汰的应是最旧的 keys[1]
+    backend._get_engine(config_path=keys[0][0], ckpt_path=keys[0][1])
+    backend._get_engine(config_path=keys[3][0], ckpt_path=keys[3][1])
+    assert len(backend._engines) == 3
+    assert keys[1] not in backend._engines
+    assert keys[0] in backend._engines and keys[3] in backend._engines

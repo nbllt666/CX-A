@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import locale
 import os
 import re
 import signal
@@ -40,7 +41,8 @@ __all__ = [
     "PluginError",
     "NotAuthorizedError",
     "InvalidArgumentError",
-    "TimeoutError",
+    "ControlTimeoutError",
+    "TimeoutError",  # 兼容别名（L-14 重命名后保留）
     "ExecutionError",
     # 结果结构
     "ToolResult",
@@ -104,11 +106,21 @@ class InvalidArgumentError(PluginError):
     http_status: int = 400
 
 
-class TimeoutError(PluginError):
-    """执行超时：超出 timeout_s，已回收整个进程树。"""
+class ControlTimeoutError(PluginError):
+    """执行超时：超出 timeout_s，已回收整个进程树。
+
+    L-14（第三轮体检批次5）：原类名 ``TimeoutError`` 遮蔽内建同名异常——任何
+    模块一旦 ``from lite.computer_control import TimeoutError``，其作用域内
+    ``except TimeoutError`` 将不再捕获 socket/subprocess 内建超时，语义静默
+    反转。现更名 ControlTimeoutError，模块级保留旧名兼容别名。
+    """
 
     error_code: str = "TIMEOUT"
     http_status: int = 504
+
+
+#: 兼容别名：历史导入名（pyi 对齐期命名）。新代码请使用 :class:`ControlTimeoutError`。
+TimeoutError = ControlTimeoutError
 
 
 class ExecutionError(PluginError):
@@ -228,14 +240,20 @@ _REDACT_PATTERN = re.compile(
     r"(?i)\b(api[_-]?key|password|passwd|token|secret)(\s*[:=]\s*)([^\s,:;]+)"
 )
 
+# Bearer 令牌形态：``Authorization: Bearer sk-xxx`` 中的令牌值脱敏（M-4）
+_BEARER_PATTERN = re.compile(r"(?i)\b(bearer\s+)([^\s,;\"']+)")
+
 
 def _redact(text: str) -> str:
     """脱敏常见密钥 / 密码模式：``api_key=sk-xxx`` -> ``api_key=***``。
 
+    同时覆盖 ``Bearer <token>`` 形态（M-4，20260828_模块0_电脑控制安全链修复）。
+
     :param text: 待处理的文本
     :return: 命中模式的值被掩码后的文本
     """
-    return _REDACT_PATTERN.sub(r"\1\2***", text)
+    text = _REDACT_PATTERN.sub(r"\1\2***", text)
+    return _BEARER_PATTERN.sub(r"\1***", text)
 
 
 # --------------------------------------------------------------------------- #
@@ -492,6 +510,8 @@ class ComputerControl:
             )
 
         timeout = float(timeout_s) if timeout_s is not None else float(self.timeout_s)
+        # L-2：超时下界钳制，防止 timeout_s=0 / 负数对未瞬时结束进程立即误杀
+        timeout = max(timeout, 1.0)
         try:
             exit_code, stdout, stderr, timed_out = self._run_subprocess(command, timeout)
         except ExecutionError:
@@ -550,47 +570,92 @@ class ComputerControl:
     #: 使 "del dirty.tmp" 命中 "del"，同时避免误伤 "delete..." 等正常词。
     _DANGEROUS_BOUNDARY = " \t-/\\:."
 
+    #: 组合命令分隔符：&&、||、&、|、; 与换行
+    #: （H-1：Windows shell 可串接多条子命令，需逐段判定防绕过）
+    _COMMAND_SPLIT_PATTERN = re.compile(r"&&|\|\||[&|;\n\r]")
+
+    @classmethod
+    def _split_command_segments(cls, command: str) -> List[str]:
+        """把组合命令拆分为子命令段（H-1，20260828_模块0_电脑控制安全链修复）。
+
+        Windows shell 下 ``&``/``&&``/``|``/``;`` 与换行可串接多条子命令，
+        括号分组可改变首 token——逐段判定防止 ``echo hi & rd /s /q C:\\x``
+        这类"首段无害、后段危险"的组合命令绕过黑名单与确认闸。
+        括号统一视作段边界处理，防止 ``(rd /s /q x)`` 以 "(" 开头骗过首 token 判定。
+
+        :param command: 原始指令字符串
+        :return: 拆分后的非空子命令段列表；整串无分隔符时为单段
+        """
+        cmd = command or ""
+        # 括号分组视作段边界（替换为分号强制分段）
+        cmd = cmd.replace("(", "; ").replace(")", "; ")
+        segments = [seg.strip() for seg in cls._COMMAND_SPLIT_PATTERN.split(cmd)]
+        nonempty = [seg for seg in segments if seg]
+        return nonempty or [cmd.strip()]
+
     @classmethod
     def _is_dangerous(cls, command: str) -> bool:
-        """判定命令是否命中危险黑名单（去空白、转小写后前缀 + 边界匹配）。
+        """判定命令是否命中危险黑名单（H-1：逐段判定，任一段命中即整体命中）。
+
+        对每个子命令段独立做前缀 + 边界匹配，组合命令中任何一段命中
+        危险名单即整体判定为危险，杜绝"首段无害掩护后段危险"的绕过。
 
         :param command: 指令字符串
         :return: True 表示危险
         """
-        cmd = (command or "").strip().lower()
-        for dangerous in DANGEROUS_COMMANDS:
-            d = dangerous.lower().strip()
-            if cmd == d:
-                return True
-            if cmd.startswith(d) and cmd[len(d)] in cls._DANGEROUS_BOUNDARY:
-                return True
+        for segment in cls._split_command_segments(command):
+            cmd = segment.lower()
+            if not cmd:
+                continue
+            for dangerous in DANGEROUS_COMMANDS:
+                d = dangerous.lower().strip()
+                if cmd == d:
+                    return True
+                if cmd.startswith(d) and cmd[len(d)] in cls._DANGEROUS_BOUNDARY:
+                    return True
         return False
+
+    @staticmethod
+    def _first_token_basename(segment: str) -> str:
+        """取单个命令段首 token 的 basename（引号路径 / 盘符路径统一处理）。
+
+        :param segment: 单个子命令段
+        :return: 首 token 的 basename（小写）
+        """
+        segment = segment.strip()
+        if not segment:
+            return ""
+        if segment[0] in ('"', "'"):
+            end = segment.find(segment[0], 1)
+            first = segment[1:end] if end > 0 else segment[1:]
+        else:
+            first = segment.split()[0]
+        # basename 统一按两种分隔符切分：Windows 反斜杠在 POSIX 平台不被
+        # os.path.basename 识别，故手动再切一次，保证跨平台判定一致
+        basename = os.path.basename(first).lower()
+        return basename.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
 
     @classmethod
     def _requires_confirmation(cls, command: str) -> bool:
-        """判定命令首 token 是否命中包裹器名单（N2：强制进高危确认闸）。
+        """判定命令是否命中包裹器名单（N2 + H-1：逐段判定首 token）。
 
-        解析规则：命令去首尾空白后，若以引号开头则取首对引号内路径为首 token，
-        否则按空白切分取首段；随后取 basename 转小写（兼容 Windows 盘符路径
-        ``C:\\...\\cmd.exe`` 与 POSIX 路径分隔），命中 ``CONFIRM_REQUIRED_WRAPPERS``
-        返回 True。黑名单命中（``_is_dangerous``）仍优先直接 BLOCKED，两者叠加生效。
+        每个子命令段独立取首 token（含带引号绝对路径形态取 basename）判定
+        是否命中 ``CONFIRM_REQUIRED_WRAPPERS``——组合命令中任何一段首 token
+        为包裹器即整体需进高危确认闸。黑名单命中（``_is_dangerous``）仍优先
+        直接 BLOCKED，两者叠加生效。
 
         :param command: 指令字符串
-        :return: True 表示首 token 为包裹器，需经高危确认闸
+        :return: True 表示存在包裹器段，需经高危确认闸
         """
         cmd = (command or "").strip()
         if not cmd:
             return False
-        if cmd[0] in ('"', "'"):
-            end = cmd.find(cmd[0], 1)
-            first = cmd[1:end] if end > 0 else cmd[1:]
-        else:
-            first = cmd.split()[0]
-        # basename 统一按两种分隔符切分：Windows 反斜杠在 POSIX 平台不被
-        # os.path.basename 识别，故手动再切一次，保证跨平台判定一致
-        basename = os.path.basename(first).lower()
-        basename = basename.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-        return basename in CONFIRM_REQUIRED_WRAPPERS
+        for segment in cls._split_command_segments(cmd):
+            if not segment:
+                continue
+            if cls._first_token_basename(segment) in CONFIRM_REQUIRED_WRAPPERS:
+                return True
+        return False
 
     def _run_subprocess(self, command: str, timeout: float) -> Tuple[Optional[int], str, str, bool]:
         """底层进程执行：Windows 套 shell、CREATE_NO_WINDOW；超时回收进程树。
@@ -621,7 +686,9 @@ class ComputerControl:
             stdin=subprocess.DEVNULL,
             creationflags=creationflags,
             start_new_session=start_new_session,
-            encoding="utf-8",
+            # M-3：Windows shell 输出跟随控制台代码页（中文系统 GBK/cp936），
+            # 按 locale 编码解码避免中文输出全为 U+FFFD；POSIX 保持 UTF-8
+            encoding=locale.getpreferredencoding(False) if os.name == "nt" else "utf-8",
             errors="replace",
             text=True,
         )
@@ -683,10 +750,14 @@ class ComputerControl:
     def _log(self, event: str, tool: str, extra: str = "") -> None:
         """打印中文日志：记录工具调用 / 授权状态 / 拒绝事件。
 
+        M-4：extra 统一过 ``_redact`` 脱敏，防止 ``set TOKEN=sk-xxx`` 类
+        命令把密钥明文带进终端日志。
+
         :param event: 事件（action / deny / unknown）
         :param tool: 工具标识
         :param extra: 附加说明
         """
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        extra = _redact(extra)
         extra = f" | {extra}" if extra else ""
         print(f"[{ts}] [INFO] 电脑控制 event={event} tool={tool}{extra} authorized={self._authorized}")

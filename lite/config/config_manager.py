@@ -104,12 +104,14 @@ NEED_RESTART_SECTIONS = ("vector", "embedding")
 def _derive_project_root():
     """推导项目根目录。
 
-    本文件位于 ``<root>/lite/config/config_manager.py``，
-    逐级向上取三次 dirname 即得到项目根（c:\\CX-A）。
+    M-14（第三轮体检批次4）：统一收敛到 ``lite.config.paths.app_root()``
+    （frozen-aware）——PyInstaller 冻结态下 ``__file__`` 位于
+    ``runtime/backend/_internal/``，原 ``__file__`` 上溯推导指向错误位置；
+    开发态行为与原实现一致。
     """
-    _config_dir = os.path.dirname(os.path.abspath(__file__))  # <root>/lite/config
-    _lite_dir = os.path.dirname(_config_dir)                  # <root>/lite
-    return os.path.dirname(_lite_dir)                         # <root>
+    from lite.config.paths import app_root
+
+    return app_root()
 
 
 def _deep_merge(defaults, current):

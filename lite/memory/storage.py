@@ -21,8 +21,14 @@ _PROJECT_ROOT = os.path.dirname(_LITE_DIR)
 
 
 def _default_db_path():
-    """默认数据库路径：项目根目录下 data/memories.db。"""
-    return os.path.join(_PROJECT_ROOT, "data", "memories.db")
+    """默认数据库路径：项目根目录下 data/memories.db。
+
+    M-14（第三轮体检批次4）：根解析统一收敛到 ``lite.config.paths.app_root()``
+    （frozen-aware），冻结态不再误指向 ``_internal/data``。
+    """
+    from lite.config.paths import data_root
+
+    return os.path.join(data_root(), "memories.db")
 
 
 def _now() -> str:

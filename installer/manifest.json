@@ -41,8 +41,8 @@
       "key": "sensevoice",
       "size_estimate": "约 300 MB",
       "status": "builtin",
-      "install_target": "data/voices/sensevoice",
-      "notes": "语音识别模型（对齐 config.asr.engine）。"
+      "install_target": "data/SenseVoiceSmall",
+      "notes": "语音识别模型（对齐 config.asr.engine）；落位与 lite/audio/asr.py SenseVoiceBackend 的默认 model_path 回退路径一致（M-13）。"
     },
     {
       "name": "本地小 LLM（可选）",

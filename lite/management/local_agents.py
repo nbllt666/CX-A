@@ -170,7 +170,18 @@ class AgentManager:
             self._save()
             return
 
-        self._agents = [Agent.from_dict(raw) for raw in raw_list if isinstance(raw, dict)]
+        # M-17（第三轮体检批次5）：逐条解析 + 脏数据兜底——单条缺 id 等异常
+        # 仅跳过并告警，不再让整份 agents.json 拖垮 AgentManager 构造
+        # （口径对齐 config_manager 的 N3 损坏兜底：单点脏数据不致命）
+        loaded = []
+        for raw in raw_list:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                loaded.append(Agent.from_dict(raw))
+            except (KeyError, TypeError, ValueError) as exc:
+                print(f"[WARN] agents.json 存在无法解析的条目，已跳过：{exc}（raw={raw!r:.120}）")
+        self._agents = loaded
         # 兼容已损坏/被外部清空的历史数据：至少保证存在一个可用的 default 锚点
         if not any(a.id == DEFAULT_SEED_ID for a in self._agents):
             self._agents.append(self._seed_agent())

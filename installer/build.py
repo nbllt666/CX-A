@@ -314,7 +314,6 @@ def assemble(electron_dist, backend_dist, portable_root):
     # 数据目录 + 内置模型组件落位 + 默认 config（复用 bootstrap，幂等）
     from installer import bootstrap
 
-    bootstrap.BUNDLED_DIR = BUNDLED_DIR
     bootstrap.ensure_dirs(portable_root)
     bootstrap.install_builtin_assets(portable_root)
     bootstrap.init_workplace(portable_root)

@@ -34,6 +34,10 @@ LOGGER = logging.getLogger(__name__)
 #: 消息结构字段集合（对齐 CX-O §3.3，供跨版本互通断言）
 MSG_STRUCT = {"action", "request_id", "data"}
 
+#: 单个路由信箱的消息容量上限（M-18，第三轮体检批次5）：超限截断最旧，
+#: 防同进程高频 route_message 造成内存无界增长。
+MAX_MAILBOX = 256
+
 
 def _now():
     """当前单调时钟（可测试注入点）。"""
@@ -269,7 +273,12 @@ class LiteACP:
             "request_id": request_id,
             "data": {"from": from_id, "to": to_id, "payload": payload},
         }
-        self._routes.setdefault(to_id, []).append(message)
+        # M-18（第三轮体检批次5）：信箱容量上限——高频 route_message 时截断
+        # 最旧消息，防止内存无界增长（N9 的 found_agents 上限语义对齐）
+        mailbox = self._routes.setdefault(to_id, [])
+        mailbox.append(message)
+        if len(mailbox) > MAX_MAILBOX:
+            del mailbox[: len(mailbox) - MAX_MAILBOX]
         return request_id
 
     def get_messages(self, agent_id):

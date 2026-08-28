@@ -25,13 +25,14 @@ __all__ = [
 def data_dir():
     """推导本项目 ``data/`` 目录（存放模型 / 音色等资产）。
 
-    本文件位于 ``<root>/lite/audio/asr.py``，逐级向上取三次 dirname 即得
-    ``<root>``，再拼接 ``data`` 得 ``<root>/data``。路径推导一律基于
-    ``os.path.dirname(os.path.abspath(__file__))``，禁止相对路径。
+    M-14（第三轮体检批次4）：根解析统一收敛到 ``lite.config.paths.app_root()``
+    （frozen-aware）——PyInstaller 冻结态下 ``__file__`` 位于
+    ``runtime/backend/_internal/``，原 ``__file__`` 上溯推导指向错误位置；
+    开发态行为与原实现一致。
     """
-    return os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data"
-    )
+    from lite.config.paths import data_root
+
+    return data_root()
 
 
 def resolve_torch_device(device="cpu"):

@@ -45,8 +45,13 @@ def resolve_root():
 def build_args(root=None):
     """组装传给 ``api_server.main`` 的命令行参数列表。
 
+    H-3（第三轮体检批次4）：追加 ``--config <root>/config.json``——把用户配置
+    真相源统一到便携根顶层（与 bootstrap.init_workplace / first_run 写入点、
+    build.py zip 注释声明的"顶层 config.json 为用户配置"对齐）；
+    修复前运行链读 data/config.json，首启向导写入的云端配置永远读不到。
+
     :param root: 安装根；缺省用 ``resolve_root()``（测试可传 tmp_path）。
-    :return: list[str]，形如 ["--host", ..., "--port", ..., "--data-dir", ...]。
+    :return: list[str]，形如 ["--host", ..., "--port", ..., "--data-dir", ..., "--config", ...]。
     """
     root = root or resolve_root()
     data_dir = os.path.join(root, "data")
@@ -54,6 +59,7 @@ def build_args(root=None):
         "--host", BACKEND_HOST,
         "--port", str(BACKEND_PORT),
         "--data-dir", data_dir,
+        "--config", os.path.join(root, "config.json"),
     ]
 
 

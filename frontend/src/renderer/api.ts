@@ -80,15 +80,44 @@ async function ensureBackendToken(): Promise<string | null> {
   return backendToken;
 }
 
-/** 通用 JSON 请求封装：非 2xx 视为失败并抛错（供上层 try/catch 降级）。 */
-export async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
+/** 请求默认超时（毫秒）：对后端 api_timeout=300s 契约；超时 abort 防 UI 永久锁死（F-5）。 */
+const DEFAULT_TIMEOUT_MS = 300_000;
+
+/**
+ * 通用 JSON 请求封装：非 2xx 视为失败并抛错（供上层 try/catch 降级）。
+ *
+ * F-5（第三轮体检批次6）：内置 AbortController 超时——后端为单线程服务，
+ * 被长任务阻塞时无超时的 fetch 会永久挂起、UI 锁死；超时后 abort 并抛出
+ * 明确的中文超时错误，调用方 catch 后正常降级。
+ *
+ * @param url 请求地址
+ * @param init 可选 fetch 初始化（method/headers/body 等）
+ * @param timeoutMs 超时毫秒数，默认 300_000（300s）
+ */
+export async function requestJson<T>(
+  url: string,
+  init?: RequestInit,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<T> {
   // N1：持有启动令牌时自动附带 X-Client-Token 头（后端开启令牌校验后必需）
   const token = await ensureBackendToken();
   const headers = new Headers(init?.headers);
   if (token) {
     headers.set('X-Client-Token', token);
   }
-  const res = await fetch(url, { ...init, headers });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(url, { ...init, headers, signal: controller.signal });
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(`后端请求超时（${Math.round(timeoutMs / 1000)} 秒）: ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) {
     throw new Error(`后端请求失败: ${res.status} ${res.statusText}`);
   }

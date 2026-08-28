@@ -366,3 +366,54 @@ def test_manager_absent_keeps_store_add(store):
     rows = store.list(type="long_term")
     assert len(rows) == 1
     assert rows[0]["content"] == "用户偏好阅读科幻小说"
+
+
+# ---------------------------------------------------------------- 批次3（第三轮体检）：解析容错 / 编号 / chunk 上限
+def test_facts_from_json_list_bad_importance_falls_back():
+    """M-11：importance 为非数字 / None 时回落默认 3，单条解析不再放大为整块失败。"""
+    facts = MemoryDistiller._facts_from_json_list(
+        [
+            {"content": "事实甲", "importance": "abc"},
+            {"content": "事实乙", "importance": None},
+            {"content": "事实丙", "importance": 4},
+        ]
+    )
+    assert [f["content"] for f in facts] == ["事实甲", "事实乙", "事实丙"]
+    assert [f["importance"] for f in facts] == [3, 3, 4]
+
+
+def test_fact_error_number_counts_dedup_skipped(store):
+    """L-6：去重跳过的条目计入错误编号——第 1 条去重跳过、第 2 条失败时报"第 2 条"。"""
+
+    class _FailSecond(RecordingManager):
+        def add_memory(self, content, type="short_term", importance=3, agent_id="default"):
+            if content == "用户喜欢雨天出行":
+                raise RuntimeError("db write failed")
+            return super().add_memory(content, type=type, importance=importance, agent_id=agent_id)
+
+    cloud = FakeCloud(
+        response=[
+            '[{"content": "用户偏好阅读科幻小说", "importance": 3},',
+            '{"content": "用户喜欢雨天出行", "importance": 3}]',
+        ]
+    )
+    manager = _FailSecond(dedup_content="用户偏好阅读科幻小说")
+    distiller = MemoryDistiller(cloud=cloud, store=store, manager=manager)
+    sessions = distiller.distill_with_sessions([{"role": "user", "content": "hi"}])
+
+    s = sessions[0]
+    assert s["state"] == S_FAILED
+    assert "第 2 条落库失败" in s["error"]
+
+
+def test_chunk_count_capped(store, monkeypatch):
+    """chunk 上限：切块数超 MAX_DISTILL_CHUNKS 时截断，云端调用数等于上限。"""
+    from lite.memory import distillation as dist_mod
+
+    monkeypatch.setattr(dist_mod, "MAX_DISTILL_CHUNKS", 3)
+    cloud = FakeCloud(response=[])
+    distiller = _mk_distiller(cloud, store)
+    messages = [{"role": "user", "content": f"第{i}条消息内容"} for i in range(40)]
+    sessions = distiller.distill_with_sessions(messages, chunk_token_estimate=1)
+    assert len(sessions) == 3
+    assert len(cloud.call_recorder) == 3

@@ -248,6 +248,8 @@ def test_backend_entry_dev_root_and_args(tmp_path, monkeypatch):
         "--host", "127.0.0.1",
         "--port", "8600",
         "--data-dir", os.path.join(str(tmp_path), "data"),
+        # H-3（第三轮体检批次4）：--config 指向便携根顶层（与安装链统一真相源）
+        "--config", os.path.join(str(tmp_path), "config.json"),
     ]
 
 
@@ -336,6 +338,121 @@ def test_check_port_bindable_probe_real_port():
         probe.close()
     # 释放后同端口应可绑定
     assert backend_entry.check_port_bindable("127.0.0.1", occupied_port) is True
+
+
+# ------------------------------------------------------------------ #
+# 批次4（第三轮体检）：配置真相源统一 / frozen-aware 路径               #
+# ------------------------------------------------------------------ #
+
+
+def test_api_server_config_path_unifies_install_and_runtime(tmp_path):
+    """H-3：config_path 指向便携根顶层 config.json 时，服务读写同一真相源。
+
+    模拟安装链先写根 config.json（bootstrap.init_workplace 同口径），再以
+    create_app(data_dir, config_path) 起服——运行链 PUT settings 落盘到根
+    config.json 而非 data/config.json。
+    """
+    from lite.server.api_server import create_app
+
+    root = tmp_path / "portable"
+    root.mkdir()
+    root_config = root / "config.json"
+    # 安装链：bootstrap.init_workplace 写根 config.json
+    install_cm = ConfigManager(config_path=str(root_config))
+    install_cm.set("cloud", "provider", "moonshot")
+    install_cm.save()
+
+    data_dir = root / "data"
+    _store, _pipeline, handler = create_app(
+        data_dir=str(data_dir), config_path=str(root_config)
+    )
+    # 运行链读到安装链写入的值（修复前运行链读 data/config.json 恒为默认 deepseek）
+    assert handler._config.get("cloud", "provider", "deepseek") == "moonshot"
+    # 运行链写 settings 落盘到根 config.json
+    handler._config.set("tts", "voice", "my-voice")
+    handler._config.save()
+    on_disk = json.loads(root_config.read_text(encoding="utf-8"))
+    assert on_disk["tts"]["voice"] == "my-voice"
+    assert not (data_dir / "config.json").exists()
+
+
+def test_settings_put_api_key_encrypted_and_hidden(tmp_path):
+    """H-6：PUT /api/settings 支持 cloud.api_key——Fernet 加密落盘且 GET 视图不含。"""
+    import urllib.error
+    import urllib.request
+    import threading
+    from http.server import HTTPServer
+
+    from lite.server.api_server import create_app
+
+    root = tmp_path / "portable"
+    root.mkdir()
+    root_config = root / "config.json"
+    data_dir = root / "data"
+    _store, _pipeline, handler = create_app(
+        data_dir=str(data_dir), config_path=str(root_config)
+    )
+    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        req = urllib.request.Request(
+            f"{base}/api/settings",
+            data=json.dumps({"cloud": {"api_key": "sk-test-abc123"}}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        assert payload["ok"] is True
+        assert "cloud.api_key" in payload["applied"]
+        # GET 视图不含 api_key（脱敏不变）
+        with urllib.request.urlopen(f"{base}/api/settings", timeout=5) as resp:
+            view = json.loads(resp.read().decode("utf-8"))
+        assert "api_key" not in view["cloud"]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+    # 落盘为 Fernet 加密形态（cxa_enc: 前缀），明文不进配置文件
+    on_disk = json.loads(root_config.read_text(encoding="utf-8"))
+    assert on_disk["cloud"]["api_key"].startswith("cxa_enc:")
+    assert "sk-test-abc123" not in root_config.read_text(encoding="utf-8")
+
+
+def test_app_root_frozen_resolves_portable_root(tmp_path, monkeypatch):
+    """M-14：frozen-aware app_root——冻结态从 sys.executable 上溯到便携根。"""
+    from lite.config import paths as paths_mod
+
+    fake_exe = tmp_path / "runtime" / "backend" / "backend.exe"
+    fake_exe.parent.mkdir(parents=True)
+    fake_exe.write_bytes(b"")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe), raising=False)
+
+    assert paths_mod.app_root() == str(tmp_path)
+    assert paths_mod.data_root() == os.path.join(str(tmp_path), "data")
+    monkeypatch.delattr(sys, "frozen", raising=False)
+
+
+def test_first_run_providers_derived_from_adapter():
+    """L-8：first_run.DEFAULT_PROVIDERS 与 adapter.PROVIDER_BASE_URLS 同源。"""
+    from lite.cloud.adapter import PROVIDER_BASE_URLS
+
+    assert FirstRunDriver  # 引用不悬空
+    from installer import first_run as first_run_mod
+
+    assert first_run_mod.DEFAULT_PROVIDERS == tuple(PROVIDER_BASE_URLS.keys())
+
+
+def test_bootstrap_ensure_dirs_covers_required(tmp_path):
+    """M-15：ensure_dirs 从 REQUIRED_DATA_DIRS 派生——两清单天然一致。"""
+    bootstrap.ensure_dirs(str(tmp_path))
+    for rel in bootstrap.REQUIRED_DATA_DIRS:
+        assert (tmp_path / rel).is_dir(), rel
+    assert (tmp_path / "logs").is_dir()
+    assert (tmp_path / "data" / "memories.db").exists()
 
 
 # ------------------------------------------------------------------ #

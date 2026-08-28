@@ -63,13 +63,24 @@ _TOKEN_OPEN_MODE_WARNED = False
 # 请求体大小上限（N6）：1MB，超出直接 413，防超大 body 阻塞单线程服务
 _MAX_BODY_BYTES = 1048576
 
+# 单次蒸馏请求的 messages 条数上限（H-5，第三轮体检批次2）：
+# 超限 400——防单请求串行发起数百次云端 LLM 调用阻塞单线程服务
+_MAX_DISTILL_MESSAGES = 200
+
+# 语音合成文本长度上限（字符）（M-5）：超限 400——防超长文本分钟级合成阻塞服务
+_MAX_SYNTH_TEXT_CHARS = 5000
+
+# 记忆列表 limit / 检索 top_k 的允许上限（M-6）：负数 400、超上限钳制——
+# 防 LIMIT -1 全表返回与超大整数触发 sqlite OverflowError
+_MAX_LIST_LIMIT = 1000
+
+# agent_id 最大长度（L-5）：入库字段限长，防任意长字符串写库
+_MAX_AGENT_ID_CHARS = 100
+
 
 class _BodyTooLarge(Exception):
     """请求体超过 ``_MAX_BODY_BYTES`` 的内部信号（413 响应已由 _read_body_json 发出）。"""
 
-
-# 云端 provider 白名单（与 lite/cloud/adapter.py 支持的 provider 对齐）
-CLOUD_PROVIDER_ALLOWLIST = ("deepseek", "tongyi", "openai", "moonshot")
 
 # settings PUT 已知只读顶层键：GET 视图可见但不在 PUT 白名单的 section
 # （收到时收集进 ignored 数组回显，消除静默丢弃——L2 收口）
@@ -137,10 +148,15 @@ from lite.computer_control.control import (  # noqa: E402
 from lite.computer_control.security import ControlAuthorizer  # noqa: E402
 from lite.computer_control.tool_bridge import ToolBridge  # noqa: E402
 from lite.config.config_manager import DEFAULTS, ConfigManager  # noqa: E402
+from lite.cloud.adapter import PROVIDER_BASE_URLS  # noqa: E402
 from lite.cloud.adapter import CloudAdapter, CloudConfigError  # noqa: E402
 from lite.memory.distillation import DistillationPaused, MemoryDistiller  # noqa: E402
 from lite.tools.builtin_registry import BuiltinToolRegistry  # noqa: E402
 from lite.audio import LiteVoicePipeline, build_default_pipeline  # noqa: E402
+
+# 云端 provider 白名单（L-8：从 adapter.PROVIDER_BASE_URLS 派生，单一真相源，
+# 新增 provider 无需再同步本文件；置于 lite 包 import 之后——派生依赖其符号）
+CLOUD_PROVIDER_ALLOWLIST = tuple(PROVIDER_BASE_URLS.keys())
 
 # 默认数据目录：项目根目录下 data/（与 storage._default_db_path 的 data/memories.db 一致）
 DEFAULT_DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
@@ -154,23 +170,27 @@ def _resolve_data_dir(data_dir=None) -> str:
     return data_dir or DEFAULT_DATA_DIR
 
 
-def build_deps(data_dir=None):
+def build_deps(data_dir=None, config_path=None):
     """组装服务依赖。
 
     Args:
         data_dir: 数据目录（None 用项目根 data/）。
+        config_path: 配置文件路径（H-3，第三轮体检批次4；None 用
+            ``data_dir/config.json``）。生产链由 backend_entry 显式传
+            ``<root>/config.json``，与安装链（bootstrap/first_run）的
+            用户配置落点统一为同一真相源。
 
     Returns:
         tuple[MemoryStore, MemoryRetrievalPipeline, AgentManager, RemoteController]:
             存储实例、检索管线、本地 Agent 管理器与远端遥控控制器，四者共享同一
-            data_dir。遥控控制器由 data_dir 下 config.json 的 remote 段驱动
+            data_dir。遥控控制器由配置的 remote 段驱动
             （默认 enabled=false），测试时各自注入 mock transport。
     """
     data_dir = _resolve_data_dir(data_dir)
     os.makedirs(data_dir, exist_ok=True)
     # M5 配置接线：读取 memory 段注入检索管线（缺省值与 DEFAULTS["memory"] 一致），
     # pipeline 内部会把 dedup/permanent_threshold 透传给其持有的 MemoryManager
-    config = ConfigManager(config_path=os.path.join(data_dir, "config.json"))
+    config = ConfigManager(config_path=config_path or os.path.join(data_dir, "config.json"))
     store = MemoryStore(db_path=os.path.join(data_dir, "memories.db"))
     embed = LiteEmbeddingProvider(dim=64)
     vector_store = InMemoryVectorStore()
@@ -210,7 +230,7 @@ def build_computer_deps(data_dir=None):
     return computer, authorizer, bridge
 
 
-def build_runtime_deps(data_dir=None, config=None, store=None, pipeline=None, computer_deps=None):
+def build_runtime_deps(data_dir=None, config=None, store=None, pipeline=None, computer_deps=None, config_path=None):
     """装配批次E生产运行时依赖：语音编排 / 内置工具注册表 / 记忆蒸馏器。
 
     三个引擎此前仅有能力实现、无生产构造点（20260828_模块0_生产装配接线），
@@ -239,11 +259,11 @@ def build_runtime_deps(data_dir=None, config=None, store=None, pipeline=None, co
     data_dir = _resolve_data_dir(data_dir)
     os.makedirs(data_dir, exist_ok=True)
     if store is None or pipeline is None:
-        built_store, built_pipeline, _manager, _remote = build_deps(data_dir)
+        built_store, built_pipeline, _manager, _remote = build_deps(data_dir, config_path=config_path)
         store = store or built_store
         pipeline = pipeline or built_pipeline
     if config is None:
-        config = ConfigManager(config_path=os.path.join(data_dir, "config.json"))
+        config = ConfigManager(config_path=config_path or os.path.join(data_dir, "config.json"))
     if computer_deps is None:
         computer_deps = build_computer_deps(data_dir)
     computer, authorizer, bridge = computer_deps
@@ -350,6 +370,10 @@ def make_handler(
         """REST 请求处理器。单线程 HTTPServer 内串行执行，无共享状态竞争。"""
 
         server_version = "CXLiteAPI/0.1"
+        #: socket 读写超时（秒）（H-4 配套，第三轮体检批次2）：防慢客户端
+        # （slowloris / 声明超大 body 缓慢发送）把单线程服务永久阻塞在 read 上；
+        # 超时抛 socket.timeout（OSError 子类），由调用方捕获后正常回错
+        timeout = 30
         #: 服务进程启动时刻（/api/status 的 uptime 基准）
         _STARTED_AT = time.monotonic()
         _store = store
@@ -562,6 +586,18 @@ def make_handler(
                 else:
                     ignored.append(f"cloud.provider={provider!r}（不在白名单 {CLOUD_PROVIDER_ALLOWLIST}）")
 
+            # H-6（第三轮体检批次4）：api_key 写入白名单——生产装配下唯一可用的
+            # 云端 Key 配置入口（管理 API 供另一 Agent 调用，不进前端 UI）。
+            # 走 ConfigManager 既有 Fernet 加密链路落盘（save 时统一加密）；
+            # GET 视图继续不含 api_key，applied 只回键名不回显值。
+            api_key = body.get("cloud", {}).get("api_key")
+            if api_key is not None:
+                if isinstance(api_key, str) and api_key.strip():
+                    self._config.set("cloud", "api_key", api_key.strip())
+                    applied.append("cloud.api_key")
+                else:
+                    ignored.append("cloud.api_key（必须为非空字符串）")
+
             voice = body.get("tts", {}).get("voice")
             if voice is not None:
                 if isinstance(voice, str) and voice.strip():
@@ -678,10 +714,11 @@ def make_handler(
             if not self._check_host():
                 self._deny_bad_host()
                 return
-            if not self._check_token():
-                return
             try:
                 path = urlparse(self.path).path
+                # N1：POST 无豁免端点，统一在 path 解析后过启动令牌闸（与 do_GET 次序对齐）
+                if not self._check_token():
+                    return
                 if path == "/api/chat/messages":
                     self._handle_chat_send_guard()
                     return
@@ -724,10 +761,11 @@ def make_handler(
             if not self._check_host():
                 self._deny_bad_host()
                 return
-            if not self._check_token():
-                return
             try:
                 path = urlparse(self.path).path
+                # N1：PUT 无豁免端点，统一在 path 解析后过启动令牌闸（与 do_GET 次序对齐）
+                if not self._check_token():
+                    return
                 if path == "/api/settings":
                     self._handle_settings_update()
                     return
@@ -747,10 +785,11 @@ def make_handler(
             if not self._check_host():
                 self._deny_bad_host()
                 return
-            if not self._check_token():
-                return
             try:
                 path = urlparse(self.path).path
+                # N1：DELETE 无豁免端点，统一在 path 解析后过启动令牌闸（与 do_GET 次序对齐）
+                if not self._check_token():
+                    return
                 prefix = "/api/memories/"
                 if path.startswith(prefix):
                     self._delete_memory(path[len(prefix):])
@@ -785,26 +824,60 @@ def make_handler(
                 self._send_json({"ok": False, "error": "bad_request", "message": "id 必须是整数"}, 400)
                 return
 
-            deleted = self._store.soft_delete(memory_id)
+            # M-10（第三轮体检批次3）：优先走 manager.soft_delete（软删 + 同步
+            # 清理向量库孤儿向量）；manager 缺席时回落 store 直删保持旧行为
+            manager = getattr(self._pipeline, "manager", None)
+            if manager is not None:
+                deleted = manager.soft_delete(memory_id)
+            else:
+                deleted = self._store.soft_delete(memory_id)
             if deleted:
                 self._send_json({"ok": True, "id": memory_id})
             else:
                 self._send_json({"ok": False, "error": "not_found", "message": f"记忆 {memory_id} 不存在"}, 404)
 
         # ------------------------------------------------------------ 各接口实现
+        def _parse_limit_param(self, raw, name):
+            """解析并校验 limit/top_k 类参数（M-6，第三轮体检批次2）。
+
+            非整数回 400；负数回 400（LIMIT -1 在 SQLite 语义为无限制，与
+            限制条数意图相反）；超上限钳制到 _MAX_LIST_LIMIT（防 sqlite
+            OverflowError 与全量拉取）。
+
+            :param raw: 原始字符串参数
+            :param name: 参数名（用于错误消息）
+            :return: 校验后的整数；校验失败时已发送 400 并返回 None
+            """
+            try:
+                value = int(raw)
+            except ValueError:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": f"{name} 必须是整数"}, 400
+                )
+                return None
+            if value < 0:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": f"{name} 不能为负数"}, 400
+                )
+                return None
+            return min(value, _MAX_LIST_LIMIT)
+
+        def _sanitize_agent_id(self, raw):
+            """规范化 agent_id（L-5）：strip + 限长，空值回落 default。"""
+            return (str(raw or "").strip()[:_MAX_AGENT_ID_CHARS]) or "default"
+
         def _handle_list(self, query):
             """记忆列表：支持 type / agent_id / limit 过滤，默认仅返回未软删除记录。"""
             limit = None
             if query.get("limit") is not None:
-                try:
-                    limit = int(query["limit"])
-                except ValueError:
-                    self._send_json({"ok": False, "error": "bad_request", "message": "limit 必须是整数"}, 400)
+                limit = self._parse_limit_param(query["limit"], "limit")
+                if limit is None:
                     return
+            agent_id = self._sanitize_agent_id(query.get("agent_id")) if query.get("agent_id") else None
             try:
                 rows = self._store.list(
                     type=query.get("type"),
-                    agent_id=query.get("agent_id"),
+                    agent_id=agent_id,
                     limit=limit,
                     include_deleted=False,
                 )
@@ -822,12 +895,10 @@ def make_handler(
 
             top_k = None
             if query.get("top_k") is not None:
-                try:
-                    top_k = int(query["top_k"])
-                except ValueError:
-                    self._send_json({"ok": False, "error": "bad_request", "message": "top_k 必须是整数"}, 400)
+                top_k = self._parse_limit_param(query["top_k"], "top_k")
+                if top_k is None:
                     return
-            agent_id = query.get("agent_id") or "default"
+            agent_id = self._sanitize_agent_id(query.get("agent_id"))
             try:
                 result = self._pipeline.retrieve(q, agent_id=agent_id, top_k=top_k)
             except ValueError as exc:
@@ -956,7 +1027,14 @@ def make_handler(
             if not tool:
                 self._send_json({"ok": False, "error": "bad_request", "message": "tool 为必填字段"}, 400)
                 return
-            arguments = body.get("arguments") if isinstance(body.get("arguments"), dict) else {}
+            # L-3：arguments 存在且非 dict 时显式 400（不再静默替换为 {}）
+            raw_args = body.get("arguments")
+            if raw_args is not None and not isinstance(raw_args, dict):
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "arguments 必须为对象"}, 400
+                )
+                return
+            arguments = raw_args or {}
             try:
                 payload = self._bridge.execute(str(tool), arguments)
             except NotAuthorizedError as exc:
@@ -1020,7 +1098,14 @@ def make_handler(
             if not name:
                 self._send_json({"ok": False, "error": "bad_request", "message": "name 为必填字段"}, 400)
                 return
-            arguments = body.get("arguments") if isinstance(body.get("arguments"), dict) else {}
+            # L-3：arguments 存在且非 dict 时显式 400（不再静默替换为 {}）
+            raw_args = body.get("arguments")
+            if raw_args is not None and not isinstance(raw_args, dict):
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "arguments 必须为对象"}, 400
+                )
+                return
+            arguments = raw_args or {}
             known_ids = {t["id"] for t in self._registry.list_tools()}
             if name not in known_ids:
                 self._send_json(
@@ -1064,7 +1149,18 @@ def make_handler(
                     400,
                 )
                 return
-            agent_id = str(body.get("agent_id") or "default")
+            # H-5：条数上限——防单请求串行发起数百次云端 LLM 调用阻塞单线程服务
+            if len(messages) > _MAX_DISTILL_MESSAGES:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "bad_request",
+                        "message": f"messages 条数超过上限 {_MAX_DISTILL_MESSAGES}（收到 {len(messages)}）",
+                    },
+                    400,
+                )
+                return
+            agent_id = self._sanitize_agent_id(body.get("agent_id"))
             try:
                 sessions = self._distiller.distill_with_sessions(messages, agent_id=agent_id)
             except CloudConfigError as exc:
@@ -1089,6 +1185,17 @@ def make_handler(
             if not text:
                 self._send_json(
                     {"ok": False, "error": "bad_request", "message": "text 为必填字段且不能为空"}, 400
+                )
+                return
+            # M-5：文本长度上限——防超长文本分钟级合成阻塞单线程服务
+            if len(text) > _MAX_SYNTH_TEXT_CHARS:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "bad_request",
+                        "message": f"text 长度超过上限 {_MAX_SYNTH_TEXT_CHARS} 字符（收到 {len(text)}）",
+                    },
+                    400,
                 )
                 return
             voice = body.get("voice") or None
@@ -1165,11 +1272,17 @@ def make_handler(
             if length <= 0:
                 return {}
             if length > _MAX_BODY_BYTES:
-                # N6：超大 body 直接 413，防止阻塞单线程服务（本机 DoS 面）。
-                # 先按声明长度丢弃 body 再响应（上限 1MB，读取有界），避免服务端
-                # 提前关连导致客户端写中断（Windows WinError 10053）而收不到 413；
+                # N6 + H-4（第三轮体检批次2）：超大 body 直接 413，防止阻塞单线程
+                # 服务（本机 DoS 面）。丢弃读取有界（最多 1MB——保证诚实客户端的
+                # 真实大 body 被读完、能收到 413；恶意声明 10GB 也最多丢 1MB），
+                # 随后置 close_connection 强制断开；配合 ApiHandler.timeout=30 的
+                # socket 超时，慢客户端（slowloris）最坏阻塞 30s 而非永久。
                 # 抛内部信号由 do_METHOD 捕获终止分发（响应已发出）
-                self.rfile.read(length)
+                try:
+                    self.rfile.read(min(length, _MAX_BODY_BYTES))
+                except OSError:
+                    pass
+                self.close_connection = True
                 self._send_json({"ok": False, "error": "payload_too_large"}, 413)
                 raise _BodyTooLarge()
             content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -1214,13 +1327,19 @@ def make_handler(
             self._send_json(agent.to_dict(), 201)
 
         def _handle_agents_update(self, agent_id):
-            """更新 Agent：body 为任意可更新字段（name/persona/voice/enabled）。"""
+            """更新 Agent：body 为可更新字段（name/persona/voice/enabled）。
+
+            L-4（第三轮体检批次2）：API 层先做白名单键过滤再展开——即使底层
+            AgentManager.update 的白名单未来放开，接口面仍只接受这四个字段。
+            """
             body = self._read_body_json()
             if body is None:
                 self._reject_bad_json()
                 return
+            allowed_keys = ("name", "persona", "voice", "enabled")
+            patch = {k: body[k] for k in allowed_keys if k in body}
             try:
-                agent = self._manager.update(agent_id, **body)
+                agent = self._manager.update(agent_id, **patch)
             except AgentNotFound as exc:
                 self._send_json({"ok": False, "error": "not_found", "message": str(exc)}, 404)
                 return
@@ -1238,21 +1357,23 @@ def make_handler(
     return ApiHandler
 
 
-def create_app(data_dir=None):
+def create_app(data_dir=None, config_path=None):
     """创建完整应用依赖并返回 (store, pipeline, handler_class)。
 
     Args:
         data_dir: 数据目录（None 用项目根 data/）。
+        config_path: 配置文件路径（H-3；None 用 data_dir/config.json；
+            生产链传 <root>/config.json 与安装链统一真相源）。
 
     Returns:
         tuple: (store, pipeline, handler) -> (MemoryStore, MemoryRetrievalPipeline, ApiHandler)。
     """
     data_dir = _resolve_data_dir(data_dir)
-    store, pipeline, manager, remote = build_deps(data_dir)
+    store, pipeline, manager, remote = build_deps(data_dir, config_path=config_path)
     computer, authorizer, bridge = build_computer_deps(data_dir)
-    #: 配置实例与 remote 同源（同一 data_dir 下 config.json），供 /api/settings 读写，
+    #: 配置实例与 remote 同源（同一 config_path），供 /api/settings 读写，
     #: 保证测试隔离（不触碰项目根运行时配置）。
-    config = ConfigManager(config_path=os.path.join(data_dir, "config.json"))
+    config = ConfigManager(config_path=config_path or os.path.join(data_dir, "config.json"))
     #: 批次E生产装配：语音编排 / 内置工具注册表 / 记忆蒸馏器，全量注入 handler
     voice, registry, distiller = build_runtime_deps(
         data_dir,
@@ -1269,9 +1390,9 @@ def create_app(data_dir=None):
     return store, pipeline, handler
 
 
-def create_server(host=DEFAULT_HOST, port=DEFAULT_PORT, data_dir=None):
+def create_server(host=DEFAULT_HOST, port=DEFAULT_PORT, data_dir=None, config_path=None):
     """构建并返回配置好的 HTTPServer（单线程串行处理）。"""
-    _store, _pipeline, handler = create_app(data_dir)
+    _store, _pipeline, handler = create_app(data_dir, config_path=config_path)
     return HTTPServer((host, port), handler)
 
 
@@ -1285,10 +1406,15 @@ def main(argv=None):
     parser.add_argument("-h", "--host", default=DEFAULT_HOST, help=f"监听主机（默认 {DEFAULT_HOST}）")
     parser.add_argument("-p", "--port", type=int, default=DEFAULT_PORT, help=f"监听端口（默认 {DEFAULT_PORT}）")
     parser.add_argument("--data-dir", default=None, help="数据目录（默认项目根 data/）")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="配置文件路径（H-3：生产链传 <root>/config.json 与安装链统一；默认 data_dir/config.json）",
+    )
     args = parser.parse_args(argv)
 
     host, port = args.host, args.port
-    server = create_server(host=host, port=port, data_dir=args.data_dir)
+    server = create_server(host=host, port=port, data_dir=args.data_dir, config_path=args.config)
     print(f"[INFO] 记忆 API 服务已启动: http://{host}:{port}/api/health")
     try:
         server.serve_forever()

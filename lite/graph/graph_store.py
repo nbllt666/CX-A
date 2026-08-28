@@ -42,13 +42,12 @@ def _parse_json_text(value):
 def _default_db_path() -> str:
     """推导默认数据库路径：<项目根>/data/graph.db。
 
-    以当前文件绝对路径逐级上溯找到项目根（lite/graph/graph_store.py → CX-A），
-    再拼接 data/graph.db。
+    M-14（第三轮体检批次4）：根解析统一收敛到 ``lite.config.paths.app_root()``
+    （frozen-aware），冻结态不再误指向 ``_internal/data``。
     """
-    here = os.path.dirname(os.path.abspath(__file__))          # lite/graph
-    lite_dir = os.path.dirname(here)                            # lite
-    project_root = os.path.dirname(lite_dir)                    # CX-A
-    return os.path.join(project_root, "data", "graph.db")
+    from lite.config.paths import data_root
+
+    return os.path.join(data_root(), "graph.db")
 
 
 def _now() -> str:

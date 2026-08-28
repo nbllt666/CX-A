@@ -34,6 +34,10 @@ __all__ = ["LiteVoicePipeline"]
 #: 对话历史滚动上限（条；超出裁掉最旧）。
 MAX_HISTORY = 20
 
+#: 话语缓冲字节上限（M-9，第三轮体检批次3）：约 30s @16kHz/16bit 单声道。
+#: 持续噪声 / VAD 永不判结束 / VAD 故障兜底场景下防无界内存累积。
+_MAX_UTTERANCE_BYTES = 1048576
+
 #: 离线且无本地兜底时的提示文案。
 OFFLINE_HINT = "当前离线，开启本地模式可继续对话"
 
@@ -68,6 +72,8 @@ class LiteVoicePipeline:
         #: 话语缓冲（H3 修复）：自上一轮结束信号以来累积的 PCM 字节块列表，
         #: end 帧触发转写或 start_session 复位时清空
         self._utterance_buffer: list = []
+        #: 缓冲当前字节总量（M-9 配套计数，避免每次 append 全量求和）
+        self._utterance_bytes = 0
         #: feed_audio / start_session 互斥锁（L11：普通 Lock 即可，两方法体
         #: 无嵌套互调、不重入自身）
         self._feed_lock = Lock()
@@ -91,6 +97,7 @@ class LiteVoicePipeline:
         self.messages = []
         # H3：会话复位必须同时清空话语缓冲，防止上一轮残留语音跨轮污染
         self._utterance_buffer = []
+        self._utterance_bytes = 0
         if self.vad is not None and hasattr(self.vad, "reset"):
             self.vad.reset()
         return self
@@ -133,8 +140,15 @@ class LiteVoicePipeline:
             except Exception as exc:  # noqa: BLE001 - VAD 故障不影响循环存活
                 print(f"[LiteAudio][WARN] VAD detect_speech_end 异常，按未结束处理：{exc}")
         if not is_end:
-            # 非 end 帧：chunk 加入话语缓冲，返回 None（仍在听，原有逻辑不变）
+            # 非 end 帧：chunk 加入话语缓冲，返回 None（仍在听，原有逻辑不变）；
+            # M-9：缓冲设字节上限（约 30s @16kHz/16bit），持续噪声 / VAD 永不判
+            # 结束 / VAD 故障兜底场景下丢弃最旧块，防无界内存累积
             self._utterance_buffer.append(chunk)
+            self._utterance_bytes += len(chunk)
+            while self._utterance_bytes > _MAX_UTTERANCE_BYTES and self._utterance_buffer:
+                dropped = self._utterance_buffer.pop(0)
+                self._utterance_bytes -= len(dropped)
+                print("[LiteAudio][WARN] 话语缓冲超上限，已丢弃最旧音频块")
             return None
 
         # end 帧：取「缓冲累积的全部音频 + 当前结束帧」整体交给 ASR（语义见 docstring）
@@ -148,6 +162,7 @@ class LiteVoicePipeline:
                 # 元素非字节类型的异常输入：退化为仅传当前帧，交由下方兜底路径处理
                 print("[LiteAudio][WARN] 话语缓冲含非字节元素，退化为仅转写当前帧")
         self._utterance_buffer = []  # 无论本轮是否产生有效文本，缓冲一次性清空
+        self._utterance_bytes = 0
 
         try:
             result = self.asr.transcribe(payload) or {}

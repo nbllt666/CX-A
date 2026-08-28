@@ -238,3 +238,53 @@ def test_package_exports_tool_bridge():
     from lite import computer_control
 
     assert computer_control.ToolBridge is ToolBridge
+
+
+# ------------------------------------------------------------------ #
+# 7. 批次1（第三轮体检）：实例授权状态不被 execute 污染                #
+# ------------------------------------------------------------------ #
+
+
+def test_execute_does_not_persist_computer_authorized(tmp_path):
+    """M-1：execute 后 ComputerControl 实例授权状态恢复原值，不被永久污染。
+
+    修复前 execute 强制 set_authorized(True) 且从不恢复——未授权实例经一次
+    bridge 调用后独立闸门被永久打开，任何绕过 bridge 的直接调用畅通无阻。
+    """
+    authorizer = ControlAuthorizer(data_dir=str(tmp_path))
+    authorizer.authorize()
+    # 构造实例级未授权的 computer（模拟上层按 config authorized=False 装配）
+    computer = ComputerControl(
+        authorized=False,
+        screen_backend=FakeScreenBackend(),
+        keyboard_backend=FakeKeyboardBackend(),
+    )
+    bridge = ToolBridge(computer=computer, authorizer=authorizer)
+    # bridge 链路（authorizer 已授权）执行成功
+    payload = bridge.execute(TOOL_SCREEN, {})
+    assert payload["success"] is True
+    # 实例级闸门保持原值 False——未被永久污染
+    assert computer.authorized is False
+    # 绕过 bridge 的直接调用仍被实例闸门拒绝
+    with pytest.raises(NotAuthorizedError):
+        computer.call_tool(TOOL_SCREEN, {})
+
+
+def test_execute_restores_computer_authorized_on_exception(tmp_path):
+    """M-1：执行抛异常时实例授权状态也在 finally 中恢复。"""
+    authorizer = ControlAuthorizer(data_dir=str(tmp_path))
+    authorizer.authorize()
+
+    class _BoomScreen:
+        def screenshot(self, region=None):
+            raise RuntimeError("backend boom")
+
+    computer = ComputerControl(
+        authorized=False,
+        screen_backend=_BoomScreen(),
+        keyboard_backend=FakeKeyboardBackend(),
+    )
+    bridge = ToolBridge(computer=computer, authorizer=authorizer)
+    with pytest.raises(Exception):
+        bridge.execute(TOOL_SCREEN, {})
+    assert computer.authorized is False
