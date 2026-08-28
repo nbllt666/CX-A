@@ -120,14 +120,19 @@ def _estimate_tokens(text: str) -> int:
 class MemoryDistiller:
     """记忆蒸馏器：把超长对话蒸馏为 long_term 记忆并落盘。"""
 
-    def __init__(self, cloud: CloudAdapter, store: MemoryStore):
+    def __init__(self, cloud: CloudAdapter, store: MemoryStore, manager=None):
         """构造记忆蒸馏器。
 
         :param cloud: CloudAdapter 实例，用于云端 LLM 流式归纳
         :param store: MemoryStore 实例，用于持久化新增记忆
+        :param manager: 可选 MemoryManager 实例（G-1 统一写入口）；注入后落库走
+            ``manager.add_memory``（带相似去重 + 向量化语义），缺省保持原
+            ``store.add`` 直写行为不变
         """
         self._cloud = cloud
         self._store = store
+        #: 可选记忆管理器（唯一带去重+向量化语义的写入口）；None 时回落 store.add
+        self._manager = manager
         #: 最近一次批量蒸馏的完整会话（含 rejected/failed，供诊断）
         self.last_sessions: List[Dict] = []
 
@@ -285,14 +290,28 @@ class MemoryDistiller:
                 try:
                     content = fact["content"]
                     importance = int(fact.get("importance") or 3)
-                    mem_id = self._store.add(
-                        {
-                            "type": "long_term",
-                            "content": content,
-                            "importance": importance,
-                            "agent_id": agent_id,
-                        }
-                    )
+                    if self._manager is not None:
+                        # G-1 统一写入口：走 manager.add_memory（相似去重 + 向量化）。
+                        # 返回 None 表示被去重跳过（未实际写入），不计入 added。
+                        mem_id = self._manager.add_memory(
+                            content=content,
+                            type="long_term",
+                            importance=importance,
+                            agent_id=agent_id,
+                        )
+                    else:
+                        # manager 缺席：保持原 store.add 直写行为兜底
+                        mem_id = self._store.add(
+                            {
+                                "type": "long_term",
+                                "content": content,
+                                "importance": importance,
+                                "agent_id": agent_id,
+                            }
+                        )
+                    if mem_id is None:
+                        # 去重跳过：该条未落库，继续处理后续事实
+                        continue
                 except Exception as fact_exc:  # noqa: BLE001 - 单条失败不放大为整块失败
                     fact_errors.append(f"第 {len(session['added']) + len(fact_errors) + 1} 条落库失败：{fact_exc}")
                     continue

@@ -81,16 +81,22 @@ class VoiceManager:
 
     @staticmethod
     def _is_loadable_voice(dirpath):
-        """宽松探测某目录是否可作为 MeloTTS 音色包。
+        """探测某目录是否可作为 MeloTTS 音色包（G-4 口径收敛）。
 
-        只要目录内含有任意文件（``.pt`` / ``.bin`` / ``.pth`` 或其他）
-        即判定为可加载产物存在。
+        与 tts.py 加载口径对齐：目录内（含子目录）存在 ``config.json`` 或
+        ``ckpt.txt`` 或任一 ``*.pth`` / ``*.ckpt`` 权重文件才算可加载；
+        任意杂文件（.pt / .bin / 说明文本等）不再判定为音色产物，
+        避免被判可用后 TTS 侧静默回退官方声音。
         """
         if not os.path.isdir(dirpath):
             return False
         for _root, _dirs, files in os.walk(dirpath):
-            if files:
-                return True
+            for name in files:
+                lower = name.lower()
+                if lower in ("config.json", "ckpt.txt"):
+                    return True
+                if lower.endswith((".pth", ".ckpt")):
+                    return True
         return False
 
     @staticmethod

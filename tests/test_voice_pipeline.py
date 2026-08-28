@@ -560,6 +560,50 @@ def test_cloud_and_offline_local_both_fail_returns_hint(capsys):
     assert "本地兜底生成失败" in capsys.readouterr().out
 
 
+# ------------------------------------------------------------------ #
+# G-2 空产出降级                                                      #
+# ------------------------------------------------------------------ #
+
+class EmptyCompletionCloud(FakeCloud):
+    """云端在线但流式产出为空白串的 mock（空 completion 场景）。"""
+
+    def chat(self, messages):
+        self.chat_calls += 1
+        yield "   "  # 仅空白：视同失败
+
+
+def test_empty_cloud_output_falls_back_to_offline_local():
+    """G-2：云端在线但返回空白产出时视同失败，降级走本地兜底。"""
+    def offline_local(messages):
+        return "本地兜底回复"
+
+    cloud = EmptyCompletionCloud(online=True)
+    pipe = _pipeline(cloud=cloud, offline_local=offline_local)
+    out = pipe.feed_audio(b"x")
+
+    assert out["should_reply"] is True
+    assert out["text"] == "本地兜底回复"
+    # 本地兜底的真实回复计入历史（空产出不入历史）
+    assert pipe.messages[-1] == {"role": "assistant", "content": "本地兜底回复"}
+
+
+def test_none_output_falls_through_to_hint():
+    """G-2：云端产出 None 且本地兜底产出空串时，回落 OFFLINE_HINT（不入历史）。"""
+    def none_local(messages):
+        return ""  # 空白串：视同失败
+
+    cloud = EmptyCompletionCloud(online=True)
+    pipe = _pipeline(cloud=cloud, offline_local=none_local)
+    out = pipe.feed_audio(b"x")
+
+    assert out["should_reply"] is True
+    assert out["text"] == OFFLINE_HINT
+    # 空产出不入对话历史，仅保留用户消息
+    assert pipe.messages == [{"role": "user", "content": "帮我查天气"}]
+    # 提示文案照常 TTS 播报（不哑巴）
+    assert out["audio"] == CAN_AUDIO
+
+
 def test_asr_exception_returns_structured_false_and_loop_survives():
     """asr.transcribe 抛异常时返回结构化 should_reply=False 且后续轮次存活。"""
     class BoomASRBackend:

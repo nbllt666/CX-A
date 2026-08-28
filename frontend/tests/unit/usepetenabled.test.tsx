@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { usePetEnabled, PET_ENABLED_KEY } from '../../src/renderer/hooks/usePetEnabled';
 
@@ -43,5 +43,33 @@ describe('usePetEnabled', () => {
     });
     expect(result.current.enabled).toBe(false);
     expect(window.localStorage.getItem(PET_ENABLED_KEY)).toBe('false');
+  });
+
+  it('挂载时 enabled=true 且 Electron 环境下主动调 openPetOverlay 恢复悬浮窗', () => {
+    const openPetOverlay = vi.fn().mockResolvedValue(true);
+    const closePetOverlay = vi.fn().mockResolvedValue(true);
+    (window as unknown as { cxaAPI: unknown }).cxaAPI = { openPetOverlay, closePetOverlay };
+    window.localStorage.setItem(PET_ENABLED_KEY, 'true');
+
+    renderHook(() => usePetEnabled());
+
+    // 重启恢复：挂载即拉起悬浮窗一次，且不误触关闭
+    expect(openPetOverlay).toHaveBeenCalledTimes(1);
+    expect(closePetOverlay).not.toHaveBeenCalled();
+  });
+
+  it('挂载时 enabled=false 不调用 openPetOverlay（Electron 环境）', () => {
+    const openPetOverlay = vi.fn().mockResolvedValue(false);
+    (window as unknown as { cxaAPI: unknown }).cxaAPI = { openPetOverlay };
+
+    renderHook(() => usePetEnabled());
+
+    expect(openPetOverlay).not.toHaveBeenCalled();
+  });
+
+  it('挂载时 enabled=true 但非 Electron 环境：桥降级 no-op，不抛错', () => {
+    // 无 cxaAPI：bridge.openPetOverlay 内部降级为 Promise.resolve(false)，静默跳过
+    window.localStorage.setItem(PET_ENABLED_KEY, 'true');
+    expect(() => renderHook(() => usePetEnabled())).not.toThrow();
   });
 });

@@ -10,6 +10,7 @@
 """
 
 import os
+import warnings
 
 # data/ 目录推导统一收敛到 asr.data_dir（三级 dirname），消除复制漂移。
 from lite.audio.asr import data_dir  # noqa: F401  （re-export 供既有引用使用）
@@ -122,9 +123,18 @@ class MeloTTSBackend(TTSBackend):
         _voice_path = self._voice_path(_voice)
         cfg = os.path.join(_voice_path, "config.json")
         ckpt = os.path.join(_voice_path, "ckpt.txt")  # 训练产物常见名；视后端而定
+        has_cfg = os.path.exists(cfg)
+        has_ckpt = os.path.exists(ckpt)
+        if not has_cfg and not has_ckpt:
+            # G-4 告警：音色目录缺少训练产物，将静默回退官方默认音色——必须显式告警
+            warnings.warn(
+                f"音色目录缺少 config.json/ckpt.txt，已回退官方默认音色：{_voice_path}",
+                UserWarning,
+                stacklevel=2,
+            )
         tts = self._get_engine(
-            config_path=cfg if os.path.exists(cfg) else None,
-            ckpt_path=ckpt if os.path.exists(ckpt) else None,
+            config_path=cfg if has_cfg else None,
+            ckpt_path=ckpt if has_ckpt else None,
         )
         speaker_id = 0  # 默认说话人；可经 tts.hps.data.spk2id 扩展
         audio = tts.tts_to_file(text, speaker_id, output_path=None, speed=1.0, quiet=True)

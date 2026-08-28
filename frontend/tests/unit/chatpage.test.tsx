@@ -89,4 +89,36 @@ describe('ChatPage：发送消息后 fetch 失败', () => {
     expect(screen.queryByText('🐱')).not.toBeInTheDocument();
     expect(screen.getByText(/消息暂时送不到/)).toBeInTheDocument();
   });
+
+  it('ok:false 守卫响应不渲染伴侣回复（故障说明文本不得当回复展示）', async () => {
+    // 后端守卫端点真实形状：200 + ok:false + error + message（失败说明文本）
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ok: false,
+          error: 'chat_service_disabled',
+          message: '聊天服务未启用，请先启动后端',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    render(<ChatPage />);
+    fireEvent.change(screen.getByPlaceholderText('跟你的伴侣说点什么吧…'), {
+      target: { value: '在吗' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+
+    // 走 unavailable + markFailed 路径：用户气泡带未送达标记
+    await screen.findByText(/未送达 · 聊天通道尚未接入/);
+    // 故障说明文本绝不渲染成伴侣气泡
+    expect(screen.queryByText(/聊天服务未启用/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/chat_service_disabled/)).not.toBeInTheDocument();
+    // 无伴侣头像节点
+    expect(screen.queryByText('🐱')).not.toBeInTheDocument();
+    // 「聊天通道尚未接入」提示条常显
+    expect(screen.getByText(/消息暂时送不到/)).toBeInTheDocument();
+    // 只有用户自己的一条气泡
+    const bubbles = document.querySelectorAll('.rounded-2xl.px-3\\.5');
+    expect(bubbles.length).toBe(1);
+  });
 });

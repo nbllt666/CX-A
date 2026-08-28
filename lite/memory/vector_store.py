@@ -95,10 +95,16 @@ class LanceVectorStore(VectorStore):
         ]
 
     def delete(self, vector_id):
-        """按 vector_id 删除向量。"""
+        """按 vector_id 删除向量。
+
+        G-5：filter 单引号 doubling 转义——node_id 含 ``'`` 时不再使
+        LanceDB filter 语法崩溃。
+        """
         if self._table is None:
             return False
-        from_lance_filter = "vector_id = '{0}'".format(vector_id)
+        from_lance_filter = "vector_id = '{0}'".format(
+            str(vector_id).replace("'", "''")
+        )
         self._table.delete(from_lance_filter)
         return True
 

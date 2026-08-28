@@ -449,3 +449,75 @@ def test_melotts_backend_device_normalized_and_passed(monkeypatch):
     assert backend.device == "cuda"
     backend._get_engine()  # 触发 fake TTS 构造，验证设备透传
     assert recorded["device"] == "cuda"
+
+
+# ------------------------------------------------------------------ #
+# G-4：音色目录缺训练产物回退官方默认音色时必须告警                    #
+# ------------------------------------------------------------------ #
+
+class _StopAfterEngine(Exception):
+    """在 _get_engine 处截断合成流程的哨兵异常（避免依赖真实引擎/soundfile）。"""
+
+
+def _make_melotts_backend(tmp_path, monkeypatch, pack_files):
+    """构造带音色目录的 MeloTTSBackend，_get_engine 被哨兵异常截断。
+
+    :param pack_files: dict[音色id, 文件名列表]，在 voice_dir 下构造目录内容
+    """
+    voice_dir = tmp_path / "voices"
+    for pack_id, files in pack_files.items():
+        pack = voice_dir / pack_id
+        pack.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            (pack / f).write_bytes(b"x")
+
+    backend = MeloTTSBackend(voice_dir=str(voice_dir))
+    # 预置 _TTSType 跳过 _ensure_lib 的真实 melo 导入（测试环境无需安装 MeloTTS）
+    backend._TTSType = object
+
+    def _stop(config_path=None, ckpt_path=None):
+        _StopAfterEngine.config_path = config_path
+        _StopAfterEngine.ckpt_path = ckpt_path
+        raise _StopAfterEngine
+
+    monkeypatch.setattr(backend, "_get_engine", _stop)
+    return backend
+
+
+def test_melotts_missing_voice_config_warns_and_falls_back(tmp_path, monkeypatch):
+    """G-4：cfg/ckpt 均缺失回退官方默认音色时发 UserWarning 告警。"""
+    import warnings
+
+    backend = _make_melotts_backend(tmp_path, monkeypatch, {"lonely_pack": ["readme.txt"]})
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(_StopAfterEngine):
+            backend.synthesize("你好", voice="lonely_pack")
+
+    messages = [str(w.message) for w in caught]
+    assert any(
+        "音色目录缺少 config.json/ckpt.txt" in m and "已回退官方默认音色" in m
+        for m in messages
+    ), messages
+    # 回退官方默认：config/ckpt 均以 None 传入引擎
+    assert _StopAfterEngine.config_path is None
+    assert _StopAfterEngine.ckpt_path is None
+
+
+def test_melotts_with_voice_config_no_fallback_warning(tmp_path, monkeypatch):
+    """G-4：config.json 存在时走本地模型路径，不发回退告警。"""
+    import warnings
+
+    backend = _make_melotts_backend(
+        tmp_path, monkeypatch, {"full_pack": ["config.json", "ckpt.txt"]}
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(_StopAfterEngine):
+            backend.synthesize("你好", voice="full_pack")
+
+    assert not any("已回退官方默认音色" in str(w.message) for w in caught)
+    assert _StopAfterEngine.config_path.endswith("config.json")
+    assert _StopAfterEngine.ckpt_path.endswith("ckpt.txt")

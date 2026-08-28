@@ -16,6 +16,8 @@ interface CxaBridge {
   openPetOverlay: () => Promise<boolean>;
   /** 关闭桌宠透明悬浮窗 */
   closePetOverlay: () => Promise<boolean>;
+  /** 获取后端启动令牌（N1 鉴权：API 请求附带 X-Client-Token 头） */
+  getBackendToken: () => Promise<string>;
 }
 
 declare global {

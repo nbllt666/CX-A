@@ -374,12 +374,26 @@ class LlmDownloader:
         os.makedirs(self.dest_dir, exist_ok=True)
         dest = os.path.join(self.dest_dir, filename)
 
-        # 已存在同名文件 → 跳过下载（若给出 verify_size 则校验大小）
+        # 已存在同名文件 → 大小校验通过则跳过下载（G-9 自愈：校验失败视为坏文件，
+        # 删除后继续走正常下载流程，不再永久短路下载）
         if os.path.exists(dest) and os.path.isfile(dest):
-            self._log("INFO", f"模型文件已存在，跳过下载：{dest}")
             if verify_size_gb is not None:
-                self._check_size(os.path.getsize(dest), verify_size_gb, filename)
-            return Path(dest)
+                try:
+                    self._check_size(os.path.getsize(dest), verify_size_gb, filename)
+                except ValueError as exc:
+                    # G-9：已存在文件大小校验失败 → 删除坏文件重新下载（校验失败不 return）
+                    self._log("WARNING", f"已存在文件大小校验失败，删除坏文件后重新下载：{filename}（{exc}）")
+                    try:
+                        os.remove(dest)
+                    except OSError as rm_exc:
+                        self._log("ERROR", f"删除坏文件失败，无法继续下载：{dest}（{rm_exc}）")
+                        raise
+                else:
+                    self._log("INFO", f"模型文件已存在，跳过下载：{dest}")
+                    return Path(dest)
+            else:
+                self._log("INFO", f"模型文件已存在，跳过下载：{dest}")
+                return Path(dest)
 
         # L10：断点重入检测——已有 .tmp 时从其大小处请求续传
         tmp = dest + ".tmp"

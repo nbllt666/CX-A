@@ -344,3 +344,24 @@ def test_error_http_status_mapping():
     assert TimeoutError("x").http_status == 504
     assert ExecutionError("x").error_code == "EXECUTION_FAILED"
     assert ExecutionError("x").http_status == 500
+
+
+# ------------------------------------------------------------------ #
+# 10. 包裹器确认闸（N2，20260828_模块0_API鉴权与安全链路修复·批次A）    #
+# ------------------------------------------------------------------ #
+
+
+def test_requires_confirmation_wrapper_first_token():
+    """N2：_requires_confirmation 解析首 token（裸名 / 大小写 / 引号绝对路径）。"""
+    assert ComputerControl._requires_confirmation("cmd /c del C:\\x") is True
+    assert ComputerControl._requires_confirmation("POWERSHELL -c ri C:\\x") is True
+    assert ComputerControl._requires_confirmation('"C:\\Windows\\System32\\cmd.exe" /c rd /q temp') is True
+    assert ComputerControl._requires_confirmation("start notepad") is True
+    assert ComputerControl._requires_confirmation("") is False
+
+
+def test_requires_confirmation_allows_plain_commands():
+    """N2：普通命令与既有测试用的带引号 python.exe 全路径不被误报。"""
+    assert ComputerControl._requires_confirmation(f'"{PY}" -c "print(1)"') is False
+    assert ComputerControl._requires_confirmation("notepad") is False
+    assert ComputerControl._requires_confirmation("dir /s") is False

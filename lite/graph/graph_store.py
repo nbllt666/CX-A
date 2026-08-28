@@ -14,9 +14,29 @@ GraphStore 负责知识图谱的实体（节点）/关系（边）的 SQLite 持
 """
 
 import json
+import logging
 import os
 import sqlite3
 from datetime import datetime
+
+#: 原生日志记录器
+LOGGER = logging.getLogger(__name__)
+
+
+def _parse_json_text(value):
+    """properties 文本 JSON 解析防线（G-7，对齐 lite/memory/storage.py L7 防线）。
+
+    解析成功返回结构化值（dict/list）；非字符串原样返回；解析失败记 warning
+    后返回空 dict——properties 语义为 dict，空 dict 可被全部调用方安全容忍，
+    单条脏数据不再使读侧（get_node / get_edges_by_node / 检索链）崩溃。
+    """
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError) as exc:
+            LOGGER.warning("properties 字段 JSON 解析失败，按空 dict 容忍：%s（%s）", value[:80], exc)
+            return {}
+    return value
 
 
 def _default_db_path() -> str:
@@ -331,24 +351,24 @@ class GraphStore:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _row_to_node(row):
-        """将 nodes 行转换为字典，properties 反序列化为字典。"""
+        """将 nodes 行转换为字典，properties 反序列化为字典（G-7 解析防线兜底）。"""
         return {
             "id": row["id"],
             "name": row["name"],
             "type": row["type"],
-            "properties": json.loads(row["properties"]) if row["properties"] else {},
+            "properties": _parse_json_text(row["properties"]) if row["properties"] else {},
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
 
     @staticmethod
     def _row_to_edge(row):
-        """将 edges 行转换为字典，properties 反序列化为字典。"""
+        """将 edges 行转换为字典，properties 反序列化为字典（G-7 解析防线兜底）。"""
         return {
             "id": row["id"],
             "source": row["source"],
             "target": row["target"],
             "relation": row["relation"],
-            "properties": json.loads(row["properties"]) if row["properties"] else {},
+            "properties": _parse_json_text(row["properties"]) if row["properties"] else {},
             "created_at": row["created_at"],
         }

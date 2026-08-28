@@ -197,13 +197,19 @@ class LiteVoicePipeline:
         注入 ``offline_local`` 走本地兜底 → 再失败回落提示文案（OFFLINE_HINT）。
         任何一层抛出异常都不向上传播，``logged`` 标记该回复是否计入对话历史
         （提示文案不计入）。
+
+        G-2 修复：空产出（None / 空白串）视同该层失败，继续走降级阶梯，
+        保证始终有非空文本（云端返回空 completion / 兜底产出空串不再入历史）。
         """
         # 一级：云端在线流式；is_online / chat 任一异常均视为云端不可用并降级
         if self.cloud is not None:
             try:
                 if self.cloud.is_online():
                     reply = self._run_stream(self.cloud.chat, self.messages)
-                    return reply, True
+                    if reply and reply.strip():
+                        return reply, True
+                    # 空产出视同失败：继续走降级阶梯
+                    print("[LiteAudio][WARN] 云端返回空产出，降级本地兜底")
             except Exception as exc:  # noqa: BLE001 - M10 兜底：云端故障降级本地
                 print(f"[LiteAudio][WARN] 云端流式回复失败，降级本地兜底：{exc}")
 
@@ -211,7 +217,10 @@ class LiteVoicePipeline:
         if callable(self.offline_local):
             try:
                 reply = self._run_stream(self.offline_local, self.messages)
-                return reply, True
+                if reply and reply.strip():
+                    return reply, True
+                # 空产出视同失败：回落提示文案
+                print("[LiteAudio][WARN] 本地兜底产出为空，返回离线提示")
             except Exception as exc:  # noqa: BLE001 - M10 兜底：本地兜底失败回落提示
                 print(f"[LiteAudio][WARN] 本地兜底生成失败，返回离线提示：{exc}")
 

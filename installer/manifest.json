@@ -2,16 +2,8 @@
   "schema": "cxa-installer-manifest/v1",
   "version": "0.1.0",
   "generated_at": "2026-08-26",
-  "description": "CX-A 安装器组件清单——记录内置组件（builtin）与可选组件（optional）的安装态映射。真实二进制当前为开发态，由安装器做结构初始化 + 引导流程。",
+  "description": "CX-A 安装器组件清单——记录内置组件（builtin）与可选组件（optional）的安装态映射。Electron 壳与 Python 后端由 build.py 组装流程直接落位，不在本清单登记。真实二进制当前为开发态，由安装器做结构初始化 + 引导流程。",
   "components": [
-    {
-      "name": "Electron 运行时",
-      "key": "electron",
-      "size_estimate": "约 120 MB",
-      "status": "builtin",
-      "install_target": "runtime/electron",
-      "notes": "桌面外壳运行时（前端宿主）。"
-    },
     {
       "name": "llama.cpp",
       "key": "llama_cpp",
@@ -51,14 +43,6 @@
       "status": "builtin",
       "install_target": "data/voices/sensevoice",
       "notes": "语音识别模型（对齐 config.asr.engine）。"
-    },
-    {
-      "name": "后端服务 (Python)",
-      "key": "backend",
-      "size_estimate": "约 150 MB",
-      "status": "builtin",
-      "install_target": "runtime/backend",
-      "notes": "CX-A 后端服务可执行包。"
     },
     {
       "name": "本地小 LLM（可选）",

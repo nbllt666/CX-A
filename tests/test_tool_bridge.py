@@ -172,7 +172,8 @@ def test_audit_recorded_on_success(tmp_path):
     _auth, _computer, bridge = _make_bridge(tmp_path, authorized=True)
     bridge.execute(TOOL_SCREEN, {"region": "全屏"})
 
-    records = _read_audit(tmp_path)
+    # N4 起 authorize() 自身也会写审计记录；本用例只关心 call_tool 记录
+    records = [r for r in _read_audit(tmp_path) if r["action"] == "call_tool"]
     assert len(records) == 1
     rec = records[0]
     assert rec["action"] == "call_tool"
@@ -202,7 +203,8 @@ def test_audit_recorded_on_confirm_rejected(tmp_path):
     )
     bridge.execute(TOOL_COMMAND, {"command": "del dirty.tmp"})
 
-    records = _read_audit(tmp_path)
+    # N4 起 authorize() 自身也会写审计记录；本用例只关心 call_tool 记录
+    records = [r for r in _read_audit(tmp_path) if r["action"] == "call_tool"]
     assert len(records) == 1
     assert records[0]["tool"] == TOOL_COMMAND
     assert records[0]["authorized"] is False

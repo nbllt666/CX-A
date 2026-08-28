@@ -185,3 +185,65 @@ def test_vector_written_to_injected_vector_store():
         assert vs._vectors.get("n1") is not None
     finally:
         store.close()
+
+
+# ------------------------------------------------------------------ #
+# G-7：读侧 properties JSON 解析防线                                   #
+# ------------------------------------------------------------------ #
+
+def _inject_dirty_row(graph, table, row_id, dirty_props):
+    """绕过 upsert 序列化，直接向表写入非法 JSON 的 properties 脏数据。"""
+    if table == "nodes":
+        graph._conn.execute(
+            "INSERT OR REPLACE INTO nodes (id, name, type, properties, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (row_id, "Dirty", "person", dirty_props, "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
+        )
+    else:
+        # 边需要合法的端点节点
+        graph._conn.execute(
+            "INSERT OR REPLACE INTO nodes (id, name, type, properties, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            ("src", "Src", "person", None, "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
+        )
+        graph._conn.execute(
+            "INSERT OR REPLACE INTO edges (id, source, target, relation, properties, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (row_id, "src", "src", "likes", dirty_props, "2026-01-01T00:00:00"),
+        )
+    graph._conn.commit()
+
+
+def test_corrupt_node_properties_tolerated_as_empty_dict(graph):
+    """G-7：nodes.properties 为非法 JSON 时读侧按空 dict 容忍，get/list 不再崩溃。"""
+    _inject_dirty_row(graph, "nodes", "dirty", "{invalid json")
+
+    node = graph.get_node("dirty")
+    assert node is not None
+    assert node["properties"] == {}
+
+    # 列表链路同样容忍
+    assert any(n["id"] == "dirty" and n["properties"] == {} for n in graph.list_nodes())
+
+
+def test_search_chain_survives_dirty_rows(graph):
+    """G-7：存在脏 properties 行时语义检索链整体不中断（正常节点照常召回）。"""
+    graph.upsert_node("clean1", "clean item alpha", "entity")
+    _inject_dirty_row(graph, "nodes", "dirty", "{invalid json")
+
+    # 脏行未写入向量库（绕过 upsert），检索不命中属预期；关键是不抛异常，
+    # 且正常节点的召回与边读取不受影响
+    hits = graph.search_nodes("clean item alpha", top_k=5)
+    assert any(h["node"]["id"] == "clean1" for h in hits)
+    for h in hits:
+        assert isinstance(h["edges"], list)
+
+
+def test_corrupt_edge_properties_tolerated_as_empty_dict(graph):
+    """G-7：edges.properties 为非法 JSON 时 get_edges_by_node 按空 dict 容忍。"""
+    _inject_dirty_row(graph, "edges", "dirty_edge", "not-json[")
+
+    edges = graph.get_edges_by_node("src")
+    dirty = [e for e in edges if e["id"] == "dirty_edge"]
+    assert len(dirty) == 1
+    assert dirty[0]["properties"] == {}

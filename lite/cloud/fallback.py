@@ -29,13 +29,20 @@
 路径 / 导入规范：本项目一律使用包绝对导入（``from lite.cloud.adapter import ...``）。
 """
 
+import logging
 import time
 from typing import Callable, Iterator, List, Optional
 
-from lite.cloud.adapter import CloudAdapter, CloudUnavailableError
+from lite.cloud.adapter import CloudAdapter, CloudConfigError, CloudUnavailableError
+
+#: 原生日志记录器
+LOGGER = logging.getLogger(__name__)
 
 #: 离线提示文案（工程文档 §10.2 与 checklist 验收口径一致）
 OFFLINE_PROMPT = "当前离线，开启本地模式可继续对话"
+
+#: 云端配置错误诊断态下的提示文案（N5：未配置 API Key 不得误诊为"断网"）
+CONFIG_ERROR_PROMPT = "云端配置未完成，请在设置中填写服务商与 API Key"
 
 
 def _llama_runtime_types():
@@ -110,6 +117,9 @@ class OfflineFallbackManager:
         self.mode_history: List[str] = []
         #: 最近一次模式变化事件字符串。
         self.last_mode_event: Optional[str] = None
+        #: 云端配置错误诊断态（N5）：探测捕获 CloudConfigError 时记录其文本，
+        #: 离线产出分支据此区分"断网"与"配置未完成"；其它探测异常清 None。
+        self._config_error: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     # 内部：在线探测 / 配置读取                                           #
@@ -192,8 +202,16 @@ class OfflineFallbackManager:
                 return bool(self._online_cache)
         try:
             online = bool(self._online_check())
-        except Exception:  # noqa: BLE001 - 探测异常一律视为离线
+            # 探测成功：清除历史配置错误诊断态
+            self._config_error = None
+        except CloudConfigError as exc:
+            # N5：配置错误（如未配置 API Key）不是断网，置配置错误诊断态供提示分支区分
             online = False
+            self._config_error = str(exc)
+            LOGGER.warning("云端配置错误，探测按未就绪处理：%s", exc)
+        except Exception:  # noqa: BLE001 - 连接层探测异常一律视为离线
+            online = False
+            self._config_error = None
         self._online_cache = online
         self._last_probe_time = time.monotonic()
         return online
@@ -225,6 +243,12 @@ class OfflineFallbackManager:
         except Exception:  # noqa: BLE001 - 兜底失败（含 LlamaNotReady）不崩溃
             return None
 
+    def _offline_prompt(self) -> str:
+        """按诊断态产出离线提示文案（N5）：有配置错误时提示配置未完成，否则提示断网。"""
+        if self._config_error:
+            return CONFIG_ERROR_PROMPT
+        return OFFLINE_PROMPT
+
     def _fallback_like_offline(self, messages) -> Iterator[str]:
         """离线（或云端调用失败）降级分支：切本地兜底，否则产提示。"""
         if self.local_mode_enabled():
@@ -233,22 +257,35 @@ class OfflineFallbackManager:
             if text is None:
                 # 本地模型未就绪 / 缺失 → 提示而不抛出
                 self.status = "offline_hint"
-                yield OFFLINE_PROMPT
+                yield self._offline_prompt()
                 return
             self.status = "local"
             yield text
             return
         # 本地模式未开启：不切换状态机（mode 保持 cloud），仅产提示
+        # （N5：按诊断态区分"断网"与"云端配置未完成"文案）
         self.status = "offline_hint"
-        yield OFFLINE_PROMPT
+        yield self._offline_prompt()
 
     def _cloud_stream(self, messages) -> Iterator[str]:
-        """在线分支：透传云端流式；遇到 CloudUnavailableError 自动降级。"""
+        """在线分支：透传云端流式；遇到 CloudUnavailableError 自动降级。
+
+        G-3 修复：已产出过 chunk 的中途故障不再追加离线提示——保留已产出的
+        半截真实回复即止，避免"半截回复+离线提示"混合文本以 logged=True 污染
+        对话历史；仅在尚未产出任何 chunk 时才走降级分支。
+        """
+        yielded = False
         try:
             self.status = "cloud"
-            yield from self._cloud.chat(messages)
+            for chunk in self._cloud.chat(messages):
+                yielded = True
+                yield chunk
         except CloudUnavailableError:
-            # 探测在线但真正调用失败 → 与离线一致的自动降级
+            if yielded:
+                # 中途故障：结束流即可，不追加降级文本（不污染多轮上下文）
+                LOGGER.warning("云端流式调用中途故障，保留已产出内容并结束流")
+                return
+            # 尚未产出任何 chunk：与离线一致的自动降级
             yield from self._fallback_like_offline(messages)
 
     # ------------------------------------------------------------------ #

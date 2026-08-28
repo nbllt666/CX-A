@@ -129,7 +129,7 @@ class ControlAuthorizer:
         """开启授权总开关（用户显式开启）。
 
         幂等语义：已授权时返回 False（不可重复开启）；本次新开启返回 True。
-        开启后立即持久化。
+        开启后立即持久化，并写一条 ``authorize`` 审计（N4：关键安全事件可回溯）。
 
         :return: 本次是否产生开启动作（True=新开启，False=已开启未变化）
         """
@@ -138,16 +138,34 @@ class ControlAuthorizer:
                 return False
             self.authorized = True
             self._save_state()
+            # N4：授权开启为关键安全事件，落盘后补审计（记录来源，便于 CSRF 场景回溯）
+            self.audit(
+                action="authorize",
+                tool="",
+                arguments_summary="source=api",
+                authorized=True,
+                result_summary="授权已开启并持久化",
+            )
             return True
 
     def revoke(self) -> bool:
         """主动撤销授权，立即收回并持久化。
+
+        撤销后写一条 ``revoke`` 审计（N4：与 authorize 对称的安全事件留痕）。
 
         :return: 恒为 True（撤销动作已执行）
         """
         with self._state_lock:
             self.authorized = False
             self._save_state()
+            # N4：撤销亦为关键安全事件，落盘后补审计
+            self.audit(
+                action="revoke",
+                tool="",
+                arguments_summary="source=api",
+                authorized=False,
+                result_summary="授权已撤销并持久化",
+            )
             return True
 
     def is_authorized(self) -> bool:
@@ -175,7 +193,8 @@ class ControlAuthorizer:
         """判定命令是否需高危二次确认。
 
         命中条件：``confirm_dangerous=True`` 且（命中 ``DANGEROUS_COMMANDS``
-        黑名单 **或** 幂等破坏操作）。
+        黑名单 **或** 首 token 命中包裹器名单 ``CONFIRM_REQUIRED_WRAPPERS``
+        **或** 幂等破坏操作）。
 
         :param command: 指令字符串
         :return: True 需确认；False 无需确认（可放行）
@@ -183,6 +202,10 @@ class ControlAuthorizer:
         if not self.confirm_dangerous:
             return False
         if ComputerControl._is_dangerous(command):
+            return True
+        # N2：包裹器形态（cmd /c del ...、powershell -c ri ...、带引号绝对路径等）
+        # 黑名单前缀匹配覆盖不到，首 token 命中包裹器名单即强制进确认闸
+        if ComputerControl._requires_confirmation(command):
             return True
         if self._is_destructive(command):
             return True

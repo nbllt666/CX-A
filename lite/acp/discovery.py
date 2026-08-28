@@ -15,9 +15,14 @@
 import json
 import socket
 import threading
+import time
 
 #: 信标报文类型（与 CX-O discover.py 保持一致，便于跨版本互通）
 MSG_TYPE = "ACP_BEACON"
+
+#: found_agents 条目上限（N9，20260828_模块0_API鉴权与安全链路修复）：
+#: 防恶意信标刷包撑大内存；超限丢弃并按每秒至多一条告警限频。
+MAX_FOUND_AGENTS = 256
 
 
 class AcpDiscoveryError(Exception):
@@ -42,6 +47,10 @@ class LiteLanDiscovery:
         self._socket_factory = socket_factory or socket.socket
         #: 发现到的 agent 事件列表（[(agent_dict, addr), ...]）
         self.found_agents = []
+        #: 已见 (agent_id, addr) 集合（N9：重复信标不再重复登记）
+        self._seen_agents = set()
+        #: 上次超限告警时刻（monotonic 秒；N9 告警限频：每秒至多一条）
+        self._last_overflow_warn = 0.0
         self._running = False
         self._socket = None
         self.port = 0
@@ -190,5 +199,20 @@ class LiteLanDiscovery:
             "timestamp": msg.get("timestamp", ""),
         }
         if agent_id:
+            # N9：按 (agent_id, addr) 去重 + 条目上限，防恶意信标污染与内存放大
+            key = (agent_id, (addr[0], addr[1]))
+            if key in self._seen_agents:
+                return agent
+            if len(self.found_agents) >= MAX_FOUND_AGENTS:
+                now = time.monotonic()
+                if now - self._last_overflow_warn >= 1.0:
+                    self._last_overflow_warn = now
+                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                    print(
+                        f"[{ts}] [WARNING] 局域网发现条目已达上限 {MAX_FOUND_AGENTS}，"
+                        f"丢弃新信标 agent_id={agent_id!r} addr={addr}"
+                    )
+                return agent
+            self._seen_agents.add(key)
             self.found_agents.append((agent, addr))
         return agent

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { GlassCard } from '../components/GlassCard';
 import Toggle from '../components/Toggle';
 import {
@@ -137,26 +137,35 @@ export default function SettingsPage() {
 
   // 云端 / 本地模式 / 音色走 PUT /api/settings 热更新。
   // 保存失败不再静默吞掉：setSaveError 内联显错；下次操作开头自动清空，自然覆盖重试。
+  // 序号守卫：每次操作分配自增序号，异步迟到失败比对序号非最新则丢弃——
+  // 防止快速连点时旧操作的 .catch 在新操作清错之后执行，把 saveError 写回与后端真相背离的旧提示。
+  const saveSeqRef = useRef(0);
   const handleProviderChange = (next: string) => {
     setProvider(next);
     if (CLOUD_PROVIDERS.includes(next)) {
+      const seq = ++saveSeqRef.current;
       setSaveError(null);
       void updateSettings({ cloud: { provider: next } }).catch(() => {
+        if (seq !== saveSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
         setSaveError('云端提供商没保存上…待会儿再动一下就好啦');
       });
     }
   };
   const handleLocalModeChange = (next: boolean) => {
     setLocalMode(next);
+    const seq = ++saveSeqRef.current;
     setSaveError(null);
     void updateSettings({ local_llm: { enabled: next } }).catch(() => {
+      if (seq !== saveSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
       setSaveError('本地模式开关没保存上…待会儿再拨一次就好啦');
     });
   };
   const handleVoiceChange = (next: string) => {
     setVoice(next);
+    const seq = ++saveSeqRef.current;
     setSaveError(null);
     void updateSettings({ tts: { voice: next } }).catch(() => {
+      if (seq !== saveSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
       setSaveError('音色设置没保存上…待会儿再选一次就好啦');
     });
   };

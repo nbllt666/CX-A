@@ -17,6 +17,7 @@
 
 from lite.computer_control.control import (
     BLOCKED,
+    CONFIRM_REQUIRED_WRAPPERS,
     DANGEROUS_COMMANDS,
     TOOL_COMMAND,
     TOOL_KEYBOARD,
@@ -51,6 +52,7 @@ __all__ = [
     "TimeoutError",
     "ExecutionError",
     "DANGEROUS_COMMANDS",
+    "CONFIRM_REQUIRED_WRAPPERS",
     "BLOCKED",
     "ControlAuthorizer",
     "ToolBridge",

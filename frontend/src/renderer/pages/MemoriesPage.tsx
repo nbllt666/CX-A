@@ -137,9 +137,15 @@ export default function MemoriesPage() {
     };
   }, [keyword, mode]);
 
-  // 最终渲染数据：在线搜索命中优先，否则对当前数据源做本地过滤
-  const source = searched ?? data;
-  const filtered = keyword === '' ? source : source.filter((m) => matchLocal(m, keyword));
+  // 最终渲染数据：后端语义搜索成功（searched 非 null）时直接采用其结果——
+  // 语义命中不保证字面包含查询词，不得再用 matchLocal 字面匹配二次过滤（否则命中被静默清空）；
+  // 仅当搜索失败 / 未搜索（searched 为 null）时回退本地兜底：keyword 为空展示全量，否则字面过滤
+  const filtered =
+    searched !== null
+      ? searched
+      : keyword === ''
+        ? data
+        : data.filter((m) => matchLocal(m, keyword));
 
   return (
     <div className="flex h-full flex-col p-5">

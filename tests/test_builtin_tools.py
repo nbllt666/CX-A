@@ -258,6 +258,88 @@ def test_memory_tools_uninjected_backend_error():
 
 
 # --------------------------------------------------------------------------- #
+# G-1 统一写入口 / G-8 退化检索语义                                            #
+# --------------------------------------------------------------------------- #
+
+
+class RecordingManager:
+    """记录 add_memory 调用的 MemoryManager 替身：可配置去重命中。"""
+
+    def __init__(self, dedup_content=None):
+        self.calls = []
+        self._dedup_content = dedup_content
+
+    def add_memory(self, content, type="short_term", importance=3, agent_id="default"):
+        self.calls.append(
+            {"content": content, "type": type, "importance": importance, "agent_id": agent_id}
+        )
+        if self._dedup_content is not None and content == self._dedup_content:
+            return None  # 模拟去重命中
+        return len(self.calls)
+
+
+def test_memory_write_prefers_manager_injection(tmp_path):
+    """G-1：注入 manager 后 memory_write 优先走 manager.add_memory（带去重语义）。"""
+    store = MemoryStore(db_path=str(tmp_path / "memories.db"))
+    manager = RecordingManager()
+    reg = BuiltinToolRegistry(memory_store=store, manager=manager, config=_CONFIG_ALL_OFF)
+
+    res = reg.call("memory_write", {"content": "用户喜欢蓝色", "type": "long_term", "importance": 4})
+    assert res["success"] is True, res
+    assert manager.calls == [
+        {"content": "用户喜欢蓝色", "type": "long_term", "importance": 4, "agent_id": "default"}
+    ]
+    assert res["result"]["id"] == 1
+    # 直连 store 未被写入
+    assert store.list(type="long_term") == []
+
+
+def test_memory_write_manager_dedup_reports_flag():
+    """G-1：manager 去重命中（返回 None）时如实返回 deduplicated 标记。"""
+    manager = RecordingManager(dedup_content="重复内容")
+    reg = BuiltinToolRegistry(manager=manager, config=_CONFIG_ALL_OFF)
+    res = reg.call("memory_write", {"content": "重复内容"})
+    assert res["success"] is True, res
+    assert res["result"] == {"id": None, "deduplicated": True}
+
+
+def test_memory_search_degraded_substring_filter(tmp_path):
+    """G-8：退化路径 query 非空时按 content 子串过滤 + importance 降序，结果带 degraded 标记。"""
+    store = MemoryStore(db_path=str(tmp_path / "memories.db"))
+    store.add({"type": "short_term", "content": "用户喜欢蓝色汽车", "importance": 2})
+    store.add({"type": "short_term", "content": "天空是蓝色的", "importance": 5})
+    store.add({"type": "short_term", "content": "完全无关的记忆", "importance": 5})
+    reg = BuiltinToolRegistry(memory_store=store, config=_CONFIG_ALL_OFF)
+
+    res = reg.call("memory_search", {"query": "蓝色", "top_k": 5})
+    assert res["success"] is True, res
+    result = res["result"]
+    # 退化标记
+    assert result["degraded"] is True
+    # 子串过滤：仅含"蓝色"的两条命中，无关记忆不冒充检索结果
+    contents = [m["content"] for m in result["memories"]]
+    assert contents == ["天空是蓝色的", "用户喜欢蓝色汽车"]  # importance 降序：5 在前
+    assert result["memories"][0]["importance"] == 5
+    assert result["memories"][1]["importance"] == 2
+
+
+def test_memory_search_degraded_recent_when_empty_query(tmp_path):
+    """G-8：退化路径 query 为空时返回最近 limit 条，同样带 degraded 标记。"""
+    store = MemoryStore(db_path=str(tmp_path / "memories.db"))
+    for i in range(5):
+        store.add({"type": "short_term", "content": f"记忆{i}", "importance": 1})
+    reg = BuiltinToolRegistry(memory_store=store, config=_CONFIG_ALL_OFF)
+
+    res = reg.call("memory_search", {"query": "", "top_k": 2})
+    assert res["success"] is True, res
+    result = res["result"]
+    assert result["degraded"] is True
+    # store.list 按 id 升序，取尾部 2 条即最新的记忆3、记忆4
+    contents = [m["content"] for m in result["memories"]]
+    assert contents == ["记忆3", "记忆4"]
+
+
+# --------------------------------------------------------------------------- #
 # 系统工具                                                                    #
 # --------------------------------------------------------------------------- #
 

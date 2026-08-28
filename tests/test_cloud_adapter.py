@@ -156,6 +156,47 @@ def test_is_online_captures_base_url(tmp_path):
 
 
 # ------------------------------------------------------------------ #
+# 5.1 N5：urllib 路径 4xx 语义与 requests 对齐（HTTPError 算在线）      #
+# ------------------------------------------------------------------ #
+
+def test_is_online_urllib_http_error_counts_online(tmp_path, monkeypatch):
+    """N5：urllib 路径收到 HTTPError（4xx/5xx）说明网关可达 → is_online 返回 True。"""
+    import urllib.error
+    import urllib.request
+
+    from lite.cloud import adapter as adapter_mod
+
+    adapter, _ = _make_adapter(tmp_path)
+    # 强制走 urllib 兜底路径（测试环境可能已安装 requests）
+    monkeypatch.setattr(adapter_mod, "_HAS_REQUESTS", False)
+
+    def _fake_urlopen(url, timeout=None):
+        raise urllib.error.HTTPError(
+            url=url, code=401, msg="Unauthorized", hdrs=None, fp=None,
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    assert adapter.is_online(timeout=2) is True
+
+
+def test_is_online_urllib_url_error_counts_offline(tmp_path, monkeypatch):
+    """N5：连接层异常（URLError 非 HTTPError）→ is_online 返回 False。"""
+    import urllib.error
+    import urllib.request
+
+    from lite.cloud import adapter as adapter_mod
+
+    adapter, _ = _make_adapter(tmp_path)
+    monkeypatch.setattr(adapter_mod, "_HAS_REQUESTS", False)
+
+    def _fake_urlopen(url, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    assert adapter.is_online(timeout=2) is False
+
+
+# ------------------------------------------------------------------ #
 # 6. reload 后 provider 切换生效                                      #
 # ------------------------------------------------------------------ #
 

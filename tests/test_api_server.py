@@ -6,6 +6,7 @@ health、空列表、add 后列表可查、search 可返回、delete 后列表�
 同时覆盖 404 / 400 等边界路由。
 """
 
+import base64
 import json
 import socket
 import threading
@@ -18,6 +19,7 @@ import pytest
 
 from lite.computer_control import ComputerControl, ToolBridge
 from lite.computer_control.security import ControlAuthorizer
+import lite.server.api_server as api_server_module
 from lite.server.api_server import build_deps, create_app, make_handler
 
 
@@ -558,3 +560,241 @@ def test_computer_authorize_success_ok_true(computer_env):
     assert status == 200
     assert body["ok"] is True
     assert body["authorized"] is True
+
+
+# ---------------------------------------------------------------- 启动令牌鉴权与请求体上限（20260828_模块0_API鉴权与安全链路修复·批次A）
+def http_get_json(url, headers=None):
+    """GET 请求返回 (status, JSON)；非 2xx 解析错误体返回（token 场景用）。"""
+    req = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def test_token_open_mode_allows_requests(api_server, monkeypatch):
+    """N1 开放模式：_API_TOKEN 为空（env CXA_API_TOKEN 未设置）时请求正常放行。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "")
+    monkeypatch.setattr(api_server_module, "_TOKEN_OPEN_MODE_WARNED", True)
+    _store, _pipeline, base = api_server
+    status, body, _raw = http_get(f"{base}/api/memories")
+    assert status == 200
+    assert body == []
+
+
+def test_token_mode_missing_header_403(api_server, monkeypatch):
+    """N1 令牌模式：无 X-Client-Token 头（如恶意 sandboxed iframe）→ 403 unauthorized_client。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
+    _store, _pipeline, base = api_server
+    status, body = http_get_json(f"{base}/api/memories")
+    assert status == 403
+    assert body == {"ok": False, "error": "unauthorized_client"}
+
+
+def test_token_mode_wrong_header_403(api_server, monkeypatch):
+    """N1 令牌模式：令牌不匹配 → 403 unauthorized_client。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
+    _store, _pipeline, base = api_server
+    status, body = http_get_json(f"{base}/api/memories", headers={"X-Client-Token": "wrong-token"})
+    assert status == 403
+    assert body["error"] == "unauthorized_client"
+
+
+def test_token_mode_correct_header_200(api_server, monkeypatch):
+    """N1 令牌模式：令牌匹配 → 200 正常业务响应。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
+    _store, _pipeline, base = api_server
+    status, body = http_get_json(f"{base}/api/memories", headers={"X-Client-Token": "unit-test-token"})
+    assert status == 200
+    assert body == []
+
+
+def test_token_mode_post_also_guarded(api_server, monkeypatch):
+    """N1：POST 同样过令牌闸（对头放行业务、无头 403），非仅 GET。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
+    _store, _pipeline, base = api_server
+
+    status, body = http_post(f"{base}/api/computer/authorize", payload={"enabled": True})
+    assert status == 403
+    assert body["error"] == "unauthorized_client"
+
+    req = urllib.request.Request(
+        f"{base}/api/computer/authorize",
+        data=json.dumps({"enabled": True}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-Client-Token": "unit-test-token"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 200
+
+
+def test_token_mode_health_exempt(api_server, monkeypatch):
+    """N1：GET /api/health 豁免令牌校验（健康探测不带自定义头也能探活）。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
+    _store, _pipeline, base = api_server
+    status, body = http_get_json(f"{base}/api/health")
+    assert status == 200
+    assert body == {"status": "ok"}
+
+
+def test_token_mode_options_exempt(api_server, monkeypatch):
+    """N1：OPTIONS 预检豁免令牌校验（浏览器预检不携带自定义头）。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
+    _store, _pipeline, base = api_server
+    req = urllib.request.Request(f"{base}/api/memories", method="OPTIONS")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 204
+
+
+def test_payload_too_large_413(api_server):
+    """N6：请求体超过 1MB 上限 → 413 payload_too_large，不进入业务处理。"""
+    _store, _pipeline, base = api_server
+    big = b'{"pad": "' + b"A" * 1048577 + b'"}'
+    status, body = http_raw_body(f"{base}/api/settings", big, method="PUT")
+    assert status == 413
+    assert body["ok"] is False
+    assert body["error"] == "payload_too_large"
+
+
+# ---------------------------------------------------------------- 生产装配接线（20260828_模块0_生产装配接线·批次E）
+def test_tools_list_contains_usage(api_server):
+    """GET /api/tools：工具清单非空（system_info/memory_* 恒注册）且附 usage 端点自述。"""
+    _store, _pipeline, base = api_server
+    status, body, _raw = http_get(f"{base}/api/tools")
+    assert status == 200
+    assert body["ok"] is True
+    assert len(body["tools"]) >= 3
+    ids = {t["id"] for t in body["tools"]}
+    assert {"system_info", "memory_write", "memory_search"} <= ids
+    # 按 registry 实际数据结构如实映射
+    sample = body["tools"][0]
+    assert {"id", "name", "description", "source", "category", "enabled"} <= set(sample)
+    usage = body["usage"]
+    for key in ("POST /api/tools/call", "POST /api/memory/distill",
+                "POST /api/voice/synthesize", "POST /api/voice/transcribe"):
+        assert key in usage
+
+
+def test_tools_call_system_info_success(api_server):
+    """POST /api/tools/call：调用无害工具 system_info（category=time）返回真实结果。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/tools/call", {"name": "system_info", "arguments": {"category": "time"}}
+    )
+    assert status == 200
+    assert body["ok"] is True
+    assert body["result"]["category"] == "time"
+    assert body["result"]["iso"]
+    assert body["result"]["timestamp"] > 0
+
+
+def test_tools_call_unknown_tool_404(api_server):
+    """POST /api/tools/call：未名工具 → 404 not_found。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/tools/call", {"name": "no_such_tool", "arguments": {}})
+    assert status == 404
+    assert body["ok"] is False
+    assert body["error"] == "not_found"
+
+
+def test_memory_distill_cloud_not_configured_400(api_server):
+    """POST /api/memory/distill：未配置云端（api_key 为空）→ 400 cloud_not_configured。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/memory/distill", {"messages": [{"role": "user", "content": "记住我喜欢冷萃"}]}
+    )
+    assert status == 400
+    assert body["error"] == "cloud_not_configured"
+    assert body["ok"] is False
+
+
+def test_memory_distill_bad_messages_400(api_server):
+    """POST /api/memory/distill：messages 为空列表 / 非列表 / 缺 role-content → 400。"""
+    _store, _pipeline, base = api_server
+    for payload in ({}, {"messages": []}, {"messages": "not-a-list"},
+                    {"messages": [{"role": "user"}]}, {"messages": [{"content": "x"}]}):
+        status, body = http_post(f"{base}/api/memory/distill", payload)
+        assert status == 400, f"payload={payload!r} 应 400"
+        assert body["error"] == "bad_request"
+
+
+def test_voice_synthesize_returns_base64_audio(api_server):
+    """POST /api/voice/synthesize：MockTTS 也应产出非空字节 → 200 + base64 wav。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/voice/synthesize", {"text": "你好，世界"})
+    assert status == 200
+    assert body["ok"] is True
+    assert body["mime"] == "audio/wav"
+    audio = base64.b64decode(body["audio_base64"])
+    assert len(audio) > 0
+
+
+def test_voice_synthesize_empty_text_400(api_server):
+    """POST /api/voice/synthesize：text 缺失 / 空白 → 400 bad_request。"""
+    _store, _pipeline, base = api_server
+    for payload in ({}, {"text": ""}, {"text": "   "}):
+        status, body = http_post(f"{base}/api/voice/synthesize", payload)
+        assert status == 400
+        assert body["error"] == "bad_request"
+
+
+def test_voice_transcribe_returns_text(api_server):
+    """POST /api/voice/transcribe：MockASR 返回占位文本 → 200 {ok:true, text}。"""
+    _store, _pipeline, base = api_server
+    audio_b64 = base64.b64encode(b"\x00\x01" * 64).decode("ascii")
+    status, body = http_post(
+        f"{base}/api/voice/transcribe", {"audio_base64": audio_b64, "sample_rate": 16000}
+    )
+    assert status == 200
+    assert body["ok"] is True
+    assert isinstance(body["text"], str)
+
+
+def test_voice_transcribe_bad_base64_400(api_server):
+    """POST /api/voice/transcribe：非法 base64 / 缺字段 → 400 bad_request。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/voice/transcribe", {"audio_base64": "@@not-base64@@"})
+    assert status == 400
+    assert body["error"] == "bad_request"
+    status2, body2 = http_post(f"{base}/api/voice/transcribe", {})
+    assert status2 == 400
+    assert body2["error"] == "bad_request"
+
+
+def test_new_endpoints_require_token_in_token_mode(api_server, monkeypatch):
+    """批次E：令牌模式下五个新端点无令牌 → 403 unauthorized_client（自动继承令牌闸）。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
+    _store, _pipeline, base = api_server
+    # GET /api/tools
+    status, body = http_get_json(f"{base}/api/tools")
+    assert status == 403
+    assert body["error"] == "unauthorized_client"
+    # POST 四端点
+    for path, payload in [
+        ("/api/tools/call", {"name": "system_info"}),
+        ("/api/memory/distill", {"messages": [{"role": "user", "content": "hi"}]}),
+        ("/api/voice/synthesize", {"text": "hi"}),
+        ("/api/voice/transcribe", {"audio_base64": "AAAA"}),
+    ]:
+        status, body = http_post(f"{base}{path}", payload)
+        assert status == 403, f"{path} 无令牌应 403"
+        assert body["error"] == "unauthorized_client"
+
+
+def test_create_app_wires_runtime_deps(tmp_path):
+    """create_app 生产装配：voice/registry/distiller 均已构造且同源共享 store 上下文。"""
+    store, pipeline, handler = create_app(data_dir=str(tmp_path))
+    # handler 类属性绑定（批次E 全量注入，非 None 回落）
+    assert handler._voice is not None
+    assert handler._registry is not None
+    assert handler._distiller is not None
+    # 同源性：registry / distiller 与 create_app 产物共享同一 store / pipeline
+    assert handler._registry.memory_store is store
+    assert handler._registry.pipeline is pipeline
+    assert handler._registry.manager is pipeline.manager
+    assert handler._distiller._store is store
+    assert handler._distiller._manager is pipeline.manager
+    # voice 三件套就位（Mock 兜底装配零失败）
+    assert handler._voice.asr is not None
+    assert handler._voice.tts is not None

@@ -60,7 +60,12 @@ def age_seconds_from_created(created_at, now=None):
 
 
 def _parse_datetime(text):
-    """尝试多种常见时间格式解析 datetime；失败返回 None。"""
+    """尝试多种常见时间格式解析 datetime；失败返回 None。
+
+    G-6：通用 ISO 解析分支若引入带时区的 aware datetime，与 naive 的
+    ``datetime.now()`` 相减会崩溃检索链——解析结果为 aware 时先
+    ``astimezone()`` 归一到本地时区再剥掉 tzinfo，统一返回 naive。
+    """
     text = str(text).strip()
     for fmt in (
         "%Y-%m-%d %H:%M:%S.%f",
@@ -73,9 +78,13 @@ def _parse_datetime(text):
         except ValueError:
             continue
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return None
+    if dt.tzinfo is not None:
+        # aware -> naive 本地时间（先转换时区再剥 tzinfo，避免时区偏移丢失）
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
 
 
 class DecayCalculator:

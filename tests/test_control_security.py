@@ -235,3 +235,46 @@ def test_package_exports_control_authorizer():
     from lite import computer_control
 
     assert computer_control.ControlAuthorizer is ControlAuthorizer
+
+
+# ------------------------------------------------------------------ #
+# 7. 包裹器确认闸与授权审计（20260828_模块0_API鉴权与安全链路修复·批次A） #
+# ------------------------------------------------------------------ #
+
+
+def test_needs_confirmation_hits_wrappers(tmp_path):
+    """N2：包裹器形态（cmd /c、powershell -c 别名、带引号绝对路径）强制进确认闸。
+
+    修复前：黑名单为裸前缀匹配，以下形态整体绕过黑名单与确认双闸。
+    """
+    auth = ControlAuthorizer(data_dir=str(tmp_path))
+    assert auth.needs_confirmation("cmd /c del C:\\x") is True
+    assert auth.needs_confirmation("powershell -c ri C:\\x") is True
+    assert auth.needs_confirmation('"C:\\Windows\\System32\\cmd.exe" /c del C:\\x') is True
+    assert auth.needs_confirmation("pwsh -Command Get-Date") is True
+
+
+def test_needs_confirmation_plain_commands_pass(tmp_path):
+    """N2：普通无害命令不被包裹器名单误伤。"""
+    auth = ControlAuthorizer(data_dir=str(tmp_path))
+    assert auth.needs_confirmation("dir /s") is False
+    assert auth.needs_confirmation("whoami") is False
+    assert auth.needs_confirmation("notepad") is False
+
+
+def test_authorize_revoke_write_audit(tmp_path):
+    """N4：authorize / revoke 落盘后写审计记录（action + 来源 source=api）。"""
+    auth = ControlAuthorizer(data_dir=str(tmp_path))
+    assert auth.authorize() is True
+    assert auth.revoke() is True
+
+    with open(_audit_path(tmp_path), "r", encoding="utf-8") as fh:
+        records = [json.loads(ln) for ln in fh.read().splitlines() if ln.strip()]
+
+    by_action = {r["action"]: r for r in records}
+    assert "authorize" in by_action
+    assert "revoke" in by_action
+    assert by_action["authorize"]["authorized"] is True
+    assert "api" in by_action["authorize"]["args"]
+    assert by_action["revoke"]["authorized"] is False
+    assert "api" in by_action["revoke"]["args"]

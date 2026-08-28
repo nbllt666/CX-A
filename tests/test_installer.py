@@ -277,6 +277,8 @@ def test_backend_entry_main_creates_data_dir(tmp_path, monkeypatch):
         fh.write(b"")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(fake_exe), raising=False)
+    # 端口预检注入为恒空闲：单测不依赖宿主机 8600 真实占用状态
+    monkeypatch.setattr(backend_entry, "check_port_bindable", lambda host, port: True)
 
     captured = {}
 
@@ -292,6 +294,48 @@ def test_backend_entry_main_creates_data_dir(tmp_path, monkeypatch):
     assert captured["argv"][0] == "--host"
     assert captured["argv"][2] == "--port"
     assert captured["argv"][5] == os.path.join(root, "data")
+
+
+def test_backend_entry_port_occupied_exits_with_error(tmp_path, monkeypatch, capsys):
+    """A-3：端口被占时 main() 应以退出码 1 终止，stderr 给出中文处置提示。"""
+    from installer import backend_entry
+
+    root = str(tmp_path / "portable")
+    os.makedirs(os.path.join(root, "runtime", "backend"))
+    fake_exe = os.path.join(root, "runtime", "backend", "backend.exe")
+    with open(fake_exe, "wb") as fh:
+        fh.write(b"")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe), raising=False)
+    # 预检注入为恒占用：不依赖真实端口状态
+    monkeypatch.setattr(backend_entry, "check_port_bindable", lambda host, port: False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        backend_entry.main()
+
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "8600" in err
+    assert "已被占用" in err
+    assert "backend.exe" in err
+
+
+def test_check_port_bindable_probe_real_port():
+    """A-3：check_port_bindable 真实探测——被监听端口返回 False，释放后返回 True。"""
+    import socket as socket_mod
+
+    from installer import backend_entry
+
+    probe = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", 0))  # 由操作系统分配一个空闲端口
+        probe.listen(1)
+        occupied_port = probe.getsockname()[1]
+        assert backend_entry.check_port_bindable("127.0.0.1", occupied_port) is False
+    finally:
+        probe.close()
+    # 释放后同端口应可绑定
+    assert backend_entry.check_port_bindable("127.0.0.1", occupied_port) is True
 
 
 # ------------------------------------------------------------------ #
@@ -329,15 +373,58 @@ def test_build_assemble_and_zip(tmp_path):
     assert os.path.isdir(os.path.join(portable_root, "data", "lancedb"))
     assert os.path.isfile(os.path.join(portable_root, "config.json"))
 
-    # zip：含 exe 与后端条目
+    # zip：固定顶层前缀 + 关键条目 + 用户数据排除（A-1/A-4）
     release_dir = str(tmp_path / "rel")
     zip_path = build_mod.zip_portable(portable_root, release_dir)
     assert os.path.isfile(zip_path)
     assert os.path.getsize(zip_path) > 0
     with zipfile.ZipFile(zip_path) as zf:
         names = [n.replace("\\", "/") for n in zf.namelist()]
-    assert any(n.endswith("CX-A.exe") for n in names)
-    assert any("runtime/backend/backend.exe" in n for n in names)
+    # A-4：所有条目恒以 CX-A-portable/ 顶层前缀开头（与实际目录名 portable 解耦）
+    assert names, "zip 不应为空"
+    assert all(n.startswith("CX-A-portable/") for n in names)
+    assert "CX-A-portable/CX-A.exe" in names
+    assert "CX-A-portable/runtime/backend/backend.exe" in names
+    # A-1：顶层 config.json 与 data/ 整棵均不入包（用户数据不被升级覆盖）
+    assert "CX-A-portable/config.json" not in names
+    assert not any(n.startswith("CX-A-portable/data/") for n in names)
+
+
+def test_zip_portable_excludes_user_data_and_fixed_prefix(tmp_path):
+    """A-1/A-4 专测：轻量伪造便携根验证 config.json 与 data/ 不入包、顶层前缀固定。"""
+    import zipfile
+
+    from installer import build as build_mod
+
+    # 故意使用非 CX-A-portable 的目录名：验证前缀与实际目录名解耦
+    root = tmp_path / "portable-with-timestamp"
+    (root / "resources").mkdir(parents=True)
+    (root / "CX-A.exe").write_bytes(b"fake-shell")
+    (root / "resources" / "app.asar").write_bytes(b"fake-asar")
+    (root / "runtime" / "backend" / "_internal").mkdir(parents=True)
+    (root / "runtime" / "backend" / "backend.exe").write_bytes(b"fake-backend")
+    (root / "runtime" / "backend" / "_internal" / "lib.dll").write_bytes(b"fake-dll")
+    # 用户数据：顶层 config.json + data/ 整棵（含嵌套子目录）
+    (root / "config.json").write_text('{"cloud": {}}', encoding="utf-8")
+    (root / "data" / "lancedb").mkdir(parents=True)
+    (root / "data" / "memories.db").write_bytes(b"sqlite-payload")
+    (root / "data" / "lancedb" / "vectors-0001.lance").write_bytes(b"user-vectors")
+
+    zip_path = build_mod.zip_portable(str(root), str(tmp_path / "rel"))
+
+    with zipfile.ZipFile(zip_path) as zf:
+        names = [n.replace("\\", "/") for n in zf.namelist()]
+
+    # A-4：顶层目录恒为 CX-A-portable/，与实际目录名 portable-with-timestamp 无关
+    assert names, "zip 不应为空"
+    assert all(n.startswith("CX-A-portable/") for n in names)
+    assert "CX-A-portable/CX-A.exe" in names
+    assert "CX-A-portable/resources/app.asar" in names
+    assert "CX-A-portable/runtime/backend/backend.exe" in names
+    assert "CX-A-portable/runtime/backend/_internal/lib.dll" in names
+    # A-1：用户配置与运行数据整棵缺席
+    assert "CX-A-portable/config.json" not in names
+    assert not any(n.startswith("CX-A-portable/data/") for n in names)
 
 
 def test_build_skip_electron_rejects_incomplete_artifacts(tmp_path, monkeypatch):

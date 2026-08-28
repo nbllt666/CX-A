@@ -266,17 +266,26 @@ class CloudAdapter:
             ) from exc
 
     def _http_get(self, url: str, timeout: int) -> bool:
-        """轻量 GET 探测：收到响应即认为连通，网络异常返回 False。"""
+        """轻量 GET 探测：收到响应即认为连通，连接层异常返回 False。
+
+        N5 语义统一：任何 HTTP 响应（含 4xx/5xx）均说明网关可达 → 在线；
+        仅连接层异常（URLError 非 HTTPError / requests 连接错误）→ 离线。
+        与 requests 路径（4xx 不抛异常、返回 True）语义对齐。
+        """
         if self._transport is not None:
             return bool(self._transport_online(url, timeout))
         try:
             if _HAS_REQUESTS:  # pragma: no cover - 依赖探测分支
                 requests.get(url, timeout=timeout)
             else:  # pragma: no cover - urllib 回退
-                with urllib.request.urlopen(url, timeout=timeout):
-                    pass
+                try:
+                    with urllib.request.urlopen(url, timeout=timeout):
+                        pass
+                except urllib.error.HTTPError:
+                    # 4xx/5xx 也是网关响应：可达（在线），与 requests 路径语义对齐
+                    return True
             return True
-        except Exception:  # noqa: BLE001 - 连通性探测失败一律视为离线
+        except Exception:  # noqa: BLE001 - 连接层探测失败视为离线
             return False
 
     def _transport_online(self, url: str, timeout: int) -> bool:

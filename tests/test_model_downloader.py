@@ -193,6 +193,23 @@ def test_download_skip_when_exists(tmp_path):
     assert dl._requests.calls == []  # 未发起任何下载
 
 
+def test_download_corrupt_existing_file_self_heals(tmp_path):
+    """G-9：已存在文件大小校验失败 → 删除坏文件继续正常下载（不再永久短路）。"""
+    good = b"\x00" * 1024
+    dl = make_loader(tmp_path, data=good)
+    dest = tmp_path / MODELSCOPE_FILE
+    dest.write_bytes(b"corrupt-stub")  # 坏文件：与预期大小偏差远超 20%
+    expected_gb = 1024 / (1024 ** 3)  # 正确内容对应的大小
+
+    result = dl.download(MODELSCOPE_REPO, MODELSCOPE_FILE, verify_size_gb=expected_gb)
+
+    assert result == dest
+    # 坏文件已被删除并被重新下载的正确内容取代
+    assert dest.read_bytes() == good
+    assert dl._requests.calls, "坏文件删除后应真实发起下载"
+    assert not any(p.suffix == ".tmp" for p in tmp_path.iterdir())
+
+
 def test_download_progress_callback_called(tmp_path):
     """progress_cb 被调用且参数为 (downloaded, total)。"""
     data = b"\x01" * 20000  # 跨多个 64KB 块（此处单块也至少回调一次）

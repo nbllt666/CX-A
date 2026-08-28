@@ -11,7 +11,12 @@
 """
 
 import json
+import logging
 import os
+from datetime import datetime
+
+#: 原生日志记录器
+_LOGGER = logging.getLogger(__name__)
 
 try:  # cryptography 为可选依赖
     from cryptography.fernet import Fernet
@@ -258,12 +263,39 @@ class ConfigManager:
             self.warnings.append(f"API Key 解密失败（{exc}），已保留原样")
 
     def _read_config(self):
-        """读取 config.json 并就地解密 api_key，返回原始 dict。"""
+        """读取 config.json 并就地解密 api_key，返回原始 dict。
+
+        N3 损坏兜底：config.json 存在但 JSON 解析失败（如写入中断导致截断）时，
+        坏文件改名为 ``config.json.corrupt-<时间戳>`` 留证 + warning 日志，
+        返回空 dict 走 DEFAULTS 深度合并（调用方 ``_deep_merge`` 对空 dict 安全，
+        等价"按缺失处理"），服务可正常起步而非永久无法启动。
+        """
         if not os.path.exists(self.config_path):
             raw = json.loads(json.dumps(DEFAULTS))
         else:
-            with open(self.config_path, "r", encoding="utf-8") as fh:
-                raw = json.load(fh)
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as fh:
+                    raw = json.load(fh)
+            except json.JSONDecodeError as exc:
+                # 坏文件改名留证（含时间戳防覆盖），按缺失处理走 DEFAULTS 合并
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                corrupt_path = f"{self.config_path}.corrupt-{timestamp}"
+                try:
+                    os.replace(self.config_path, corrupt_path)
+                    _LOGGER.warning(
+                        "config.json 解析失败（%s），坏文件已改名留证：%s，"
+                        "本次启动按默认配置处理",
+                        exc,
+                        corrupt_path,
+                    )
+                except OSError as rename_exc:
+                    _LOGGER.warning(
+                        "config.json 解析失败（%s），且改名留证失败（%s），"
+                        "本次启动按默认配置处理",
+                        exc,
+                        rename_exc,
+                    )
+                raw = {}
         self._decrypt_in_place(raw)
         return raw
 
@@ -329,13 +361,29 @@ class ConfigManager:
         self._config[section][key] = value
 
     def save(self):
-        """将当前内存配置（api_key 加密后）持久化到 config.json。"""
+        """将当前内存配置（api_key 加密后）持久化到 config.json。
+
+        N3 原子写：先写 ``config.json.tmp`` 再 ``os.replace`` 原子替换，
+        写入中断不再留下截断的 config.json（配合 ``_read_config`` 损坏兜底，
+        双重保证服务不会因半成品配置文件而无法启动）；异常时清理 tmp。
+        """
         payload = json.loads(json.dumps(self._config))
         api_key = payload.get("cloud", {}).get("api_key", "")
         payload["cloud"]["api_key"] = self._encrypt(api_key)
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-        with open(self.config_path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        tmp_path = self.config_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.config_path)
+        except Exception:
+            # 异常时清理 tmp，避免残留半成品干扰后续读写
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:  # noqa: BLE001 - 清理失败不影响原始异常上抛
+                pass
+            raise
 
     def reloadable(self, key):
         """判断配置段/键是否可热更新（无需重启）。

@@ -129,11 +129,21 @@ export default function ChatPage() {
   );
 }
 
-/** 从后端响应中提取明确的回复文本；形状不符 / 无内容一律返回 null（绝不伪造）。 */
+/**
+ * 从后端响应中提取明确的回复文本；形状不符 / 无内容一律返回 null（绝不伪造）。
+ *
+ * 守卫端点会返回 200 + `{"ok":false,"error":"chat_service_disabled","message":"聊天服务未启用…"}`
+ * 这类失败说明：ok === false 或存在非空 error 字段即判定为不可用返回 null，
+ * 走「未送达」路径，绝不把故障说明文本（message/content 等）渲染成伴侣气泡。
+ */
 function extractReplyText(data: unknown): string | null {
   if (!data || typeof data !== 'object') return null;
   const rec = data as Record<string, unknown>;
-  for (const key of ['reply', 'reply_text', 'text', 'content', 'message']) {
+  // 失败响应守卫：ok === false 或显式 error 字符串 → 一律视为不可用
+  if (rec.ok === false) return null;
+  if (typeof rec.error === 'string' && rec.error.trim()) return null;
+  // 候选 key 收窄为回复专用字段，防止 message/content 等通用字段被误当回复
+  for (const key of ['reply', 'reply_text']) {
     const val = rec[key];
     if (typeof val === 'string' && val.trim()) return val;
   }

@@ -41,6 +41,16 @@ export function usePetEnabled() {
     });
   }, []);
 
+  // 挂载恢复：应用重启后若上次为开启状态，主动拉起透明悬浮窗（主进程侧幂等创建）。
+  // 非 Electron 环境下桥调用自动降级 no-op（返回 false），静默跳过，不影响页面渲染。
+  useEffect(() => {
+    if (readStoredEnabled()) {
+      void openPetOverlay().catch(() => {
+        /* IPC 异常静默：不阻塞渲染，下次开关操作自然重试 */
+      });
+    }
+  }, []);
+
   // 跨窗口同步：Electron 悬浮窗 / 多窗口修改该 key 时跟随刷新
   useEffect(() => {
     const onStorage = (e: StorageEvent) => {

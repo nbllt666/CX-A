@@ -3,7 +3,9 @@
 
 覆盖（全 tmp_path，无真实模型 / 无网络）：
 - 音色目录不存在/为空 -> list_voices 空 + 不抛
-- 构造 cx-open/ 与 custom_a/（.pt 文件）-> 含 is_default 标记与排序
+- 构造 cx-open/ 与 custom_a/（G-4 口径认可的产物文件）-> 含 is_default 标记与排序
+- G-4 口径收敛：仅 config.json / ckpt.txt / *.pth / *.ckpt 算可加载；
+  任意杂文件（.pt / .bin）不再判定为音色包
 - resolve_voice：cx-open 命中路径 / 自定义命中 / 不存在回 None
 - set_default_voice 写 config 并在下一次 resolve 生效
 - LiteTTS voice_resolver 注入冒烟：voice 参数被解析（不真实加载模型）
@@ -58,8 +60,8 @@ def test_list_voices_empty_dir_returns_empty(tmp_path):
 def test_list_voices_marks_default_and_sorted(tmp_path):
     """应识别 cx-open 与自定义音色，cx-open 恒 is_default=True，且按 id 排序。"""
     voices = tmp_path / "voices"
-    _make_voice(voices, "cx-open", "p.pt")
-    _make_voice(voices, "custom_a", "m.pt")
+    _make_voice(voices, "cx-open", "model.pth")
+    _make_voice(voices, "custom_a", "config.json")
     vm = VoiceManager(voices_dir=str(voices))
 
     lst = vm.list_voices()
@@ -77,13 +79,19 @@ def test_list_voices_marks_default_and_sorted(tmp_path):
 
 
 def test_list_voices_multiformat_files(tmp_path):
-    """宽松探测：.pt / .bin / .pth 任意文件均视为可加载产物。"""
+    """G-4 口径收敛：*.pth / *.ckpt / config.json / ckpt.txt 算可加载；
+    杂文件（.pt / .bin / 说明文本）不再判定为音色包。"""
     voices = tmp_path / "voices"
     _make_voice(voices, "pth_pack", "model.pth")
-    _make_voice(voices, "bin_pack", "model.bin")
+    _make_voice(voices, "ckpt_ext_pack", "weights.ckpt")
+    _make_voice(voices, "json_pack", "config.json")
+    _make_voice(voices, "txt_pack", "ckpt.txt")
+    _make_voice(voices, "pt_pack", "model.pt")      # 旧口径认可，新口径拒绝
+    _make_voice(voices, "bin_pack", "model.bin")    # 旧口径认可，新口径拒绝
+    _make_voice(voices, "readme_pack", "说明.txt")   # 任意杂文件不判定
     vm = VoiceManager(voices_dir=str(voices))
     ids = {v["id"] for v in vm.list_voices()}
-    assert ids == {"pth_pack", "bin_pack"}
+    assert ids == {"pth_pack", "ckpt_ext_pack", "json_pack", "txt_pack"}
 
 
 # ------------------------------------------------------------------ #
@@ -93,8 +101,8 @@ def test_list_voices_multiformat_files(tmp_path):
 def test_resolve_voice_paths(tmp_path):
     """cx-open / 自定义音色命中返回路径；不存在的 id 返回 None。"""
     voices = tmp_path / "voices"
-    _make_voice(voices, "cx-open", "a.pt")
-    _make_voice(voices, "custom_a", "b.bin")
+    _make_voice(voices, "cx-open", "model.pth")
+    _make_voice(voices, "custom_a", "ckpt.txt")
     vm = VoiceManager(voices_dir=str(voices))
 
     assert vm.resolve_voice("cx-open") == str(voices / "cx-open")
@@ -115,7 +123,7 @@ def test_resolve_voice_rejects_traversal_ids(tmp_path):
     """L13：含 / \\ .. 或盘符的音色 id 一律拒绝返回 None（路径穿越防护）。"""
     voices = tmp_path / "voices"
     # 即使对应目录真实存在（含可加载文件），穿越 id 也必须被拒绝
-    _make_voice(voices, "cx-open", "p.pt")
+    _make_voice(voices, "cx-open", "model.pth")
     evil_target = tmp_path / "evil" / "secret.pt"
     evil_target.parent.mkdir(parents=True, exist_ok=True)
     evil_target.write_bytes(b"x")
@@ -144,8 +152,8 @@ def test_resolve_voice_rejects_traversal_ids(tmp_path):
 def test_set_default_voice_writes_config_and_effective(tmp_path):
     """set_default_voice 应写 config tts.voice 并落盘，且下次 resolve 生效。"""
     voices = tmp_path / "voices"
-    _make_voice(voices, "cx-open", "p.pt")
-    _make_voice(voices, "custom_a", "m.pt")
+    _make_voice(voices, "cx-open", "model.pth")
+    _make_voice(voices, "custom_a", "config.json")
     cfg = _make_config(tmp_path)
     vm = VoiceManager(voices_dir=str(voices), config=cfg)
 
@@ -168,8 +176,8 @@ def test_set_default_voice_writes_config_and_effective(tmp_path):
 def test_litets_voice_resolver_injected(tmp_path):
     """注入 voice_resolver 后，synthesize 的 voice 参数应被解析为路径。"""
     voices = tmp_path / "voices"
-    _make_voice(voices, "cx-open", "p.pt")
-    _make_voice(voices, "custom_a", "m.pt")
+    _make_voice(voices, "cx-open", "model.pth")
+    _make_voice(voices, "custom_a", "config.json")
     vm = VoiceManager(voices_dir=str(voices))
 
     calls = []

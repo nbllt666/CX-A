@@ -62,9 +62,33 @@ export interface MemoryRow {
   [key: string]: unknown;
 }
 
+/**
+ * 后端启动令牌缓存（N1 鉴权）：Electron 环境经 preload IPC 惰性获取并缓存；
+ * 非 Electron 环境（纯浏览器 dev / 测试）为 null，请求不附带令牌头。
+ */
+let backendToken: string | null | undefined;
+
+/** 惰性获取并缓存后端启动令牌；失败或非 Electron 环境返回 null。 */
+async function ensureBackendToken(): Promise<string | null> {
+  if (backendToken === undefined) {
+    try {
+      backendToken = (await window.cxaAPI?.getBackendToken?.()) ?? null;
+    } catch {
+      backendToken = null;
+    }
+  }
+  return backendToken;
+}
+
 /** 通用 JSON 请求封装：非 2xx 视为失败并抛错（供上层 try/catch 降级）。 */
 export async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+  // N1：持有启动令牌时自动附带 X-Client-Token 头（后端开启令牌校验后必需）
+  const token = await ensureBackendToken();
+  const headers = new Headers(init?.headers);
+  if (token) {
+    headers.set('X-Client-Token', token);
+  }
+  const res = await fetch(url, { ...init, headers });
   if (!res.ok) {
     throw new Error(`后端请求失败: ${res.status} ${res.statusText}`);
   }
@@ -132,15 +156,15 @@ export async function fetchSettings(): Promise<SettingsView> {
 
 /** 更新可热更配置（PUT /api/settings，白名单键：cloud.provider / tts.voice / local_llm.enabled）。 */
 export async function updateSettings(patch: Record<string, unknown>): Promise<SettingsView> {
-  const res = await fetch(API_ENDPOINTS.settings.update, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(patch),
-  });
-  if (!res.ok) {
-    throw new Error(`配置更新失败: ${res.status} ${res.statusText}`);
-  }
-  const data = (await res.json()) as { config?: SettingsView; error?: string };
+  // N1：统一走 requestJson（自动附带 X-Client-Token），保留 config 缺失的显式抛错语义
+  const data = await requestJson<{ config?: SettingsView; error?: string }>(
+    API_ENDPOINTS.settings.update,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    },
+  );
   if (!data.config) {
     throw new Error(`配置更新失败: ${data.error ?? '未知错误'}`);
   }
@@ -171,15 +195,12 @@ export async function fetchComputerStatus(): Promise<ComputerStatus> {
 
 /** 开启 / 撤销电脑控制授权（POST /api/computer/authorize），返回最新状态。 */
 export async function setComputerAuthorized(enabled: boolean): Promise<ComputerStatus> {
-  const res = await fetch(API_ENDPOINTS.computer.authorize, {
+  // N1：统一走 requestJson（自动附带 X-Client-Token）
+  return requestJson<ComputerStatus>(API_ENDPOINTS.computer.authorize, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled }),
   });
-  if (!res.ok) {
-    throw new Error(`授权请求失败: ${res.status} ${res.statusText}`);
-  }
-  return res.json() as Promise<ComputerStatus>;
 }
 
 /** 发起一次电脑控制工具调用（POST /api/computer/call）。未授权时后端返回 403 抛错。 */

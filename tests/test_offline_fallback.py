@@ -9,15 +9,17 @@
 - 恢复：先离线切 local，网络恢复后下次 chat 自动回 cloud 并通知；
 - 节流：多次 refresh_online 只在超间隔 / force 时真正调 cloud.is_online；
 - 本地未就绪：offline_chat 抛 LlamaNotReady → 产提示文案不崩；
-- 导出：OfflineFallbackManager / OFFLINE_PROMPT 可由 lite.cloud 导入。
+- 导出：OfflineFallbackManager / OFFLINE_PROMPT 可由 lite.cloud 导入；
+- G-3：流中途 CloudUnavailableError 不再追加离线提示，保留半截真实回复；
+- N5：CloudConfigError 置配置错误诊断态，提示"配置未完成"而非误诊断网。
 """
 
 from unittest.mock import Mock
 
 import pytest
 
-from lite.cloud.adapter import CloudUnavailableError
-from lite.cloud.fallback import OFFLINE_PROMPT, OfflineFallbackManager
+from lite.cloud.adapter import CloudConfigError, CloudUnavailableError
+from lite.cloud.fallback import CONFIG_ERROR_PROMPT, OFFLINE_PROMPT, OfflineFallbackManager
 from lite.runtime import LlamaNotReady
 
 
@@ -275,3 +277,105 @@ def test_package_exports():
 
     assert PkgMgr is OfflineFallbackManager
     assert PkgPrompt == OFFLINE_PROMPT
+
+
+# ------------------------------------------------------------------ #
+# G-3：流中途降级不再追加离线提示                                      #
+# ------------------------------------------------------------------ #
+
+def _make_midstream_cloud(chunks_before_error):
+    """构造"先产出若干 chunk 再抛 CloudUnavailableError"的云端 mock。"""
+    cloud = Mock()
+    cloud.is_online.return_value = True
+
+    def _chat(messages):
+        for chunk in chunks_before_error:
+            yield chunk
+        raise CloudUnavailableError("流中途断连")
+
+    cloud.chat.side_effect = _chat
+    return cloud
+
+
+def test_midstream_error_keeps_partial_reply_without_hint():
+    """G-3：已产出 chunk 后流中途故障 → 保留半截真实回复即止，不追加离线提示。"""
+    cloud = _make_midstream_cloud(["部分", "回复"])
+    local = StubLocalLLM(text="本地兜底")
+    mgr = OfflineFallbackManager(
+        cloud=cloud, local_llm=local, config={"local_llm": {"enabled": True}}
+    )
+    out = list(mgr.chat([{"role": "user", "content": "hi"}]))
+
+    # 仅保留已产出的半截真实回复，不混入离线提示
+    assert out == ["部分", "回复"]
+    assert OFFLINE_PROMPT not in out
+
+
+def test_pre_stream_error_still_degrades():
+    """G-3：未产出任何 chunk 即故障 → 仍走降级分支（切本地）。"""
+    cloud = _make_midstream_cloud([])  # 一块未产出就断连
+    local = StubLocalLLM(text="本地兜底")
+    mgr = OfflineFallbackManager(
+        cloud=cloud, local_llm=local, config={"local_llm": {"enabled": True}}
+    )
+    out = list(mgr.chat([{"role": "user", "content": "hi"}]))
+
+    assert out == ["本地兜底"]
+    assert mgr.mode == "local"
+
+
+# ------------------------------------------------------------------ #
+# N5：CloudConfigError 探测路径诊断态                                  #
+# ------------------------------------------------------------------ #
+
+def test_refresh_online_config_error_sets_diagnostic_state():
+    """N5：探测抛 CloudConfigError → online=False 且 _config_error 记录诊断文本。"""
+    cloud = Mock()
+    cloud.is_online.side_effect = CloudConfigError("未配置 api_key")
+    mgr = OfflineFallbackManager(
+        cloud=cloud, config={"local_llm": {"enabled": False}}
+    )
+    assert mgr.refresh_online(force=True) is False
+    assert mgr._config_error is not None
+    assert "api_key" in mgr._config_error
+
+
+def test_config_error_yields_config_prompt_not_offline():
+    """N5：配置错误诊断态下离线产出"云端配置未完成"文案，不再误诊为断网。"""
+    cloud = Mock()
+    cloud.is_online.side_effect = CloudConfigError("未配置 api_key")
+    mgr = OfflineFallbackManager(
+        cloud=cloud, config={"local_llm": {"enabled": False}}
+    )
+    out = list(mgr.chat([{"role": "user", "content": "hi"}]))
+
+    assert out == [CONFIG_ERROR_PROMPT]
+    assert OFFLINE_PROMPT not in out
+    assert mgr.status == "offline_hint"
+
+
+def test_connection_error_clears_diagnostic_state():
+    """N5：连接层探测异常（非配置错误）→ _config_error 清 None，仍产断网提示。"""
+    cloud = Mock()
+    cloud.is_online.return_value = False
+    mgr = OfflineFallbackManager(
+        cloud=cloud, config={"local_llm": {"enabled": False}}
+    )
+    # 预置一个历史配置错误诊断态
+    mgr._config_error = "旧配置错误残留"
+
+    out = list(mgr.chat([{"role": "user", "content": "hi"}]))
+    assert mgr._config_error is None
+    assert out == [OFFLINE_PROMPT]
+
+
+def test_successful_probe_clears_diagnostic_state():
+    """N5：探测恢复成功 → 配置错误诊断态被清除。"""
+    cloud = Mock()
+    cloud.is_online.return_value = True
+    mgr = OfflineFallbackManager(
+        cloud=cloud, config={"local_llm": {"enabled": False}}
+    )
+    mgr._config_error = "历史配置错误"
+    assert mgr.refresh_online(force=True) is True
+    assert mgr._config_error is None

@@ -154,3 +154,38 @@ def test_reactivation_none_branch_clamped_to_upper(calc):
     # 下界行为保持不变：负 base 情感为 0 时钳到 0
     low = calc.apply_reactivation(-0.5, None, emotion_score=0.0)
     assert low == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------- G-6：aware datetime 归一 naive
+def test_parse_datetime_aware_iso_normalized_to_naive():
+    """G-6：带时区的 ISO 时间解析后归一为 naive 本地时间，可与 naive now() 相减。"""
+    from datetime import datetime as _dt
+
+    from lite.memory.decay import _parse_datetime
+
+    aware_text = "2026-08-28T08:00:00+08:00"
+    parsed = _parse_datetime(aware_text)
+    assert parsed is not None
+    assert parsed.tzinfo is None  # 已归一 naive
+    # 时区偏移不丢失：+08:00 的 08:00 == UTC 00:00 == 本地（Asia/Shanghai）08:00
+    expected = _dt.fromisoformat(aware_text).astimezone().replace(tzinfo=None)
+    assert parsed == expected
+
+    # Z 结尾（UTC）同样归一 naive，且不再崩溃
+    z_text = "2026-08-28T00:00:00Z"
+    parsed_z = _parse_datetime(z_text)
+    assert parsed_z is not None
+    assert parsed_z.tzinfo is None
+
+
+def test_age_seconds_with_aware_created_no_crash():
+    """G-6：aware ISO created_at 与 naive now 相减不再崩溃检索链。"""
+    from datetime import datetime as _dt
+
+    created = "2026-08-28T00:00:00+08:00"
+    now_text = "2026-08-28 08:00:00.000000"  # naive 基准
+    age = age_seconds_from_created(created, now_text)  # 修复前此处抛 TypeError
+    # 归一后的 naive created 与 now 的差值即为期望年龄（时区无关的相对断言）
+    expected_naive = _dt.fromisoformat(created).astimezone().replace(tzinfo=None)
+    expected_age = (_dt.strptime(now_text, "%Y-%m-%d %H:%M:%S.%f") - expected_naive).total_seconds()
+    assert age == pytest.approx(expected_age)

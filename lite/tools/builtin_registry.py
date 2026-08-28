@@ -100,6 +100,7 @@ class BuiltinToolRegistry:
         pipeline: Any = None,
         config: Any = None,
         tools_provider: Optional[Callable[[], Dict[str, Any]]] = None,
+        manager: Any = None,
     ) -> None:
         self.computer = computer
         self.computer_bridge = computer_bridge
@@ -109,6 +110,9 @@ class BuiltinToolRegistry:
         self.config = config
         #: 可选的实时 tools 开关提供者（覆盖注册期快照）
         self.tools_provider = tools_provider
+        #: 可选 MemoryManager（G-1 统一写入口）：注入后 memory_write 优先走
+        #: ``manager.add_memory``（相似去重 + 向量化语义）；None 时回落 store.add
+        self.manager = manager
 
         #: 注册表：tool_id -> 工具描述 dict（含 handler / category / enabled）
         self._tools: Dict[str, Dict[str, Any]] = {}
@@ -380,32 +384,53 @@ class BuiltinToolRegistry:
         )
 
     def _make_memory_write_handler(self) -> Callable:
-        """构造 memory_write handler：委托 memory_store.add（或 pipeline.store.add）。"""
+        """构造 memory_write handler：优先 manager.add_memory，回落 memory_store.add。"""
 
         def handler(arguments: Dict[str, Any]) -> Dict[str, Any]:
             store = self.memory_store
             if store is None and self.pipeline is not None:
                 store = getattr(self.pipeline, "store", None)
-            if store is None:
+            if store is None and self.manager is None:
                 return {
                     "success": False,
                     "tool": "memory_write",
                     "authorized": True,
-                    "error": "记忆存储后端未注入（memory_store / pipeline 均为 None）",
+                    "error": "记忆存储后端未注入（memory_store / pipeline / manager 均为 None）",
                     "result": None,
                 }
             args = arguments or {}
             tags = args.get("tags") or []
             if not isinstance(tags, str):  # tags 列为 TEXT，list/dict 需 JSON 序列化
                 tags = json.dumps(tags, ensure_ascii=False)
-            payload = {
-                "content": args.get("content", ""),
-                "type": args.get("type", "long_term"),
-                "importance": args.get("importance", 3),
-                "tags": tags,
-            }
+            content = args.get("content", "")
+            mem_type = args.get("type", "long_term")
+            importance = args.get("importance", 3)
             try:
-                mem_id = store.add(payload)
+                if self.manager is not None:
+                    # G-1 统一写入口：优先走 manager.add_memory（相似去重 + 向量化）。
+                    # 返回 None 表示被去重跳过（未实际写入），如实返回标记。
+                    mem_id = self.manager.add_memory(
+                        content=content,
+                        type=mem_type,
+                        importance=importance,
+                        agent_id=args.get("agent_id", "default"),
+                    )
+                    if mem_id is None:
+                        return {
+                            "success": True,
+                            "tool": "memory_write",
+                            "authorized": True,
+                            "result": {"id": None, "deduplicated": True},
+                        }
+                else:
+                    # manager 缺席：保持原 store.add 直写行为兜底
+                    payload = {
+                        "content": content,
+                        "type": mem_type,
+                        "importance": importance,
+                        "tags": tags,
+                    }
+                    mem_id = store.add(payload)
             except Exception as exc:  # noqa: BLE001 - 异常包装返回
                 return {
                     "success": False,
@@ -456,10 +481,8 @@ class BuiltinToolRegistry:
             # 退化：仅用 store.list 简化检索（无向量打分）
             if self.memory_store is not None:
                 try:
-                    kw: Dict[str, Any] = {}
-                    if top_k is not None:
-                        kw["limit"] = int(top_k)
-                    memories = self.memory_store.list(**kw)
+                    # G-8 修复：先取全量再做子串过滤 + 相关度排序，避免"前 N 条"截断丢失命中项
+                    memories = self.memory_store.list()
                 except Exception as exc:  # noqa: BLE001 - 异常包装返回
                     return {
                         "success": False,
@@ -468,11 +491,28 @@ class BuiltinToolRegistry:
                         "error": str(exc),
                         "result": None,
                     }
+                q = str(query or "")
+                if q:
+                    # query 非空：按 content 含 query 子串过滤，按（子串命中、importance 降序）排序
+                    hits = [m for m in memories if q in str(m.get("content") or "")]
+                    hits.sort(
+                        key=lambda m: (
+                            q in str(m.get("content") or ""),
+                            int(m.get("importance") or 0),
+                        ),
+                        reverse=True,
+                    )
+                else:
+                    # query 为空：返回最近 limit 条（store.list 按 id 升序，取尾部即最新）
+                    hits = list(memories)
+                if top_k is not None and int(top_k) > 0:
+                    # query 非空：按相关度序取前 N；query 为空：取尾部 N 条（最新）
+                    hits = hits[: int(top_k)] if q else hits[-int(top_k):]
                 return {
                     "success": True,
                     "tool": "memory_search",
                     "authorized": True,
-                    "result": {"memories": memories, "context_text": "【回忆】"},
+                    "result": {"memories": hits, "context_text": "【回忆】", "degraded": True},
                 }
 
             # 后端未注入 -> 明确错误（不抛）

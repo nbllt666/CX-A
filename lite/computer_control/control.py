@@ -50,6 +50,7 @@ __all__ = [
     # 主类
     "ComputerControl",
     "DANGEROUS_COMMANDS",
+    "CONFIRM_REQUIRED_WRAPPERS",
     "BLOCKED",
 ]
 
@@ -192,6 +193,32 @@ DANGEROUS_COMMANDS: List[str] = [
     "rmtree",
     "powershell -c remove",
     "powershell -executionpolicy bypass -command remove",
+]
+
+#: 需强制二次确认的包裹器名单（N2，20260828_模块0_API鉴权与安全链路修复）：
+#: 命令首 token（含带引号绝对路径形态取 basename）命中此名单时，黑名单之外仍
+#: 强制进入高危确认闸——防止 ``cmd /c del ...`` / ``powershell -c ri ...`` /
+#: ``C:\\...\\cmd.exe /c rd ...`` 等包裹器 / 别名形态整体绕过黑名单。
+CONFIRM_REQUIRED_WRAPPERS: List[str] = [
+    "cmd",
+    "cmd.exe",
+    "powershell",
+    "powershell.exe",
+    "pwsh",
+    "bash",
+    "sh",
+    "sh.exe",
+    "wscript",
+    "wscript.exe",
+    "cscript",
+    "cscript.exe",
+    "mshta",
+    "rundll32",
+    "regsvr32",
+    "python",
+    "pythonw",
+    "node",
+    "start",
 ]
 
 
@@ -538,6 +565,32 @@ class ComputerControl:
             if cmd.startswith(d) and cmd[len(d)] in cls._DANGEROUS_BOUNDARY:
                 return True
         return False
+
+    @classmethod
+    def _requires_confirmation(cls, command: str) -> bool:
+        """判定命令首 token 是否命中包裹器名单（N2：强制进高危确认闸）。
+
+        解析规则：命令去首尾空白后，若以引号开头则取首对引号内路径为首 token，
+        否则按空白切分取首段；随后取 basename 转小写（兼容 Windows 盘符路径
+        ``C:\\...\\cmd.exe`` 与 POSIX 路径分隔），命中 ``CONFIRM_REQUIRED_WRAPPERS``
+        返回 True。黑名单命中（``_is_dangerous``）仍优先直接 BLOCKED，两者叠加生效。
+
+        :param command: 指令字符串
+        :return: True 表示首 token 为包裹器，需经高危确认闸
+        """
+        cmd = (command or "").strip()
+        if not cmd:
+            return False
+        if cmd[0] in ('"', "'"):
+            end = cmd.find(cmd[0], 1)
+            first = cmd[1:end] if end > 0 else cmd[1:]
+        else:
+            first = cmd.split()[0]
+        # basename 统一按两种分隔符切分：Windows 反斜杠在 POSIX 平台不被
+        # os.path.basename 识别，故手动再切一次，保证跨平台判定一致
+        basename = os.path.basename(first).lower()
+        basename = basename.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+        return basename in CONFIRM_REQUIRED_WRAPPERS
 
     def _run_subprocess(self, command: str, timeout: float) -> Tuple[Optional[int], str, str, bool]:
         """底层进程执行：Windows 套 shell、CREATE_NO_WINDOW；超时回收进程树。

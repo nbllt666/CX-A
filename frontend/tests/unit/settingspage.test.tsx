@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, act } from '@testing-library/react';
 import SettingsPage from '../../src/renderer/pages/SettingsPage';
 
 /**
@@ -77,6 +77,54 @@ describe('SettingsPage：PUT 失败 → 内联错误提示', () => {
     expect(screen.queryByText(LOCAL_MODE_ERROR)).not.toBeInTheDocument();
 
     // 新的「音色」PUT 又失败 → 新内联提示出现
+    await screen.findByText(VOICE_ERROR);
+    expect(screen.queryByText(LOCAL_MODE_ERROR)).not.toBeInTheDocument();
+  });
+
+  it('旧操作迟到失败被序号守卫丢弃，不覆盖新操作状态', async () => {
+    // PUT 请求挂起、由测试手动决定失败时序；GET 全部失败（首帧走降级分支）
+    const pending: Array<(v: Response) => void> = [];
+    const seqFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'PUT') {
+        return new Promise<Response>((resolve) => pending.push(resolve));
+      }
+      return new Response(JSON.stringify({ error: `backend down for ${String(input)}` }), {
+        status: 503,
+        statusText: 'Service Unavailable',
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', seqFetch);
+
+    render(<SettingsPage />);
+    await screen.findByText(/设置加载失败啦/); // 等首帧 effect 完成
+
+    // 操作1：本地模式开关 → PUT 挂起（序号1）
+    fireEvent.click(screen.getByRole('switch', { name: '本地模式' }));
+    // 操作2：切音色 → 同步清错 + PUT 挂起（序号2，成为最新）
+    const combos = screen.getAllByRole('combobox');
+    fireEvent.change(combos[combos.length - 1], { target: { value: 'ling' } });
+    // requestJson 内部有 await，PUT 实际发出在微任务中：先冲刷再断言挂起数量
+    await act(async () => {});
+    expect(pending.length).toBe(2);
+
+    // 操作1 的迟到失败先到达：序号已非最新 → 不得出现「本地模式」错误提示
+    pending[0](
+      new Response(JSON.stringify({ error: 'stale request' }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    await act(async () => {}); // 冲刷微任务，让操作1 的 .catch 执行
+    expect(screen.queryByText(LOCAL_MODE_ERROR)).not.toBeInTheDocument();
+
+    // 操作2 的失败随后到达：序号最新 → 音色错误提示正常出现
+    pending[1](
+      new Response(JSON.stringify({ error: 'fresh request' }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
     await screen.findByText(VOICE_ERROR);
     expect(screen.queryByText(LOCAL_MODE_ERROR)).not.toBeInTheDocument();
   });

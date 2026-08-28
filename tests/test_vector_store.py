@@ -124,3 +124,16 @@ def test_lance_overwrite_replaces(tmp_path):
     vs.upsert("v1", [0.0, 1.0])
     res = vs.search([0.0, 1.0], top_k=1)
     assert res[0]["vector_id"] == "v1"
+
+
+def test_lance_delete_with_single_quote_filter(tmp_path):
+    """G-5：vector_id 含单引号时 upsert/delete 不再因 filter 语法崩溃。"""
+    vs = LanceVectorStore(db_path=str(tmp_path / "lancedb"))
+    vid = "node'with'quote"
+    assert vs.upsert(vid, [1.0, 0.0]) is True
+    # 含引号的未命中 filter：转义后不抛异常
+    assert vs.delete("missing'id") is True
+    # 含引号的命中 filter：正确删除目标向量
+    assert vs.delete(vid) is True
+    res = vs.search([1.0, 0.0], top_k=5)
+    assert all(r["vector_id"] != vid for r in res)

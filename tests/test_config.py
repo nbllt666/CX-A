@@ -229,3 +229,66 @@ def test_get_missing_returns_default(tmp_path):
     """get 不存在的键返回传入默认值。"""
     cfg = _make_manager(tmp_path)
     assert cfg.get("cloud", "no_such_key", "fb") == "fb"
+
+
+# ------------------------------------------------------------------ #
+# 8. N3：save 原子写 + 损坏 config.json 兜底                          #
+# ------------------------------------------------------------------ #
+
+def test_save_atomic_no_tmp_left(tmp_path):
+    """N3：save 走 tmp + os.replace 原子写，成功后不留 .tmp 残留。"""
+    cfg = _make_manager(tmp_path)
+    cfg.set("tts", "voice", "atomic-check")
+    cfg.save()
+
+    assert (tmp_path / "config.json").exists()
+    assert not (tmp_path / "config.json.tmp").exists()
+    # 落盘内容可正常解析且含写入值
+    raw = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert raw["tts"]["voice"] == "atomic-check"
+
+
+def test_save_cleans_tmp_on_failure(tmp_path, monkeypatch):
+    """N3：写入失败（os.replace 抛错）时清理 tmp 并上抛原异常。"""
+    cfg = _make_manager(tmp_path)
+    cfg.set("tts", "voice", "will-fail")
+
+    import lite.config.config_manager as cm_mod
+
+    real_replace = os.replace
+
+    def _boom_replace(src, dst):
+        if str(dst).endswith(".tmp"):
+            return real_replace(src, dst)
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(cm_mod.os, "replace", _boom_replace)
+    with pytest.raises(OSError):
+        cfg.save()
+
+    # tmp 已清理，原 config.json 未被破坏
+    assert not (tmp_path / "config.json.tmp").exists()
+    raw = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert "tts" in raw
+
+
+def test_corrupt_config_renamed_and_defaults_applied(tmp_path):
+    """N3：坏 config.json 改名为 .corrupt-<时间戳> 留证，按 DEFAULTS 起步可正常使用。"""
+    config_path = tmp_path / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text('{"cloud": {"provider": "deep', encoding="utf-8")  # 截断 JSON
+
+    cfg = _make_manager(tmp_path)
+
+    # 坏文件已改名留证（含 corrupt- 前缀），不再占用 config.json
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith("config.json.corrupt-")]
+    assert len(leftovers) == 1
+    assert not config_path.exists() or config_path.read_text(encoding="utf-8") != '{"cloud": {"provider": "deep'
+
+    # 按 DEFAULTS 起步：缺省段键已补齐，读写与 save 可正常进行
+    assert cfg.get("cloud", "provider") == DEFAULTS["cloud"]["provider"]
+    assert cfg.get("memory", "dedup") == DEFAULTS["memory"]["dedup"]
+    cfg.set("tts", "voice", "after-corrupt")
+    cfg.save()
+    cfg2 = _make_manager(tmp_path)
+    assert cfg2.get("tts", "voice") == "after-corrupt"

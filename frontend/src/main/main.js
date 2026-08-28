@@ -19,10 +19,17 @@
  */
 const { app, BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const http = require('http');
 const path = require('path');
 
 const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
+
+/**
+ * 后端启动令牌（N1 防 CSRF）：每次应用启动随机生成，经 spawn env CXA_API_TOKEN
+ * 注入后端进程，并经 IPC backend:token 交给 renderer 附带到 X-Client-Token 请求头。
+ */
+const BACKEND_TOKEN = crypto.randomBytes(24).toString('hex');
 
 /** 后端服务固定地址（与 lite/server/api_server.py、renderer api.ts 约定一致） */
 const BACKEND_HOST = '127.0.0.1';
@@ -68,7 +75,12 @@ function startBackend() {
   if (backendProcess) return;
   const { command, args, cwd } = resolveBackendCommand();
   try {
-    backendProcess = spawn(command, args, { cwd, windowsHide: true });
+    // N1：随机令牌经环境变量注入后端进程，后端据此开启 X-Client-Token 强制校验
+    backendProcess = spawn(command, args, {
+      cwd,
+      windowsHide: true,
+      env: { ...process.env, CXA_API_TOKEN: BACKEND_TOKEN },
+    });
   } catch (err) {
     console.warn(`[backend] 启动失败（${err.message}）；前端将走降级路径`);
     backendProcess = null;
@@ -95,14 +107,19 @@ function waitForBackendHealth() {
   const startedAt = Date.now();
   return new Promise((resolve) => {
     const probe = () => {
-      const req = http.get(url, { timeout: 2000 }, (res) => {
-        res.resume();
-        if (res.statusCode === 200) {
-          resolve(true);
-        } else {
-          schedule(); // 后端已监听但未就绪：继续轮询
+      // N1：健康探测附带令牌头——陌生进程占用 8600 时探测永不 200，超时告警更明确
+      const req = http.get(
+        url,
+        { timeout: 2000, headers: { 'X-Client-Token': BACKEND_TOKEN } },
+        (res) => {
+          res.resume();
+          if (res.statusCode === 200) {
+            resolve(true);
+          } else {
+            schedule(); // 后端已监听但未就绪：继续轮询
+          }
         }
-      });
+      );
       req.on('error', () => schedule());
       req.on('timeout', () => {
         req.destroy();
@@ -282,6 +299,9 @@ ipcMain.handle('pet-overlay:open', () => {
   return true;
 });
 ipcMain.handle('pet-overlay:close', () => closePetOverlayWindow());
+
+// 后端启动令牌（N1）：renderer 经 preload 白名单方法获取后，附带在 API 请求头
+ipcMain.handle('backend:token', () => BACKEND_TOKEN);
 
 // ---------- 应用生命周期 ----------
 

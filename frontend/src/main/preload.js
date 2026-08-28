@@ -25,6 +25,12 @@ contextBridge.exposeInMainWorld('cxaAPI', {
   /** 关闭桌宠透明悬浮窗（不存在时静默成功） */
   closePetOverlay: () => ipcRenderer.invoke('pet-overlay:close'),
 
+  /**
+   * 获取后端启动令牌（N1 鉴权）：renderer 请求后端 API 时附带 X-Client-Token 头。
+   * 非 Electron 环境（纯浏览器 dev）不会被调用。
+   */
+  getBackendToken: () => ipcRenderer.invoke('backend:token'),
+
   // ---------- 后续任务扩展点（占位，保留签名） ----------
   // 后端 API / 系统通知等能力将在此处增量暴露，
   // 契约由对应任务（A10 起）补充，本期保持最小集。

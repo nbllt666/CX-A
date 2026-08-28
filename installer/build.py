@@ -25,6 +25,16 @@ import sys
 import time
 import zipfile
 
+# GBK 控制台防崩：electron-builder / vite 输出常含 U+2022 等非 GBK 字符，
+# print 直写 GBK 控制台会抛 UnicodeEncodeError 并掩盖真实构建失败原因。
+# 统一把标准流切到 UTF-8（replace 兜底）；流不支持 reconfigure 时静默跳过。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):  # 已重定向/已关闭等场景不阻断构建
+            pass
+
 #: 本安装器目录（installer/），基于文件绝对位置推导，禁止相对路径。
 _INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
 #: 项目根目录。
@@ -52,6 +62,8 @@ BACKEND_DIST_NAME = "backend"
 PORTABLE_DIR_NAME = "portable"
 #: 最终 zip 名。
 ZIP_BASENAME = "CX-A-portable-win64"
+#: zip 内固定顶层目录前缀（A-4：与便携根实际目录名解耦，解压结果恒定）。
+ZIP_TOP_DIR = "CX-A-portable/"
 
 
 def _log_info(message):
@@ -139,13 +151,31 @@ def build_renderer():
 
 
 def build_electron_shell():
-    """步骤2：electron-builder --dir 产出壳（frontend/release/win-unpacked）。"""
+    """步骤2：electron-builder --dir 产出壳，返回实际使用的产物目录。"""
     _log_info("步骤2：打包 Electron 壳（npm run dist:electron）…")
     npm = shutil.which("npm") or "npm"
     env = dict(os.environ)
     env.setdefault("ELECTRON_MIRROR", "https://npmmirror.com/mirrors/electron/")
+
+    # 壳产物目录预清理：Trae IDE 索引/杀毒等会长期独占 app.asar 句柄，
+    # electron-builder 自身 remove 失败即 ERR_ELECTRON_BUILDER_CANNOT_EXECUTE。
+    # 清理失败时切换全新输出父目录（与 portable 根自愈同策略）。
+    unpacked = ELECTRON_UNPACKED
+    extra = []
+    if os.path.isdir(unpacked):
+        try:
+            _rmtree_retry(unpacked, attempts=3, delay=1.0)
+        except PermissionError:
+            # electron-builder 对 --dir 目标固定在 <directories.output>/win-unpacked
+            # 下落位，故覆盖父目录、产物实际落在 <alt>/win-unpacked
+            alt_parent = os.path.join(
+                FRONTEND_DIR, "release", f"shell-{time.strftime('%Y%m%d_%H%M%S')}"
+            )
+            extra = ["--", f"-c.directories.output={alt_parent}"]
+            unpacked = os.path.join(alt_parent, "win-unpacked")
+            _log_warn(f"旧壳产物目录被占用，改用全新输出目录：{unpacked}")
     proc = subprocess.run(
-        [npm, "run", "dist:electron"], cwd=FRONTEND_DIR,
+        [npm, "run", "dist:electron", *extra], cwd=FRONTEND_DIR,
         capture_output=True, text=True, timeout=1800, env=env,
         encoding="utf-8", errors="replace",
         shell=(os.name == "nt"),
@@ -157,9 +187,10 @@ def build_electron_shell():
             "Electron 壳打包失败",
             "确认已 npm install（electron/electron-builder 二进制经 npmmirror 拉取）",
         )
-    if not os.path.isfile(os.path.join(ELECTRON_UNPACKED, ELECTRON_SHELL_EXE)):
-        _die(f"壳产物缺失：{os.path.join(ELECTRON_UNPACKED, ELECTRON_SHELL_EXE)}")
-    _log_info(f"Electron 壳打包完成：{ELECTRON_UNPACKED}")
+    if not os.path.isfile(os.path.join(unpacked, ELECTRON_SHELL_EXE)):
+        _die(f"壳产物缺失：{os.path.join(unpacked, ELECTRON_SHELL_EXE)}")
+    _log_info(f"Electron 壳打包完成：{unpacked}")
+    return unpacked
 
 
 def build_backend(work_dir):
@@ -295,6 +326,12 @@ def assemble(electron_dist, backend_dist, portable_root):
 def zip_portable(portable_root, release_dir):
     """把便携根压成 zip（步骤5）。
 
+    用户数据排除（A-1）：便携根顶层 config.json 与 data/ 整棵目录不写入 zip，
+    避免升级解压覆盖用户配置（含 Fernet 加密 Key）与记忆库；首启由
+    backend_entry/启动链 auto-init 按默认值重新生成。
+    顶层目录固定（A-4）：arcname 恒以 CX-A-portable/ 前缀开头，与便携根
+    实际目录名解耦（清理失败回退的 portable-<时间戳> 目录解压结果一致）。
+
     :param portable_root: 便携根目录。
     :param release_dir: zip 输出目录。
     :return: str zip 绝对路径。
@@ -306,9 +343,17 @@ def zip_portable(portable_root, release_dir):
     _log_info(f"步骤5：压缩 -> {zip_path}")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for base, _dirs, files in os.walk(portable_root):
+            rel_base = os.path.relpath(base, portable_root)
+            # A-1：data/ 整棵为用户运行数据，walk 层直接剪枝不入包
+            if rel_base.split(os.sep)[0] == "data":
+                continue
             for name in files:
+                # A-1：便携根顶层的 config.json 为用户配置，不入包
+                if rel_base == "." and name == "config.json":
+                    continue
                 full = os.path.join(base, name)
-                rel = os.path.relpath(full, os.path.dirname(portable_root))
+                # A-4：arcname 固定 CX-A-portable/ 前缀，与实际目录名解耦
+                rel = ZIP_TOP_DIR + os.path.relpath(full, portable_root)
                 zf.write(full, rel)
     size_mb = os.path.getsize(zip_path) / (1024 * 1024)
     _log_info(f"zip 完成：{size_mb:.1f} MB")
@@ -333,6 +378,7 @@ def main(argv=None):
 
     if not args.skip_frontend:
         build_renderer()
+    electron_dist = ELECTRON_UNPACKED
     if args.skip_electron:
         # 跳过壳构建 = 复用已有产物：目录与关键文件必须齐备（残缺产物不得静默组装）
         if not os.path.isdir(ELECTRON_UNPACKED) or not os.path.isfile(
@@ -343,7 +389,7 @@ def main(argv=None):
                 "去掉 --skip-electron 重新打包",
             )
     else:
-        build_electron_shell()
+        electron_dist = build_electron_shell()
 
     work_dir = os.path.join(args.output, "_work")
     if args.skip_backend:
@@ -354,7 +400,7 @@ def main(argv=None):
         backend_dist = build_backend(work_dir)
 
     portable_root = _prepare_portable_root(args.output)
-    assemble(ELECTRON_UNPACKED, backend_dist, portable_root)
+    assemble(electron_dist, backend_dist, portable_root)
 
     if not args.skip_zip:
         zip_portable(portable_root, args.output)

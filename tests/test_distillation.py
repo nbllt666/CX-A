@@ -287,3 +287,82 @@ def test_committing_partial_failure_keeps_committed_rows(store, monkeypatch):
     # 聚合接口如实返回已落库条目（不清空/不误导统计）
     flat = [a for sess in distiller.last_sessions for a in sess.get("added") or []]
     assert [a["content"] for a in flat] == ["用户偏好阅读科幻小说"]
+
+
+# ---------------------------------------------------------------- G-1 统一写入口（manager 注入）
+class RecordingManager:
+    """记录 add_memory 调用的 MemoryManager 替身：可配置去重命中。"""
+
+    def __init__(self, dedup_content=None):
+        self.calls = []
+        self._dedup_content = dedup_content
+
+    def add_memory(self, content, type="short_term", importance=3, agent_id="default"):
+        self.calls.append(
+            {"content": content, "type": type, "importance": importance, "agent_id": agent_id}
+        )
+        if self._dedup_content is not None and content == self._dedup_content:
+            return None  # 模拟去重命中：跳过写入
+        return len(self.calls)
+
+
+def test_manager_injection_routes_add_memory(store):
+    """G-1：注入 manager 后落库走 manager.add_memory（参数对齐 content/type/importance/agent_id）。"""
+    cloud = FakeCloud(
+        response=[
+            '[{"content": "用户偏好阅读科幻小说", "importance": 5},',
+            '{"content": "用户喜欢雨天出行"}]',
+        ]
+    )
+    manager = RecordingManager()
+    distiller = MemoryDistiller(cloud=cloud, store=store, manager=manager)
+    added = distiller.distill_long_conversation(
+        [{"role": "user", "content": "我喜欢看三体"}], agent_id="alice"
+    )
+
+    # 两条事实均走 manager.add_memory
+    assert len(manager.calls) == 2
+    assert manager.calls[0] == {
+        "content": "用户偏好阅读科幻小说",
+        "type": "long_term",
+        "importance": 5,
+        "agent_id": "alice",
+    }
+    assert manager.calls[1]["importance"] == 3  # 云端未给 importance -> 默认 3
+    # added 如实反映 manager 返回的 id
+    assert [a["id"] for a in added] == [1, 2]
+    # 直连 store.add 未被触碰（store 无写入）
+    assert store.list(type="long_term") == []
+
+
+def test_manager_dedup_skip_not_counted_in_added(store):
+    """G-1：manager 去重命中（返回 None）的条目不计入 added，其余正常落库。"""
+    cloud = FakeCloud(
+        response=[
+            '[{"content": "用户偏好阅读科幻小说", "importance": 4},',
+            '{"content": "用户喜欢雨天出行", "importance": 3}]',
+        ]
+    )
+    manager = RecordingManager(dedup_content="用户偏好阅读科幻小说")
+    distiller = MemoryDistiller(cloud=cloud, store=store, manager=manager)
+    sessions = distiller.distill_with_sessions([{"role": "user", "content": "hi"}])
+
+    s = sessions[0]
+    assert s["state"] == S_DONE
+    # 第 1 条被去重跳过，仅第 2 条计入 added
+    assert len(manager.calls) == 2
+    assert [a["content"] for a in s["added"]] == ["用户喜欢雨天出行"]
+    assert s["committed"] == 1
+    assert s["partial"] is False  # 去重跳过不是落库失败
+
+
+def test_manager_absent_keeps_store_add(store):
+    """G-1：manager 缺席时保持原 store.add 直写行为兜底。"""
+    cloud = FakeCloud(response=['[{"content": "用户偏好阅读科幻小说", "importance": 4}]'])
+    distiller = _mk_distiller(cloud, store)  # 不传 manager
+    added = distiller.distill_long_conversation([{"role": "user", "content": "hi"}])
+    assert len(added) == 1
+    # 直写 store：库中可查回
+    rows = store.list(type="long_term")
+    assert len(rows) == 1
+    assert rows[0]["content"] == "用户偏好阅读科幻小说"

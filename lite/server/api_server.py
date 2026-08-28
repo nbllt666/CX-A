@@ -19,6 +19,13 @@
     POST   /api/chat/messages       聊天发送（未启用守卫：明确提示走前端 Mock）
     GET    /api/chat/history        聊天历史（未启用守卫：返回空列表 + 提示）
 
+生产装配接线 API（批次E，记录在 `.trae/documents/20260828_模块0_生产装配接线.md`）：
+    GET    /api/tools               内置工具清单（含 usage 端点用法自述）
+    POST   /api/tools/call          调用内置工具（body {name, arguments}；未授权 403 / 未知工具 404）
+    POST   /api/memory/distill      记忆蒸馏（body {messages, agent_id?}；未配置云端 400 / 云端离线 503）
+    POST   /api/voice/synthesize    文本合成语音（body {text, voice?}；后端异常 503）
+    POST   /api/voice/transcribe    语音转文本（body {audio_base64, sample_rate?}；后端异常 503）
+
 > 管理面已收敛为纯 API：前端不再路由 Agents/Remote/Status，管理能力以上述端点
 > + /api/agents、/api/remote/* 外露，供另一 Agent 或管理工具调用。
 
@@ -32,6 +39,8 @@ MemoryStore 的 sqlite3 连接与 MemoryRetrievalPipeline 均在主处理线程�
 """
 
 import argparse
+import base64
+import hmac
 import json
 import os
 import sys
@@ -41,6 +50,23 @@ from urllib.parse import parse_qs, urlparse
 
 # 聊天服务未启用守卫错误码（前端本期走 Mock 演示，端点存在但明确提示）
 CHAT_SERVICE_DISABLED = "chat_service_disabled"
+
+# ------------------------------------------------------------------ 启动令牌鉴权（N1）
+# 环境变量 CXA_API_TOKEN 非空时，除 OPTIONS 预检与 GET /api/health 外的所有请求
+# 必须携带匹配的 X-Client-Token 头（常量时间比较），否则回 403 unauthorized_client。
+# Electron 生产态由 main.js 启动时生成随机令牌经 spawn env 注入本进程；env 未设置
+# （纯浏览器 dev / 测试态）保持开放模式并告警一次。
+_API_TOKEN = os.environ.get("CXA_API_TOKEN", "").strip()
+#: 开放模式告警是否已发出（仅告警一次，避免刷屏）
+_TOKEN_OPEN_MODE_WARNED = False
+
+# 请求体大小上限（N6）：1MB，超出直接 413，防超大 body 阻塞单线程服务
+_MAX_BODY_BYTES = 1048576
+
+
+class _BodyTooLarge(Exception):
+    """请求体超过 ``_MAX_BODY_BYTES`` 的内部信号（413 响应已由 _read_body_json 发出）。"""
+
 
 # 云端 provider 白名单（与 lite/cloud/adapter.py 支持的 provider 对齐）
 CLOUD_PROVIDER_ALLOWLIST = ("deepseek", "tongyi", "openai", "moonshot")
@@ -60,6 +86,26 @@ _ALLOWED_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173", "null")
 # 严格两值白名单会误伤；外部恶意域名（DNS rebinding 的真正攻击面）仍被拒绝。
 _ALLOWED_HOSTS = ("127.0.0.1:8600", "localhost:8600")
 _ALLOWED_HOST_NAMES = ("127.0.0.1", "localhost")
+
+# 批次E：GET /api/tools 响应附带的端点用法自述（openapi 风格，供管理 Agent 自发现）
+_TOOLS_USAGE = {
+    "POST /api/tools/call": {
+        "body": {"name": "工具 id（见 tools[].id）", "arguments": "工具参数 dict（可省略）"},
+        "result": "200 {ok:true, result}；未授权/类别禁用 403 not_authorized；未知工具 404",
+    },
+    "POST /api/memory/distill": {
+        "body": {"messages": "非空 [{role, content}, ...] 列表", "agent_id": "可选，默认 default"},
+        "result": "200 {ok:true, sessions}；未配置云端 400 cloud_not_configured；云端离线 503 cloud_offline",
+    },
+    "POST /api/voice/synthesize": {
+        "body": {"text": "待合成文本（非空）", "voice": "可选音色，默认 cx-open"},
+        "result": "200 {ok:true, audio_base64, mime:'audio/wav'}；后端异常 503 voice_backend_unavailable",
+    },
+    "POST /api/voice/transcribe": {
+        "body": {"audio_base64": "PCM 音频的 base64 编码", "sample_rate": "可选采样率（默认 16000，当前透传忽略）"},
+        "result": "200 {ok:true, text}；解码失败 400；后端异常 503 voice_backend_unavailable",
+    },
+}
 
 # ------------------------------------------------------------------ 路径推导
 # lite/server/api_server.py -> lite/server -> lite -> 项目根目录（逐级上溯 3 次）
@@ -91,6 +137,10 @@ from lite.computer_control.control import (  # noqa: E402
 from lite.computer_control.security import ControlAuthorizer  # noqa: E402
 from lite.computer_control.tool_bridge import ToolBridge  # noqa: E402
 from lite.config.config_manager import DEFAULTS, ConfigManager  # noqa: E402
+from lite.cloud.adapter import CloudAdapter, CloudConfigError  # noqa: E402
+from lite.memory.distillation import DistillationPaused, MemoryDistiller  # noqa: E402
+from lite.tools.builtin_registry import BuiltinToolRegistry  # noqa: E402
+from lite.audio import LiteVoicePipeline, build_default_pipeline  # noqa: E402
 
 # 默认数据目录：项目根目录下 data/（与 storage._default_db_path 的 data/memories.db 一致）
 DEFAULT_DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
@@ -160,21 +210,141 @@ def build_computer_deps(data_dir=None):
     return computer, authorizer, bridge
 
 
-def make_handler(store, pipeline, manager=None, remote=None, computer=None, authorizer=None, bridge=None, config=None):
+def build_runtime_deps(data_dir=None, config=None, store=None, pipeline=None, computer_deps=None):
+    """装配批次E生产运行时依赖：语音编排 / 内置工具注册表 / 记忆蒸馏器。
+
+    三个引擎此前仅有能力实现、无生产构造点（20260828_模块0_生产装配接线），
+    本函数为其提供统一装配入口：
+
+    - voice：``build_default_pipeline(config)`` 装配三件套（funasr / melotts 缺席时
+      自动回退 Mock 后端，装配零失败），再包装为 ``LiteVoicePipeline``（cloud 置
+      None，保持纯本地离线形态）；
+    - registry：``BuiltinToolRegistry``，电脑控制三件复用 ``computer_deps`` 产物
+      （authorizer 单例同源），记忆读写复用 store / pipeline / pipeline.manager；
+    - distiller：``MemoryDistiller``，云端适配器由同一 config 构造（CloudAdapter
+      构造期零失败，CloudConfigError 延迟到 is_online / chat 时才抛出）。
+
+    Args:
+        data_dir: 数据目录（None 用项目根 data/）。
+        config: 可选 ConfigManager；缺省按 data_dir 下 config.json 新建。
+        store: 可选 MemoryStore；缺省随 pipeline 一起经 build_deps 补建。
+        pipeline: 可选 MemoryRetrievalPipeline；缺省经 build_deps 补建。
+        computer_deps: 可选 (computer, authorizer, bridge) 三元组；缺省经
+            build_computer_deps 补建。
+
+    Returns:
+        tuple[LiteVoicePipeline, BuiltinToolRegistry, MemoryDistiller]:
+            三者共享同一 config / store / pipeline 上下文。
+    """
+    data_dir = _resolve_data_dir(data_dir)
+    os.makedirs(data_dir, exist_ok=True)
+    if store is None or pipeline is None:
+        built_store, built_pipeline, _manager, _remote = build_deps(data_dir)
+        store = store or built_store
+        pipeline = pipeline or built_pipeline
+    if config is None:
+        config = ConfigManager(config_path=os.path.join(data_dir, "config.json"))
+    if computer_deps is None:
+        computer_deps = build_computer_deps(data_dir)
+    computer, authorizer, bridge = computer_deps
+
+    # 语音全链路：Mock 兜底装配（缺依赖仅告警不失败），离线形态 cloud=None
+    components = build_default_pipeline(config)
+    voice = LiteVoicePipeline(
+        vad=components["vad"],
+        asr=components["asr"],
+        tts=components["tts"],
+        cloud=None,
+        judge=components["judge"],
+    )
+    registry = BuiltinToolRegistry(
+        computer=computer,
+        computer_bridge=bridge,
+        authorizer=authorizer,
+        memory_store=store,
+        pipeline=pipeline,
+        manager=getattr(pipeline, "manager", None),
+        config=config,
+    )
+    distiller = MemoryDistiller(
+        cloud=CloudAdapter(config),
+        store=store,
+        manager=getattr(pipeline, "manager", None),
+    )
+    return voice, registry, distiller
+
+
+def make_handler(
+    store, pipeline, manager=None, remote=None,
+    computer=None, authorizer=None, bridge=None, config=None,
+    registry=None, distiller=None, voice=None,
+):
     """基于指定依赖构建处理器类（闭包绑定 store / pipeline / manager / remote / computer，便于测试隔离）。
 
     Args:
         config: 可选 ConfigManager 实例（提供 /api/settings 读写；缺省新建，
             默认读写项目根 data/config.json）。
+        registry: 可选内置工具注册表（批次E；供 /api/tools* 端点使用）。
+        distiller: 可选记忆蒸馏器（批次E；供 /api/memory/distill 使用）。
+        voice: 可选语音全链路编排器（批次E；供 /api/voice/* 端点使用）。
+            registry / distiller / voice 遵循 N8 注入语义：仅对显式为 None 的
+            依赖回落默认构建（voice 默认构建经 build_default_pipeline 的 Mock
+            兜底零失败；registry / distiller 默认构建复用下方已解析的
+            computer / authorizer / bridge 与 config / store / pipeline 上下文）。
     """
     if manager is None:
         manager = AgentManager()
     if remote is None:
         remote = RemoteController()
-    if bridge is None:
-        computer, authorizer, bridge = build_computer_deps(DEFAULT_DATA_DIR)
+    # N8 注入语义修正：仅对显式为 None 的电脑控制依赖逐项回落默认，不再无条件
+    # 覆盖调用方注入的 computer / authorizer；默认构建的 data_dir 优先复用已注入
+    # 依赖携带的 data_dir 属性（ComputerControl.data_dir / ControlAuthorizer._data_dir），
+    # 取不到再落 DEFAULT_DATA_DIR。create_app 全量注入路径行为不变。
+    default_data_dir = DEFAULT_DATA_DIR
+    for _dep in (computer, authorizer, bridge):
+        reused = getattr(_dep, "data_dir", None) or getattr(_dep, "_data_dir", None)
+        if reused:
+            default_data_dir = reused
+            break
+    if computer is None or authorizer is None or bridge is None:
+        built_computer, built_authorizer, built_bridge = build_computer_deps(default_data_dir)
+        if computer is None:
+            computer = built_computer
+        if authorizer is None:
+            authorizer = built_authorizer
+        if bridge is None:
+            bridge = built_bridge
     if config is None:
-        config = ConfigManager(config_path=os.path.join(DEFAULT_DATA_DIR, "config.json"))
+        config = ConfigManager(config_path=os.path.join(default_data_dir, "config.json"))
+    # 批次E（N8 语义延续）：仅对显式为 None 的运行时依赖回落默认构建。
+    # voice 默认构建走 build_default_pipeline（funasr/melotts 缺席自动回退 Mock，零失败）；
+    # registry / distiller 默认构建复用上方已解析的 computer/authorizer/bridge 与
+    # config/store/pipeline 上下文，保证与既有注入依赖同源。
+    if voice is None:
+        _components = build_default_pipeline(config)
+        voice = LiteVoicePipeline(
+            vad=_components["vad"],
+            asr=_components["asr"],
+            tts=_components["tts"],
+            cloud=None,
+            judge=_components["judge"],
+        )
+    if registry is None:
+        registry = BuiltinToolRegistry(
+            computer=computer,
+            computer_bridge=bridge,
+            authorizer=authorizer,
+            memory_store=store,
+            pipeline=pipeline,
+            manager=getattr(pipeline, "manager", None),
+            config=config,
+        )
+    if distiller is None:
+        distiller = MemoryDistiller(
+            cloud=CloudAdapter(config),
+            store=store,
+            manager=getattr(pipeline, "manager", None),
+        )
 
     class ApiHandler(BaseHTTPRequestHandler):
         """REST 请求处理器。单线程 HTTPServer 内串行执行，无共享状态竞争。"""
@@ -190,6 +360,9 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
         _authorizer = authorizer
         _bridge = bridge
         _config = config
+        _registry = registry
+        _distiller = distiller
+        _voice = voice
 
         # ------------------------------------------------------------ 底层工具
         def log_message(self, fmt, *args):
@@ -214,6 +387,32 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             elif ":" in name:
                 name = name.rsplit(":", 1)[0]
             return name in _ALLOWED_HOST_NAMES
+
+        def _check_token(self):
+            """校验启动令牌 X-Client-Token（N1：根治 CSRF→RCE 链）。
+
+            规则：
+            - 服务端令牌为空（env CXA_API_TOKEN 未设置）：开放模式放行，仅首次
+              调用告警一次（提示当前无令牌保护，仅限开发 / 测试环境）；
+            - 令牌非空：请求头 X-Client-Token 必须与令牌常量时间比较一致，
+              否则回 403 ``unauthorized_client``。
+
+            :return: True 放行；False 表示已发送 403，调用方直接 return。
+            """
+            global _TOKEN_OPEN_MODE_WARNED
+            if not _API_TOKEN:
+                if not _TOKEN_OPEN_MODE_WARNED:
+                    _TOKEN_OPEN_MODE_WARNED = True
+                    print(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [WARNING] "
+                        "CXA_API_TOKEN 未设置：API 服务运行于开放模式（无令牌校验），仅限开发/测试环境"
+                    )
+                return True
+            supplied = (self.headers.get("X-Client-Token") or "").encode("utf-8", errors="replace")
+            if hmac.compare_digest(supplied, _API_TOKEN.encode("utf-8")):
+                return True
+            self._send_json({"ok": False, "error": "unauthorized_client"}, 403)
+            return False
 
         def _cors_headers(self):
             """按请求 Origin 计算应附带的 CORS 响应头。
@@ -415,12 +614,18 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
 
         # ------------------------------------------------------------ 路由
         def do_GET(self):
-            """处理 GET：/api/health、/api/status、/api/settings、/api/chat/history、记忆/Agent/远端接口。"""
+            """处理 GET：health/status/settings/chat 守卫、记忆/Agent/远端/电脑状态、/api/tools。
+
+            GET /api/health 豁免令牌校验（供 main.js 健康探测与运维探针）。
+            """
             if not self._check_host():
                 self._deny_bad_host()
                 return
+            path = urlparse(self.path).path
+            # N1：健康检查豁免令牌，其余 GET 一律先过启动令牌闸
+            if path != "/api/health" and not self._check_token():
+                return
             try:
-                path = urlparse(self.path).path
                 query = self._parse_query()
 
                 if path == "/api/health":
@@ -459,15 +664,21 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                     self._handle_computer_status()
                     return
 
+                if path == "/api/tools":
+                    self._handle_tools_list()
+                    return
+
                 self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
             except Exception as exc:  # noqa: BLE001 - 兜底：任何畸形输入都得到结构化 500 而非连接中断
                 # SystemExit / KeyboardInterrupt 继承 BaseException，不会被此处捕获
                 self._guard_internal_error(exc)
 
         def do_POST(self):
-            """处理 POST：/api/chat/messages、Agent/远端/电脑控制接口。"""
+            """处理 POST：chat 守卫、Agent/远端/电脑控制、tools/call、memory/distill、voice/*。"""
             if not self._check_host():
                 self._deny_bad_host()
+                return
+            if not self._check_token():
                 return
             try:
                 path = urlparse(self.path).path
@@ -489,7 +700,22 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                 if path == "/api/computer/call":
                     self._handle_computer_call()
                     return
+                if path == "/api/tools/call":
+                    self._handle_tools_call()
+                    return
+                if path == "/api/memory/distill":
+                    self._handle_memory_distill()
+                    return
+                if path == "/api/voice/synthesize":
+                    self._handle_voice_synthesize()
+                    return
+                if path == "/api/voice/transcribe":
+                    self._handle_voice_transcribe()
+                    return
                 self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
+            except _BodyTooLarge:
+                # N6：413 响应已由 _read_body_json 发出，此处直接返回
+                return
             except Exception as exc:  # noqa: BLE001 - 兜底：结构化 500 而非连接中断
                 self._guard_internal_error(exc)
 
@@ -497,6 +723,8 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             """处理 PUT：/api/settings 更新配置；/api/agents/{id} 更新指定 Agent。"""
             if not self._check_host():
                 self._deny_bad_host()
+                return
+            if not self._check_token():
                 return
             try:
                 path = urlparse(self.path).path
@@ -508,6 +736,9 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                     self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
                     return
                 self._handle_agents_update(agent_id)
+            except _BodyTooLarge:
+                # N6：413 响应已由 _read_body_json 发出，此处直接返回
+                return
             except Exception as exc:  # noqa: BLE001 - 兜底：结构化 500 而非连接中断
                 self._guard_internal_error(exc)
 
@@ -515,6 +746,8 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
             """处理 DELETE：/api/memories/{id} 软删除 / /api/agents/{id} 删除 Agent。"""
             if not self._check_host():
                 self._deny_bad_host()
+                return
+            if not self._check_token():
                 return
             try:
                 path = urlparse(self.path).path
@@ -738,13 +971,180 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                 )
                 return
             except PluginError as exc:
-                payload = {"ok": False, "error": exc.message, "error_code": exc.error_code}
-                # L3：仅授权类错误才标注 authorized:false；其他 PluginError 省略该键
-                if isinstance(exc, NotAuthorizedError):
-                    payload["authorized"] = False
-                self._send_json(payload, exc.http_status)
+                # N7：原 isinstance(exc, NotAuthorizedError) 分支恒 False（该异常已由
+                # 上一个 except 捕获），删除死分支；非授权类 PluginError 不携带 authorized 键
+                self._send_json(
+                    {"ok": False, "error": exc.message, "error_code": exc.error_code},
+                    exc.http_status,
+                )
                 return
             self._send_json(payload)
+
+        # ------------------------------------------------------------ 内置工具 / 记忆蒸馏 / 语音（批次E）
+        def _handle_tools_list(self):
+            """GET /api/tools：内置工具清单 + 端点用法自述（供管理 Agent 自发现）。
+
+            按 BuiltinToolRegistry.list_tools() 实际提供的数据结构如实映射
+            （id/name/description/source/category/enabled），不虚构参数 schema。
+            """
+            tools = [
+                {
+                    "id": t["id"],
+                    "name": t["name"],
+                    "description": t["description"],
+                    "source": t["source"],
+                    "category": t["category"],
+                    "enabled": t["enabled"],
+                }
+                for t in self._registry.list_tools()
+            ]
+            self._send_json({"ok": True, "tools": tools, "usage": _TOOLS_USAGE})
+
+        def _handle_tools_call(self):
+            """POST /api/tools/call：body {name, arguments}，调用内置工具注册表。
+
+            注册表 ``call`` 不抛异常、统一返回 ``{success, tool, result|error,
+            authorized}`` 外壳，本端点按外壳判定映射：
+            - 未知工具（list_tools 无该 id）→ 404 not_found；
+            - success=False 且 authorized=False（NotAuthorizedError 包装 /
+              类别开关禁用，电脑三件套已在注册表内走 授权→高危确认→审计 链）
+              → 403 not_authorized；
+            - 其余 success=False（执行失败）→ 400；
+            - 成功 → 200 {ok:true, result}。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            name = str(body.get("name") or "").strip()
+            if not name:
+                self._send_json({"ok": False, "error": "bad_request", "message": "name 为必填字段"}, 400)
+                return
+            arguments = body.get("arguments") if isinstance(body.get("arguments"), dict) else {}
+            known_ids = {t["id"] for t in self._registry.list_tools()}
+            if name not in known_ids:
+                self._send_json(
+                    {"ok": False, "error": "not_found", "message": f"未知内置工具：{name!r}"}, 404
+                )
+                return
+            outcome = self._registry.call(name, arguments)
+            if not outcome.get("success"):
+                if outcome.get("authorized") is False:
+                    self._send_json(
+                        {"ok": False, "error": "not_authorized", "message": outcome.get("error")}, 403
+                    )
+                else:
+                    self._send_json(
+                        {"ok": False, "error": "tool_failed", "message": outcome.get("error")}, 400
+                    )
+                return
+            self._send_json({"ok": True, "result": outcome.get("result")})
+
+        def _handle_memory_distill(self):
+            """POST /api/memory/distill：body {messages, agent_id?}，触发云端记忆蒸馏。
+
+            - messages 必须为非空列表且每项含 role/content，否则 400；
+            - CloudConfigError（未配置 api_key / 未知 provider）→ 400 cloud_not_configured；
+            - DistillationPaused（云端离线）→ 503 cloud_offline；
+            - 成功 → 200 {ok:true, sessions}（distill_with_sessions 完整会话明细）。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            messages = body.get("messages")
+            if not isinstance(messages, list) or not messages:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "messages 必须为非空列表"}, 400
+                )
+                return
+            if not all(isinstance(m, dict) and "role" in m and "content" in m for m in messages):
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "messages 每项必须是含 role/content 的对象"},
+                    400,
+                )
+                return
+            agent_id = str(body.get("agent_id") or "default")
+            try:
+                sessions = self._distiller.distill_with_sessions(messages, agent_id=agent_id)
+            except CloudConfigError as exc:
+                self._send_json({"ok": False, "error": "cloud_not_configured", "message": str(exc)}, 400)
+                return
+            except DistillationPaused as exc:
+                self._send_json({"ok": False, "error": "cloud_offline", "message": str(exc)}, 503)
+                return
+            self._send_json({"ok": True, "sessions": sessions})
+
+        def _handle_voice_synthesize(self):
+            """POST /api/voice/synthesize：body {text, voice?}，TTS 合成并以 base64 返回。
+
+            调 voice.tts.synthesize(text, voice) 得 wav/pcm 字节；后端任何异常
+            （含引擎未就绪）统一 503 voice_backend_unavailable，不中断服务。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            text = str(body.get("text") or "").strip()
+            if not text:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "text 为必填字段且不能为空"}, 400
+                )
+                return
+            voice = body.get("voice") or None
+            try:
+                audio = self._voice.tts.synthesize(text, voice)
+            except Exception as exc:  # noqa: BLE001 - 语音后端故障统一 503 兜底
+                self._send_json(
+                    {"ok": False, "error": "voice_backend_unavailable", "message": str(exc)[:200]}, 503
+                )
+                return
+            if not audio:
+                self._send_json(
+                    {"ok": False, "error": "voice_backend_unavailable", "message": "合成返回空音频"}, 503
+                )
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    "audio_base64": base64.b64encode(bytes(audio)).decode("ascii"),
+                    "mime": "audio/wav",
+                }
+            )
+
+        def _handle_voice_transcribe(self):
+            """POST /api/voice/transcribe：body {audio_base64, sample_rate?}，ASR 转写。
+
+            base64 解码后送 voice.asr.transcribe；解码失败 400；后端异常 503
+            voice_backend_unavailable。sample_rate 为可选元数据（当前 ASR 门面
+            不消费，透传忽略，保留字段兼容未来采样率感知后端）。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            raw = body.get("audio_base64")
+            if not isinstance(raw, str) or not raw.strip():
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "audio_base64 为必填字段"}, 400
+                )
+                return
+            try:
+                audio = base64.b64decode(raw, validate=True)
+            except (ValueError, TypeError):
+                # binascii.Error 是 ValueError 子类，统一按非法 base64 处理
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "audio_base64 不是合法的 base64 编码"}, 400
+                )
+                return
+            try:
+                result = self._voice.asr.transcribe(audio) or {}
+            except Exception as exc:  # noqa: BLE001 - 语音后端故障统一 503 兜底
+                self._send_json(
+                    {"ok": False, "error": "voice_backend_unavailable", "message": str(exc)[:200]}, 503
+                )
+                return
+            self._send_json({"ok": True, "text": str(result.get("text", ""))})
 
         # ------------------------------------------------------------ Agent 接口
         def _read_body_json(self):
@@ -764,6 +1164,14 @@ def make_handler(store, pipeline, manager=None, remote=None, computer=None, auth
                 length = 0
             if length <= 0:
                 return {}
+            if length > _MAX_BODY_BYTES:
+                # N6：超大 body 直接 413，防止阻塞单线程服务（本机 DoS 面）。
+                # 先按声明长度丢弃 body 再响应（上限 1MB，读取有界），避免服务端
+                # 提前关连导致客户端写中断（Windows WinError 10053）而收不到 413；
+                # 抛内部信号由 do_METHOD 捕获终止分发（响应已发出）
+                self.rfile.read(length)
+                self._send_json({"ok": False, "error": "payload_too_large"}, 413)
+                raise _BodyTooLarge()
             content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
             if not content_type.startswith("application/json"):
                 return None
@@ -845,9 +1253,18 @@ def create_app(data_dir=None):
     #: 配置实例与 remote 同源（同一 data_dir 下 config.json），供 /api/settings 读写，
     #: 保证测试隔离（不触碰项目根运行时配置）。
     config = ConfigManager(config_path=os.path.join(data_dir, "config.json"))
+    #: 批次E生产装配：语音编排 / 内置工具注册表 / 记忆蒸馏器，全量注入 handler
+    voice, registry, distiller = build_runtime_deps(
+        data_dir,
+        config=config,
+        store=store,
+        pipeline=pipeline,
+        computer_deps=(computer, authorizer, bridge),
+    )
     handler = make_handler(
         store, pipeline, manager, remote,
         computer=computer, authorizer=authorizer, bridge=bridge, config=config,
+        registry=registry, distiller=distiller, voice=voice,
     )
     return store, pipeline, handler
 

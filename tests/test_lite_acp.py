@@ -542,3 +542,42 @@ def test_config_manager_reads_new_sections():
 def test_msg_struct_constant():
     """消息结构常量与 CX-O §3.3 对齐。"""
     assert MSG_STRUCT == {"action", "request_id", "data"}
+
+
+# ------------------------------------------------------------------ #
+# 7. 局域网发现去重与上限（N9，20260828_模块0_API鉴权与安全链路修复）   #
+# ------------------------------------------------------------------ #
+
+
+def _beacon(agent_id, port=9000):
+    """构造一条合法 ACP_BEACON 报文字节。"""
+    return json.dumps({"type": "ACP_BEACON", "agent_id": agent_id, "port": port}).encode("utf-8")
+
+
+def test_discovery_dedup_by_agent_and_addr():
+    """N9：同一 (agent_id, addr) 重复信标只登记一次；不同 addr 不互斥。"""
+    d = LiteLanDiscovery()
+    for _ in range(3):
+        d.parse_packet(_beacon("node1"), ("192.168.1.5", 5678))
+    assert len(d.found_agents) == 1
+    # 同 id 不同来源地址：各自登记（不同节点允许同名 id 的防御口径按 addr 区分）
+    d.parse_packet(_beacon("node1"), ("192.168.1.6", 5678))
+    assert len(d.found_agents) == 2
+
+
+def test_discovery_entries_capped_and_overflow_dropped(capsys):
+    """N9：条目上限 256；超限信标丢弃（解析照常返回）且同秒告警至多一条。"""
+    d = LiteLanDiscovery()
+    for i in range(300):
+        d.parse_packet(_beacon(f"n{i}", port=i), ("10.0.0.1", 7000 + i))
+    assert len(d.found_agents) == 256
+
+    # 超限后再来新信标：解析结果照常返回，但不登记
+    agent = d.parse_packet(_beacon("overflow-node"), ("10.0.0.9", 9999))
+    assert agent["agent_id"] == "overflow-node"
+    assert len(d.found_agents) == 256
+
+    # 告警限频：同秒内重复丢弃不重复打印
+    d.parse_packet(_beacon("overflow-node2"), ("10.0.0.9", 9998))
+    output = capsys.readouterr().out
+    assert output.count("已达上限") == 1
