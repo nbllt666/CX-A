@@ -497,3 +497,77 @@ def test_tools_provider_failure_falls_back_snapshot():
     res2 = reg2.call("computer_screen_control", {})
     assert res2["success"] is False
     assert "后端未注入" in res2["error"]
+
+
+# --------------------------------------------------------------------------- #
+# 批次A（第四轮体检）：uptime 语义 / top_k 校验 / agent_id 清洗               #
+# --------------------------------------------------------------------------- #
+
+
+def test_system_info_status_uptime_is_process_uptime():
+    """批次A：uptime_seconds 为进程运行秒数（monotonic 差值），非开机秒数。"""
+    import time as _time
+
+    reg = BuiltinToolRegistry(config=_CONFIG_ALL_OFF)
+    up1 = reg.call("system_info", {"category": "status"})["result"]["uptime_seconds"]
+    assert isinstance(up1, (int, float))
+    assert up1 >= 0
+    assert up1 < 3600  # 测试进程启动至今远小于 1 小时；修复前为开机秒数可能极大
+    _time.sleep(0.01)
+    up2 = reg.call("system_info", {"category": "status"})["result"]["uptime_seconds"]
+    assert up2 >= up1  # 单调不减，符合"运行时长"语义
+
+
+def test_memory_search_negative_top_k_rejected():
+    """批次A：负 top_k 返回 400 语义 error outcome，不再不截断返回全量。
+
+    参数校验位于 handler 入口（先于后端注入判定），无后端注入时同样先报参数错。
+    """
+    reg = BuiltinToolRegistry(config=_CONFIG_ALL_OFF)
+    res = reg.call("memory_search", {"query": "x", "top_k": -1})
+    assert res["success"] is False
+    assert "top_k 不能为负数" in res["error"]
+    assert res["result"] is None
+
+
+def test_memory_search_invalid_top_k_clean_error():
+    """批次A：非法 top_k（字符串）返回干净错误，不透出 int() 内部异常细节。"""
+    reg = BuiltinToolRegistry(config=_CONFIG_ALL_OFF)
+    res = reg.call("memory_search", {"query": "x", "top_k": "abc"})
+    assert res["success"] is False
+    assert "top_k 必须为整数" in res["error"]
+    assert "invalid literal" not in res["error"].lower()  # 内部细节不外泄
+    assert res["result"] is None
+
+
+def test_memory_search_pipeline_receives_validated_top_k():
+    """批次A：合法 top_k 仍正常透传 pipeline（回归保护）。"""
+    pipeline = MockPipeline()
+    reg = BuiltinToolRegistry(pipeline=pipeline, config=_CONFIG_ALL_OFF)
+    res = reg.call("memory_search", {"query": "今天", "top_k": "3"})
+    assert res["success"] is True
+    assert pipeline.retrieve_kwargs == {"query": "今天", "top_k": 3}
+
+
+def test_memory_write_agent_id_sanitized():
+    """批次A：memory_write 的 agent_id 走 strip + 限长 + 空值回落 default 清洗。"""
+    from lite.tools.builtin_registry import _MAX_AGENT_ID_CHARS
+
+    manager = RecordingManager()
+    reg = BuiltinToolRegistry(manager=manager, config=_CONFIG_ALL_OFF)
+
+    # 常规清洗：去首尾空白
+    reg.call("memory_write", {"content": "x", "agent_id": "  agent-001  "})
+    # 空值回落 default
+    reg.call("memory_write", {"content": "y", "agent_id": "   "})
+    # 缺省回落 default
+    reg.call("memory_write", {"content": "w"})
+    # 超限截断到与 API 侧一致的上限
+    reg.call("memory_write", {"content": "z", "agent_id": "a" * 250})
+
+    assert [c["agent_id"] for c in manager.calls] == [
+        "agent-001",
+        "default",
+        "default",
+        "a" * _MAX_AGENT_ID_CHARS,
+    ]

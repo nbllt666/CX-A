@@ -10,15 +10,6 @@ contextBridge.exposeInMainWorld('cxaAPI', {
   /** 获取应用基础信息（名称 / 版本 / 平台） */
   getAppInfo: () => ipcRenderer.invoke('app:get-info'),
 
-  /** 订阅主进程发起的「视图面切换」事件，返回取消订阅函数 */
-  onModeSwitch: (callback) => {
-    const listener = (_event, mode) => {
-      if (typeof callback === 'function') callback(mode);
-    };
-    ipcRenderer.on('mode:switch', listener);
-    return () => ipcRenderer.removeListener('mode:switch', listener);
-  },
-
   /** 打开桌宠透明悬浮窗（主进程幂等创建；已存在则置前显示） */
   openPetOverlay: () => ipcRenderer.invoke('pet-overlay:open'),
 

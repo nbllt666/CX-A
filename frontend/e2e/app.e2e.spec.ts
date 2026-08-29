@@ -107,12 +107,12 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
       .poll(windowCount(app), { timeout: 20_000, intervals: [250, 500, 1_000] })
       .toBe(1);
 
-    // localStorage 持久化回落 false（关闭后干净退出，不污染其他用例）
+    // localStorage 持久化回落 '0'（关闭后干净退出，不污染其他用例）
     await expect
       .poll(() => win.evaluate(() => localStorage.getItem('cx-a.petEnabled')), {
         timeout: 10_000,
       })
-      .toBe('false');
+      .toBe('0');
 
     await app.close();
   });

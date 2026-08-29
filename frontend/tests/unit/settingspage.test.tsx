@@ -141,4 +141,70 @@ describe('SettingsPage：PUT 失败 → 内联错误提示', () => {
       expect(window.localStorage.getItem('cx-a.computer.authorized')).toBe('1');
     });
   });
+
+  it('授权切换与配置保存分桶计数：配置保存失败不得吞掉授权失败分支（D1）', async () => {
+    // 修复1回归：此前共用单一 saveSeqRef，配置保存（音色）在授权 POST 在途期间
+    // 抢占最新序号 → 授权迟到失败被判「非最新」静默丢弃，离线降级分支被跳过。
+    const pendingAuth: Array<(v: Response) => void> = [];
+    const bucketFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (url.includes('/computer/authorize') && method === 'POST') {
+        return new Promise<Response>((resolve) => pendingAuth.push(resolve));
+      }
+      if (method === 'PUT') {
+        // 配置保存：立即失败（settings 桶内最新序号 → 音色错误提示出现）
+        return new Response(JSON.stringify({ error: `settings down for ${url}` }), {
+          status: 503,
+          statusText: 'Service Unavailable',
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.includes('/computer/status')) {
+        // 授权状态在线装载：authorized=false
+        return new Response(JSON.stringify({ authorized: false, confirm_dangerous: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      // 其余 GET（/api/settings 首帧）：失败走降级默认值
+      return new Response(JSON.stringify({ error: `down for ${url}` }), {
+        status: 503,
+        statusText: 'Service Unavailable',
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', bucketFetch);
+
+    render(<SettingsPage />);
+    // 等待电脑控制状态装载成功：status GET 成功后 writeLsBool(false) 先写入 '0'
+    await vi.waitFor(() => {
+      expect(window.localStorage.getItem('cx-a.computer.authorized')).toBe('0');
+    });
+    expect(screen.getByText(/权限很敏感，谨慎开关/)).toBeInTheDocument();
+
+    // 操作1：授权切换 → POST /api/computer/authorize 挂起（auth 桶序号1）
+    fireEvent.click(screen.getByRole('switch', { name: '电脑控制授权' }));
+
+    // 操作2：切音色 → PUT 立即失败（settings 桶序号1，与授权桶无关）
+    const combos = screen.getAllByRole('combobox');
+    fireEvent.change(combos[combos.length - 1], { target: { value: 'ling' } });
+    await screen.findByText(VOICE_ERROR); // 配置桶失败提示正常出现
+
+    // 授权 POST 迟到失败：auth 桶内序号仍最新 → 失败分支必须执行（修复前被静默跳过）
+    pendingAuth[0](
+      new Response(JSON.stringify({ error: 'auth down' }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    await vi.waitFor(() => {
+      // 失败分支写回本地记忆（开关为 true → '1'）
+      expect(window.localStorage.getItem('cx-a.computer.authorized')).toBe('1');
+    });
+    // 降级离线：授权卡描述切到离线文案（computerOnline=false 的直接证据）
+    expect(screen.getByText(/后端还没连上/)).toBeInTheDocument();
+    // 配置桶的音色错误提示不受授权失败影响
+    expect(screen.getByText(VOICE_ERROR)).toBeInTheDocument();
+  });
 });

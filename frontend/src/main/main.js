@@ -5,7 +5,7 @@
  *  - 拉起 Python 后端服务（127.0.0.1:8600）并等待 /api/health 就绪（打包链路）
  *  - 创建主窗口（伴侣面 / 管理面主视图）
  *  - 创建「桌宠透明悬浮窗」的独立窗口（createPetOverlayWindow / pet-overlay:open IPC）
- *  - 注册 renderer 所需的最小 IPC（app:get-info、mode:switch、pet-overlay:open/close）
+ *  - 注册 renderer 所需的最小 IPC（app:get-info、pet-overlay:open/close、backend:token）
  *
  * 后端生命周期：
  *  - 开发态（VITE_DEV_SERVER_URL 存在）：spawn `python -m lite.server.api_server`，cwd=项目根；
@@ -14,7 +14,8 @@
  *  - before-quit / process.exit 兜底回收子进程，防止残留进程占用 8600。
  *
  * 安全基线：contextIsolation:true、nodeIntegration:false、renderer sandbox 走
- * Electron 默认（开启）；WebContents 导航守卫 will-navigate 只放行本地来源，
+ * Electron 默认（开启）；单实例锁防双开令牌失配（D3）；WebContents 导航守卫
+ * will-navigate 按 URL 解析精确放行（自身 dist 产物 / dev server origin，D2），
  * setWindowOpenHandler 一律拒绝 window.open。
  */
 const { app, BrowserWindow, ipcMain } = require('electron');
@@ -22,6 +23,7 @@ const { spawn } = require('child_process');
 const crypto = require('crypto');
 const http = require('http');
 const path = require('path');
+const { fileURLToPath } = require('url');
 
 const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
 
@@ -162,23 +164,55 @@ function loadRenderer(win, entryHtml) {
 }
 
 /**
- * 导航与弹窗守卫：
- *  - will-navigate 仅放行 file:// 与本地 dev server（localhost:5173），其余一律阻止；
- *  - setWindowOpenHandler 拒绝一切 window.open 新窗口请求。
+ * 导航与弹窗守卫（D2 修复）：
+ *  - 一律先 `new URL(url)` 解析，再做精确比对，杜绝前缀匹配绕过
+ *    （如 `http://localhost:5173.evil.com/`）与任意本地文件放行；
+ *  - file:// 仅放行应用自身 dist 目录的归一化路径前缀；
+ *  - http(s) 仅在 VITE_DEV_SERVER_URL 存在（dev 态）时放行与其 origin 精确相等的
+ *    来源——dev 放行统一收口到 dev server 存在性之下，生产态无该 env 即全部拒绝；
+ *  - will-navigate 与 setWindowOpenHandler 共用同一判据（open-handler 仍拒绝一切新窗口）。
  */
 function attachNavigationGuards(win) {
-  const isLocalDev = (url) => {
-    if (!VITE_DEV_SERVER_URL) return false;
-    return url === VITE_DEV_SERVER_URL || url.startsWith(`${VITE_DEV_SERVER_URL}/`);
+  // dev 放行来源：仅 dev server 本身的 origin（无 VITE_DEV_SERVER_URL 即为 null，永不放行）
+  const devOrigin = (() => {
+    if (!VITE_DEV_SERVER_URL) return null;
+    try {
+      return new URL(VITE_DEV_SERVER_URL).origin;
+    } catch {
+      return null;
+    }
+  })();
+
+  // 应用自身 dist 产物目录（生产态 loadFile 目标）
+  const distDir = path.resolve(__dirname, '..', '..', 'dist');
+  const isOwnDistFile = (parsedUrl) => {
+    if (parsedUrl.protocol !== 'file:') return false;
+    try {
+      const filePath = path.normalize(fileURLToPath(parsedUrl));
+      const base = process.platform === 'win32' ? distDir.toLowerCase() : distDir;
+      const target = process.platform === 'win32' ? filePath.toLowerCase() : filePath;
+      // 前缀必须以路径分隔符收尾（或恰为目录本身），防 `dist-evil` 这类同前缀目录误放行
+      return target === base || target.startsWith(`${base}${path.sep}`);
+    } catch {
+      return false;
+    }
   };
-  const isLocalhostDevPort = (url) =>
-    url.startsWith('http://localhost:5173') || url.startsWith('http://127.0.0.1:5173');
+
+  const isAllowedNavigation = (url) => {
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol === 'file:') return isOwnDistFile(parsed);
+      // http(s)/其它协议：仅放行 dev server origin 精确匹配（dev 态限定）
+      return devOrigin !== null && parsed.origin === devOrigin;
+    } catch {
+      return false;
+    }
+  };
 
   win.webContents.on('will-navigate', (event, url) => {
-    if (url.startsWith('file://') || isLocalDev(url) || isLocalhostDevPort(url)) {
-      return;
+    if (!isAllowedNavigation(url)) {
+      event.preventDefault();
     }
-    event.preventDefault();
   });
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 }
@@ -284,15 +318,6 @@ ipcMain.handle('app:get-info', () => ({
   platform: process.platform,
 }));
 
-// 预留：主进程可主动通知 renderer 切换视图面（如托盘事件），renderer 通过 preload.onModeSwitch 订阅
-ipcMain.handle('mode:switch', (_event, mode) => {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('mode:switch', mode);
-    return true;
-  }
-  return false;
-});
-
 // 桌宠悬浮窗开关（对应 preload 的 openPetOverlay / closePetOverlay 白名单方法）
 ipcMain.handle('pet-overlay:open', () => {
   createPetOverlayWindow();
@@ -304,6 +329,21 @@ ipcMain.handle('pet-overlay:close', () => closePetOverlayWindow());
 ipcMain.handle('backend:token', () => BACKEND_TOKEN);
 
 // ---------- 应用生命周期 ----------
+
+// 单实例锁（D3 修复）：双开会导致第二实例生成不同的 CXA_API_TOKEN，
+// 对后端全部 API 401 静默降级——未获锁实例直接退出；获锁实例在
+// second-instance 事件中聚焦既有主窗口。e2e 冒烟为串行 launch+close，不受影响。
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
 
 app.whenReady().then(() => {
   // 拉起后端：不 await——窗口先开，健康探测并行进行，超时仅告警

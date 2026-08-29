@@ -71,8 +71,9 @@ export default function SettingsPage() {
   const [provider, setProvider] = useState(FALLBACK_PROVIDER);
   const [localMode, setLocalMode] = useState(FALLBACK_LOCAL_MODE);
   const [voice, setVoice] = useState(FALLBACK_VOICE);
-  // 后端返回的 provider 若不在白名单则附加为自定义项
+  // 后端返回的 provider / voice 若不在白名单则附加为自定义项（select 显示空白修复，D8）
   const [extraProvider, setExtraProvider] = useState<string | null>(null);
+  const [extraVoice, setExtraVoice] = useState<string | null>(null);
 
   // 电脑控制授权状态
   const [controlAuth, setControlAuth] = useState(false);
@@ -84,6 +85,8 @@ export default function SettingsPage() {
   const [settingsDegraded, setSettingsDegraded] = useState(false);
   // 配置项保存失败的轻量内联提示（哪一项失败显示哪一句）
   const [saveError, setSaveError] = useState<string | null>(null);
+  // 自定义 provider / voice 选中时的非阻断提示（不支持在线修改，显式告知而非静默跳过，D8）
+  const [customHint, setCustomHint] = useState<string | null>(null);
 
   // 挂载初始化：拉后端配置视图 + 电脑控制状态；失败回退默认值（与 config 默认一致）
   useEffect(() => {
@@ -97,7 +100,10 @@ export default function SettingsPage() {
           if (p && !CLOUD_PROVIDERS.includes(p)) setExtraProvider(p);
           setProvider((p && CLOUD_PROVIDERS.includes(p) ? p : (st?.cloud?.provider ?? FALLBACK_PROVIDER)) as string);
           setLocalMode(Boolean(st?.local_llm?.enabled ?? FALLBACK_LOCAL_MODE));
-          setVoice(st?.tts?.voice || FALLBACK_VOICE);
+          const v = st?.tts?.voice || FALLBACK_VOICE;
+          setVoice(v);
+          // 后端自定义音色（不在白名单）：附加为当前值选项，避免 select 显示空白（D8）
+          if (v && !VOICE_OPTIONS.includes(v)) setExtraVoice(v);
         } catch {
           if (!alive) return;
           setProvider(FALLBACK_PROVIDER);
@@ -137,55 +143,71 @@ export default function SettingsPage() {
 
   // 云端 / 本地模式 / 音色走 PUT /api/settings 热更新。
   // 保存失败不再静默吞掉：setSaveError 内联显错；下次操作开头自动清空，自然覆盖重试。
-  // 序号守卫：每次操作分配自增序号，异步迟到失败比对序号非最新则丢弃——
-  // 防止快速连点时旧操作的 .catch 在新操作清错之后执行，把 saveError 写回与后端真相背离的旧提示。
-  const saveSeqRef = useRef(0);
+  // 序号守卫（D1 修复）：配置保存与授权切换使用两个独立计数器分桶——此前共用单一
+  // saveSeqRef 时，任一在途请求都会让另一类操作的迟到回调被判「非最新」而静默丢弃，
+  // 授权失败分支（降级离线记忆）被跳过 → UI 与后端授权真相背离且无提示。
+  const settingsSeqRef = useRef(0);
+  const authSeqRef = useRef(0);
   const handleProviderChange = (next: string) => {
     setProvider(next);
     if (CLOUD_PROVIDERS.includes(next)) {
-      const seq = ++saveSeqRef.current;
+      const seq = ++settingsSeqRef.current;
       setSaveError(null);
+      setCustomHint(null);
       void updateSettings({ cloud: { provider: next } }).catch(() => {
-        if (seq !== saveSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
+        if (seq !== settingsSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
         setSaveError('云端提供商没保存上…待会儿再动一下就好啦');
       });
+    } else {
+      // 选中白名单外的自定义 provider（后端既有值）：不支持在线保存，显式提示而非静默跳过（D8）
+      setSaveError(null);
+      setCustomHint('当前为自定义提供商，暂不支持在线修改；如需切换请选择列表中的提供商');
     }
   };
   const handleLocalModeChange = (next: boolean) => {
     setLocalMode(next);
-    const seq = ++saveSeqRef.current;
+    const seq = ++settingsSeqRef.current;
     setSaveError(null);
+    setCustomHint(null);
     void updateSettings({ local_llm: { enabled: next } }).catch(() => {
-      if (seq !== saveSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
+      if (seq !== settingsSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
       setSaveError('本地模式开关没保存上…待会儿再拨一次就好啦');
     });
   };
   const handleVoiceChange = (next: string) => {
     setVoice(next);
-    const seq = ++saveSeqRef.current;
-    setSaveError(null);
-    void updateSettings({ tts: { voice: next } }).catch(() => {
-      if (seq !== saveSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
-      setSaveError('音色设置没保存上…待会儿再选一次就好啦');
-    });
+    if (VOICE_OPTIONS.includes(next)) {
+      const seq = ++settingsSeqRef.current;
+      setSaveError(null);
+      setCustomHint(null);
+      void updateSettings({ tts: { voice: next } }).catch(() => {
+        if (seq !== settingsSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
+        setSaveError('音色设置没保存上…待会儿再选一次就好啦');
+      });
+    } else {
+      // 选中后端自定义音色：不支持在线保存，显式提示而非静默跳过（D8）
+      setSaveError(null);
+      setCustomHint('当前为后端自定义音色，暂不支持在线修改；如需切换请选择列表中的音色');
+    }
   };
 
   // 切换授权：在线走 POST authorize；离线/失败则本地记忆。
   // F-8（第三轮体检批次6）：补序号守卫（F3 修复未覆盖此处）——快速连点时
   // 并发 POST 响应可乱序，迟到的旧响应不得把 UI 拉回与后端真相背离的状态。
+  // D1（第四轮体检批次D）：改用独立 authSeqRef 计数桶，与配置保存互不干扰。
   const handleControlAuthChange = async (next: boolean) => {
     setControlAuth(next);
-    const seq = ++saveSeqRef.current;
+    const seq = ++authSeqRef.current;
     if (computerOnline) {
       try {
         const st = await setComputerAuthorized(next);
-        if (seq !== saveSeqRef.current) return; // 已有更新的操作接管，丢弃迟到响应
+        if (seq !== authSeqRef.current) return; // 已有更新的操作接管，丢弃迟到响应
         setControlAuth(st.authorized);
         setConfirmDangerous(st.confirm_dangerous);
         writeLsBool(LS_AUTH_KEY, st.authorized);
         writeLsBool(LS_CONFIRM_KEY, st.confirm_dangerous);
       } catch {
-        if (seq !== saveSeqRef.current) return; // 同上：迟到失败丢弃
+        if (seq !== authSeqRef.current) return; // 同上：迟到失败丢弃
         // 后端请求失败：降到本地记忆交互
         setComputerOnline(false);
         writeLsBool(LS_AUTH_KEY, next);
@@ -212,6 +234,11 @@ export default function SettingsPage() {
       {/* 配置项保存失败的轻量内联提示 */}
       {saveError && (
         <p className="-mt-1 mb-2 text-xs font-medium text-[var(--color-error)]">{saveError}</p>
+      )}
+
+      {/* 自定义 provider / voice 选中时的非阻断提示（不支持在线修改） */}
+      {customHint && (
+        <p className="-mt-1 mb-2 text-xs text-[var(--text-secondary)]">{customHint}</p>
       )}
 
       <div className="flex max-w-2xl flex-col gap-4">
@@ -292,6 +319,7 @@ export default function SettingsPage() {
               <option value="ling">灵灵（温柔）</option>
               <option value="gulu">咕噜（元气）</option>
               <option value="momo">默默（低沉）</option>
+              {extraVoice && <option value={extraVoice}>{extraVoice}（当前值）</option>}
             </select>
           </div>
         </GlassCard>

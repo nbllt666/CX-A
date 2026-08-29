@@ -224,3 +224,29 @@ def test_voice_manager_exported():
 
     assert hasattr(audio, "VoiceManager")
     assert audio.VoiceManager is VoiceManager
+
+
+# ------------------------------------------------------------------ #
+# 7. 第四轮体检批次C：任意位置冒号（NTFS ADS）拦截                      #
+# ------------------------------------------------------------------ #
+
+def test_is_unsafe_voice_id_rejects_ads_colon():
+    """第四轮体检批次C：任意位置的冒号（含 NTFS ADS 形态 a:b）一律判非法。"""
+    from lite.audio.voice_manager import is_unsafe_voice_id
+
+    assert is_unsafe_voice_id("a:b") is True
+    assert is_unsafe_voice_id("ab:cd") is True
+    assert is_unsafe_voice_id(":lead") is True
+    assert is_unsafe_voice_id("trail:") is True
+    # 正常音色 id 不受影响
+    assert is_unsafe_voice_id("cx-open") is False
+    assert is_unsafe_voice_id("custom_a") is False
+
+
+def test_resolve_voice_rejects_midfix_colon_ads(tmp_path):
+    """中缀冒号 id（NTFS ADS 形态 a:b）经 resolve_voice 同样拒绝返回 None。"""
+    voices = tmp_path / "voices"
+    _make_voice(voices, "cx-open", "model.pth")
+    vm = VoiceManager(voices_dir=str(voices))
+    assert vm.resolve_voice("a:b") is None
+    assert vm.resolve_voice("cx-open") == str(voices / "cx-open")

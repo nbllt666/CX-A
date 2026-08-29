@@ -214,3 +214,70 @@ def test_list_and_get_parse_consistently(store):
     store.add({"type": "long_term", "content": "a", "tags": ["t1"]})
     rows = store.list(type="long_term")
     assert [r["tags"] for r in rows] == [["t1"]]
+
+
+# ---------------------------------------------------------------- 检索组合索引（中-1a，第四轮体检批次B）
+def test_agent_index_created_with_table(store):
+    """建表时同步创建 agent_id+is_deleted 组合索引（检索链免全表扫描）。"""
+    conn = store._connect()
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_agent'"
+    ).fetchone()
+    assert row is not None
+
+
+def test_agent_index_rebuilt_on_legacy_db(store):
+    """既有库升级路径：无索引旧库经 _ensure_table 幂等补建索引。"""
+    conn = store._connect()
+    conn.execute("DROP INDEX idx_memories_agent")
+    conn.commit()
+    store._index_ready = False  # 模拟升级前实例状态
+    store.list()  # 任一读写入口都会触发 _ensure_table
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_agent'"
+    ).fetchone()
+    assert row is not None
+
+
+# ---------------------------------------------------------------- 有界最近查询（中-1c）
+def test_list_recent_desc_bounded(store):
+    """list_recent 按 id 降序返回最近 limit 条（供写入口相似判定有界扫描）。"""
+    for i in range(6):
+        store.add({"type": "long_term", "content": f"m{i}"})
+    rows = store.list_recent(limit=4)
+    assert [r["content"] for r in rows] == ["m5", "m4", "m3", "m2"]
+
+
+def test_list_recent_agent_filter_excludes_deleted(store):
+    """list_recent 与 list 过滤语义一致：agent 过滤 + 默认排除软删除。"""
+    a1 = store.add({"type": "long_term", "content": "a1", "agent_id": "x"})
+    store.add({"type": "long_term", "content": "a2", "agent_id": "x"})
+    store.add({"type": "long_term", "content": "b1", "agent_id": "y"})
+    store.soft_delete(a1)
+    rows = store.list_recent(agent_id="x", limit=10)
+    assert [r["content"] for r in rows] == ["a2"]
+
+
+# ---------------------------------------------------------------- update 未知键（低-10）
+def test_update_all_unknown_keys_returns_zero_without_touch(store, caplog):
+    """全为未知键：返回 0 且不再空刷新 updated_at（消除 rowcount 误导）。"""
+    import logging as _logging
+
+    mid = store.add({"type": "short_term", "content": "a"})
+    before = store.get(mid)["updated_at"]
+    with caplog.at_level(_logging.WARNING, logger="lite.memory.storage"):
+        assert store.update(mid, {"hacker_field": "x"}) == 0
+    assert store.get(mid)["updated_at"] == before
+    assert "hacker_field" in caplog.text
+
+
+def test_update_partial_unknown_keys_warn_and_apply(store, caplog):
+    """部分未知键：合法键照常生效，被忽略键名写入告警日志。"""
+    import logging as _logging
+
+    mid = store.add({"type": "short_term", "content": "a"})
+    with caplog.at_level(_logging.WARNING, logger="lite.memory.storage"):
+        rows = store.update(mid, {"content": "b", "bogus_key": 1})
+    assert rows == 1
+    assert store.get(mid)["content"] == "b"
+    assert "bogus_key" in caplog.text

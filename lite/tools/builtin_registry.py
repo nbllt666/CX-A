@@ -50,6 +50,27 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 #: 原生日志记录器
 LOGGER = logging.getLogger(__name__)
 
+#: 进程启动时刻（monotonic 基准，批次A 第四轮体检）：system_info 的
+#: ``uptime_seconds`` = 当前 monotonic - 本时刻（进程运行秒数）。
+#: 修复前直接返回 ``time.monotonic()``——那是开机以来秒数，语义错误。
+_STARTED_AT = time.monotonic()
+
+#: agent_id 限长上限（与 lite/server/api_server.py 的 ``_MAX_AGENT_ID_CHARS`` 一致）
+_MAX_AGENT_ID_CHARS = 100
+
+
+def _sanitize_agent_id(raw: Any) -> str:
+    """规范化 agent_id（批次A 第四轮体检）：strip + 限长，空值回落 default。
+
+    与 ``api_server._sanitize_agent_id`` 口径保持一致（L-5），修复前
+    memory_write 工具侧未做任何清洗，与 API 侧口径不一致。
+
+    :param raw: 原始 agent_id（任意类型，None / 空串回落 "default"）
+    :return: 清洗后的 agent_id（最长 :data:`_MAX_AGENT_ID_CHARS` 字符）
+    """
+    return (str(raw or "").strip()[:_MAX_AGENT_ID_CHARS]) or "default"
+
+
 #: 内置工具来源标识
 SOURCE_BUILTIN = "builtin"
 
@@ -414,7 +435,8 @@ class BuiltinToolRegistry:
                         content=content,
                         type=mem_type,
                         importance=importance,
-                        agent_id=args.get("agent_id", "default"),
+                        # 批次A：agent_id 与 api_server 口径一致（strip + 限长 + 空值回落 default）
+                        agent_id=_sanitize_agent_id(args.get("agent_id")),
                         tags=tags,
                     )
                     if mem_id is None:
@@ -456,14 +478,37 @@ class BuiltinToolRegistry:
         def handler(arguments: Dict[str, Any]) -> Dict[str, Any]:
             args = arguments or {}
             query = args.get("query", "")
-            top_k = args.get("top_k")
+
+            # 批次A（第四轮体检）：top_k 统一校验——非法值（含内部细节的
+            # int() 异常）与负值（修复前不截断直接返回全量）一律返回 400 语义
+            # 的 error outcome，不抛、不透出内部异常文本。
+            top_k = None
+            if args.get("top_k") is not None:
+                try:
+                    top_k = int(args.get("top_k"))
+                except (TypeError, ValueError):
+                    return {
+                        "success": False,
+                        "tool": "memory_search",
+                        "authorized": True,
+                        "error": "参数非法：top_k 必须为整数",
+                        "result": None,
+                    }
+                if top_k < 0:
+                    return {
+                        "success": False,
+                        "tool": "memory_search",
+                        "authorized": True,
+                        "error": "参数非法：top_k 不能为负数",
+                        "result": None,
+                    }
 
             # 优先走完整检索管线（向量 + 关键词 + 打分 + 注入上下文）
             if self.pipeline is not None:
                 try:
                     kw = {"query": query}
                     if top_k is not None:
-                        kw["top_k"] = int(top_k)
+                        kw["top_k"] = top_k
                     result = self.pipeline.retrieve(**kw)
                 except Exception as exc:  # noqa: BLE001 - 异常包装返回
                     return {
@@ -507,9 +552,10 @@ class BuiltinToolRegistry:
                 else:
                     # query 为空：返回最近 limit 条（store.list 按 id 升序，取尾部即最新）
                     hits = list(memories)
-                if top_k is not None and int(top_k) > 0:
+                if top_k is not None and top_k > 0:
+                    # 批次A：top_k 已在入口统一校验（负值被拒），此处只处理正值截断
                     # query 非空：按相关度序取前 N；query 为空：取尾部 N 条（最新）
-                    hits = hits[: int(top_k)] if q else hits[-int(top_k):]
+                    hits = hits[:top_k] if q else hits[-top_k:]
                 return {
                     "success": True,
                     "tool": "memory_search",
@@ -573,7 +619,9 @@ class BuiltinToolRegistry:
                         "status": "ok",
                         "app": "CX-A/CX-Lite",
                         "pid": os.getpid(),
-                        "uptime_seconds": time.monotonic(),
+                        # 批次A（第四轮体检）：返回进程运行秒数（monotonic 差值），
+                        # 修复前直接返回 time.monotonic()（开机以来秒数，语义错误）
+                        "uptime_seconds": max(0.0, time.monotonic() - _STARTED_AT),
                     },
                 }
 

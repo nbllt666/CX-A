@@ -327,7 +327,8 @@ def test_options_preflight_204_with_cors_headers(api_server):
         assert resp.read() == b""  # 空 body（Content-Length: 0）
         assert resp.headers.get("Access-Control-Allow-Origin") == "http://localhost:5173"
         assert resp.headers.get("Access-Control-Allow-Methods") == "GET, POST, PUT, DELETE, OPTIONS"
-        assert resp.headers.get("Access-Control-Allow-Headers") == "Content-Type"
+        # 中-3（第四轮体检批次B）：预检允许头补 X-Client-Token，与令牌闸一致
+        assert resp.headers.get("Access-Control-Allow-Headers") == "Content-Type, X-Client-Token"
 
 
 def test_cors_headers_echo_allowlisted_origin_only(api_server):
@@ -366,15 +367,26 @@ def test_settings_invalid_section_type_400(api_server):
     assert body["error"] == "invalid section type: cloud"
 
 
-def test_delete_memory_huge_id_returns_structured_500(api_server):
-    """超大数字 id 触发 sqlite OverflowError 时兜底为结构化 500（而非连接中断）。"""
+def test_delete_memory_huge_id_returns_400(api_server):
+    """低-6：超出 64 位整数范围的记忆 id 边界处显式 400，不再触发 OverflowError → 500。"""
     _store, _pipeline, base = api_server
     huge_id = "9" * 30
     status, body = http_delete(f"{base}/api/memories/{huge_id}")
-    assert status == 500
-    assert body["error"] == "internal error"
-    assert isinstance(body.get("detail"), str)
-    assert len(body["detail"]) <= 200
+    assert status == 400
+    assert body["ok"] is False
+    assert body["error"] == "bad_request"
+
+
+def test_delete_memory_int64_boundary_ids(api_server):
+    """低-6 边界：int64 上界（合法但不存在）→ 404；上界+1 与下界-1（超界）→ 400。"""
+    _store, _pipeline, base = api_server
+    status, _body = http_delete(f"{base}/api/memories/9223372036854775807")
+    assert status == 404
+    status2, body2 = http_delete(f"{base}/api/memories/9223372036854775808")
+    assert status2 == 400
+    assert body2["error"] == "bad_request"
+    status3, _body3 = http_delete(f"{base}/api/memories/-9223372036854775809")
+    assert status3 == 400
 
 
 def test_post_wrong_content_type_400(api_server):
@@ -940,3 +952,179 @@ def test_agents_update_unknown_fields_ignored(api_server):
     assert status == 200
     assert updated["name"] == "A2"
     assert "hacker_field" not in updated
+
+
+# ---------------------------------------------------------------- 低-5/低-7/中-4（第四轮体检批次B）
+def test_internal_error_sanitized_no_detail_leak(api_server, monkeypatch, caplog):
+    """低-5：兜底 500 对外只回错误码与异常类别名（detail=类名），完整异常仅写日志。"""
+    import logging as _logging
+
+    _store, pipeline, base = api_server
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("机密内部信息 secret-internal-detail")
+
+    monkeypatch.setattr(pipeline, "retrieve", _boom)
+    with caplog.at_level(_logging.ERROR, logger="lite.server.api_server"):
+        status, body = http_get_json(f"{base}/api/memories/search?" + urlencode({"q": "x"}))
+    assert status == 500
+    assert body["error"] == "internal error"
+    assert body["detail"] == "RuntimeError"
+    assert "secret-internal-detail" not in json.dumps(body)
+    assert "secret-internal-detail" in caplog.text
+
+
+class _LeakRegistry:
+    """注册表桩：call 返回 success=False 且 error 携带内部异常文本（模拟 registry 包装 str(exc)）。"""
+
+    def list_tools(self):
+        return [
+            {
+                "id": "boom_tool",
+                "name": "boom_tool",
+                "description": "测试桩工具",
+                "source": "builtin",
+                "category": "test",
+                "enabled": True,
+            }
+        ]
+
+    def call(self, tool_id, arguments=None):
+        return {
+            "success": False,
+            "tool": tool_id,
+            "authorized": True,
+            "error": "RuntimeError: 机密内部细节 secret-tool-detail",
+            "result": None,
+        }
+
+
+def test_tools_call_failure_message_sanitized(tmp_path, caplog):
+    """低-5：tools/call 失败分支对外只回固定类别摘要，完整内部错误仅写日志。"""
+    import logging as _logging
+
+    store, pipeline, manager, _remote = build_deps(data_dir=str(tmp_path))
+    handler = make_handler(store, pipeline, manager, registry=_LeakRegistry())
+    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    port = httpd.server_address[1]
+    base = f"http://127.0.0.1:{port}"
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with caplog.at_level(_logging.WARNING, logger="lite.server.api_server"):
+            status, body = http_post(f"{base}/api/tools/call", {"name": "boom_tool", "arguments": {}})
+        assert status == 400
+        assert body["error"] == "tool_failed"
+        assert body["message"] == "工具执行失败"
+        assert "secret-tool-detail" not in json.dumps(body)
+        assert "secret-tool-detail" in caplog.text
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_top_k_zero_accepted_returns_200(api_server):
+    """低-7：top_k=0 为显式取值（管线内钳为候选 1），API 层正常返回 200。"""
+    _store, pipeline, base = api_server
+    pipeline.add("topk zero probe content")
+    status, body, _raw = http_get(
+        f"{base}/api/memories/search?" + urlencode({"q": "probe", "top_k": "0"})
+    )
+    assert status == 200
+    assert "memories" in body
+
+
+class _FakeImmediateServer:
+    """serve_forever 立即以 KeyboardInterrupt 返回的假服务器（验证 main 放行路径用）。"""
+
+    def serve_forever(self):
+        raise KeyboardInterrupt
+
+    def server_close(self):
+        pass
+
+
+def test_main_refuses_non_loopback_without_token(monkeypatch, capsys):
+    """中-4：-h 0.0.0.0 且未配置 CXA_API_TOKEN → 默认拒绝启动并输出中文错误提示。"""
+    monkeypatch.delenv("CXA_API_TOKEN", raising=False)
+    monkeypatch.delenv("CXA_ALLOW_UNSAFE", raising=False)
+
+    def _no_server(**_kwargs):
+        raise AssertionError("拒绝启动路径不应创建服务器")
+
+    monkeypatch.setattr(api_server_module, "create_server", _no_server)
+    with pytest.raises(SystemExit):
+        api_server_module.main(["-h", "0.0.0.0", "-p", "8600"])
+    out = capsys.readouterr().out
+    assert "拒绝启动" in out
+    assert "CXA_API_TOKEN" in out
+
+
+def test_main_allows_unsafe_non_loopback_with_banner(monkeypatch, capsys):
+    """中-4：CXA_ALLOW_UNSAFE=1 显式放行非回环监听，并打印醒目风险横幅。"""
+    monkeypatch.delenv("CXA_API_TOKEN", raising=False)
+    monkeypatch.setenv("CXA_ALLOW_UNSAFE", "1")
+    monkeypatch.setattr(
+        api_server_module, "create_server", lambda **_kwargs: _FakeImmediateServer()
+    )
+    api_server_module.main(["-h", "0.0.0.0", "-p", "8600"])
+    out = capsys.readouterr().out
+    assert "安全警告" in out
+    assert "CXA_ALLOW_UNSAFE" in out
+
+
+def test_main_allows_non_loopback_with_token(monkeypatch, capsys):
+    """中-4：已配置 CXA_API_TOKEN 时非回环监听放行（令牌闸兜底）。"""
+    monkeypatch.setenv("CXA_API_TOKEN", "unit-test-token")
+    monkeypatch.delenv("CXA_ALLOW_UNSAFE", raising=False)
+    monkeypatch.setattr(
+        api_server_module, "create_server", lambda **_kwargs: _FakeImmediateServer()
+    )
+    api_server_module.main(["-h", "0.0.0.0", "-p", "8600"])
+    out = capsys.readouterr().out
+    assert "已启动" in out
+
+
+def test_main_loopback_default_unaffected(monkeypatch, capsys):
+    """中-4：默认回环监听不触发安全闸（既有行为保持）。"""
+    monkeypatch.delenv("CXA_API_TOKEN", raising=False)
+    monkeypatch.delenv("CXA_ALLOW_UNSAFE", raising=False)
+    monkeypatch.setattr(
+        api_server_module, "create_server", lambda **_kwargs: _FakeImmediateServer()
+    )
+    api_server_module.main(["-p", "8600"])
+    out = capsys.readouterr().out
+    assert "已启动" in out
+    assert "拒绝启动" not in out
+
+
+# ---------------------------------------------------------------- 第四轮体检批次E：向量库降级透明化
+def test_build_deps_lancedb_degrade_warning(tmp_path, monkeypatch, caplog):
+    """批次E：配置 vector.backend=lancedb 但依赖不可用时，中文告警且 InMemory 兜底不变。
+
+    monkeypatch importlib.util.find_spec 使 "lancedb" 探测为缺失（对应 frozen
+    产物 excludes lancedb 形态），验证 build_deps 降级路径：告警可见 +
+    InMemoryVectorStore 兜底不变。
+    """
+    import importlib.util
+    import logging
+
+    from lite.memory.vector_store import InMemoryVectorStore
+
+    real_find_spec = importlib.util.find_spec
+
+    def _fake_find_spec(name, *args, **kwargs):
+        # 仅模拟 lancedb 缺失，其余模块探测走真实实现
+        if name == "lancedb":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec)
+    with caplog.at_level(logging.WARNING, logger="lite.server.api_server"):
+        _store, pipeline, _manager, _remote = build_deps(data_dir=str(tmp_path))
+
+    # 中文降级告警已发出（不再静默降级）
+    assert any("已降级为内存向量库" in rec.getMessage() for rec in caplog.records)
+    # 兜底不变：装配仍为内存向量库
+    assert isinstance(pipeline.vector_store, InMemoryVectorStore)

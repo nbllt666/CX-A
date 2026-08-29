@@ -24,15 +24,18 @@ from lite.config.config_manager import ConfigManager
 #: 默认音色标识（依赖 MeloTTS 官方模型，首次使用联网自动下载；自定义包放 data/voices/）
 DEFAULT_VOICE_ID = "cx-open"
 
-#: 音色 id 路径穿越特征：盘符前缀或含任意路径分隔符（L13）
-_VOICE_ID_TRAVERSAL_RE = re.compile(r"^[A-Za-z]:|[\\/]")
+#: 音色 id 路径穿越特征：任意位置的盘符模式（含 NTFS ADS 中缀冒号 ``a:b``）或
+#: 任意路径分隔符（L13；第四轮体检批次C：原 ``^[A-Za-z]:`` 仅行首锚定，
+#: 中缀冒号可绕过，现改为任意位置匹配 + 显式任意冒号拦截）
+_VOICE_ID_TRAVERSAL_RE = re.compile(r"[A-Za-z]:|[\\/]")
 
 
 def is_unsafe_voice_id(voice_id) -> bool:
     """判定音色 id 是否含路径穿越特征（L13；第三轮体检批次3 升为公开接口）。
 
-    包含 ``/``、``\\``、``..`` 或盘符模式（如 ``C:``）任一即视为非法：
-    此类 id 可能逃逸 ``data/voices/`` 根目录读写任意位置。
+    包含 ``/``、``\\``、``..``、任意位置盘符模式（如 ``C:``、NTFS ADS 形态
+    ``a:b``）或任意冒号（第四轮体检批次C）任一即视为非法：
+    此类 id 可能逃逸 ``data/voices/`` 根目录读写任意位置（含 NTFS 备用数据流）。
     tts.MeloTTSBackend 的 ``_voice_path`` 亦以本函数为统一校验入口（H-2）。
 
     :param voice_id: 待检音色 id（str）
@@ -40,7 +43,7 @@ def is_unsafe_voice_id(voice_id) -> bool:
     """
     if not isinstance(voice_id, str) or not voice_id:
         return False
-    if _VOICE_ID_TRAVERSAL_RE.search(voice_id):
+    if ":" in voice_id or _VOICE_ID_TRAVERSAL_RE.search(voice_id):
         return True
     return ".." in voice_id
 

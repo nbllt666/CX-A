@@ -22,6 +22,7 @@
 
 import importlib
 import os
+import re
 
 from lite.memory.embedding import EmbeddingProvider
 
@@ -43,8 +44,15 @@ JUDGE_MAX_TOKENS = 8
 #: n_ctx 预算中为响应/安全保留的余量 token 数（M11 溢出防护）
 N_CTX_RESERVE_TOKENS = 64
 
-#: prompt 长度估算比例：约 4 字符 ≈ 1 token
+#: prompt 长度估算比例：非 CJK 字符约 4 字符 ≈ 1 token（历史口径，仅对 ASCII 成立）
 _CHARS_PER_TOKEN = 4
+
+#: CJK 字符 token 估算：每字符 ≈ 0.75 token（约 1.3 字符/token，第四轮体检批次C：
+#: 原统一 4 字符/token 口径对中文低估 3-4 倍，n_ctx 溢出防护失效）
+_TOKENS_PER_CJK_CHAR = 0.75
+
+#: CJK 表意字符判定（含扩展 A 区与兼容表意区）
+_CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 #: GPU 卸载层数——device="cpu" 且未显式配置 n_gpu_layers 时使用（0 = 全部层驻留 CPU）
 GPU_LAYERS_CPU = 0
@@ -89,6 +97,47 @@ def _import_llama():
             "llama_cpp 模块中不存在 Llama 类，请确认 llama-cpp-python 安装完整。"
         )
     return llama_cls
+
+
+def _estimate_prompt_tokens(text) -> float:
+    """按 CJK 字符占比动态折算 prompt 的 token 估算值（第四轮体检批次C）。
+
+    原口径 ``len(prompt) / 4`` 对中文低估 3-4 倍（中文约 1.3 字符/token），
+    长中文 prompt 的 n_ctx 溢出防护失效。现按字符构成折算：
+
+    ``tokens ≈ (n - c) / 4 + c * 0.75``
+
+    其中 n 为总字符数、c 为 CJK 表意字符数（即非 CJK 按 4 字符/token、
+    CJK 按 0.75 token/字符）。估算值随文本长度单调不减。
+
+    :param text: 待估算文本（str；非 str 先 str() 化）
+    :return: token 估算值（float）
+    """
+    text = str(text or "")
+    total = len(text)
+    if total == 0:
+        return 0.0
+    cjk = len(_CJK_CHAR_RE.findall(text))
+    return (total - cjk) / _CHARS_PER_TOKEN + cjk * _TOKENS_PER_CJK_CHAR
+
+
+def _clip_text_to_token_budget(text, budget_tokens) -> str:
+    """把文本硬截断到 token 估算预算内（尾部截断）。
+
+    估算随长度单调，先按比例一次截到位；若前缀构成与整体不同导致仍超预算，
+    逐字符回退兜底，保证返回值估算不超 ``budget_tokens``。
+
+    :param text: 待截断文本
+    :param budget_tokens: token 估算预算上限
+    :return: 截断后的文本（估算值 <= 预算）
+    """
+    est = _estimate_prompt_tokens(text)
+    if est <= budget_tokens:
+        return text
+    cut = max(1, int(len(text) * budget_tokens / est))
+    while cut > 1 and _estimate_prompt_tokens(text[:cut]) > budget_tokens:
+        cut -= 1
+    return text[:cut]
 
 
 class LlamaRuntime:
@@ -353,33 +402,36 @@ class LlamaRuntime:
     # 本地小 LLM：判定 + 离线兜底                                        #
     # ------------------------------------------------------------------ #
 
-    def _max_prompt_chars(self, max_tokens):
-        """按 4 chars≈1token 估算的 prompt 字符预算。
+    def _token_budget(self, max_tokens):
+        """本次生成的可用 prompt token 预算（M11 + 第四轮体检批次C）。
 
-        预算公式：``(n_ctx - max_tokens - 64余量) * 4``；保证至少留出可用空间。
+        预算公式：``n_ctx - max_tokens - 64余量``（token 数）；保证至少留出
+        可用空间。预算判断统一使用 :func:`_estimate_prompt_tokens` 的 CJK
+        占比动态折算估算，不再使用对中文失真的字符数近似。
         """
-        usable = int(self._n_ctx) - int(max_tokens) - N_CTX_RESERVE_TOKENS
-        return max(int(usable), 1) * _CHARS_PER_TOKEN
+        return max(int(self._n_ctx) - int(max_tokens) - N_CTX_RESERVE_TOKENS, 1)
 
     def _fit_prompt(self, prompt, max_tokens, messages=None):
-        """投递前的 n_ctx 溢出防护（M11）。
+        """投递前的 n_ctx 溢出防护（M11 + 第四轮体检批次C CJK 折算）。
 
         规则：
-        - 按 ``4 chars ≈ 1 token`` 估算，预算 = ``(n_ctx - max_tokens - 64余量) * 4``；
+        - token 估算按 CJK 字符占比动态折算：
+          ``tokens ≈ (n-c)/4 + c*0.75``（CJK 约 1.3 字符/token，纯 ASCII 约
+          4 字符/token），预算 = ``n_ctx - max_tokens - 64余量``（token 数）；
         - 未超限原样返回；
         - 超限且提供 ``messages``：按**消息列表**从最旧侧删减重建
           （保底全部 system 行 + 最近一轮），重建后仍未落地则继续行级兜底；
         - 行级兜底：拆行后保护头部连续 ``system`` 行，从最旧侧删减、最近一行恒留，
-          重算仍超限（单条/system 即爆）则硬截断 prompt 尾部到预算内。
+          重算仍超限（单条/system 即爆）则硬截断 prompt 尾部到 token 预算内。
 
         :param prompt: 待投递的提示词文本
         :param max_tokens: 本次生成的最大 token 数（用于预算计算）
         :param messages: 生成 ``prompt`` 的原始消息列表（可选）；提供时启用消息级删减
-        :return: 裁剪后的提示词（长度 <= 预算）
+        :return: 裁剪后的提示词（token 估算 <= 预算）
         """
         prompt = str(prompt)
-        limit = self._max_prompt_chars(max_tokens)
-        if len(prompt) <= limit:
+        budget = self._token_budget(max_tokens)
+        if _estimate_prompt_tokens(prompt) <= budget:
             return prompt
 
         if messages:
@@ -392,7 +444,7 @@ class LlamaRuntime:
             if isinstance(recent, dict) and all(recent is not m for m in system_msgs):
                 system_msgs.append(recent)
             rebuilt = self._format_messages(system_msgs)
-            if len(rebuilt) <= limit:
+            if _estimate_prompt_tokens(rebuilt) <= budget:
                 return rebuilt
             prompt = rebuilt  # 仍超限 -> 继续行级兜底
 
@@ -404,12 +456,11 @@ class LlamaRuntime:
             header.append(lines[idx])
             idx += 1
         body = lines[idx:]
-        while len(body) > 1 and len("\n".join(header + body)) > limit:
+        while len(body) > 1 and _estimate_prompt_tokens("\n".join(header + body)) > budget:
             body.pop(0)  # 从最旧侧删减；body[-1]（最近一轮）恒保留
         fitted = "\n".join(header + body)
-        if len(fitted) > limit:
-            fitted = fitted[:limit]  # 硬截断尾部兜底
-        return fitted
+        # 硬截断尾部兜底：按 token 估算截到预算内
+        return _clip_text_to_token_budget(fitted, budget)
 
     def judge_should_reply(self, user_text) -> bool:
         """本地小 LLM 判定：用户是否在对本助手说话、是否应当回复。

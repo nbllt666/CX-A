@@ -27,6 +27,7 @@ RemoteDisabled；远端不可达（超时 / 连接失败）抛 RemoteUnreachable
     不影响本期局域网既有行为。
 """
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -213,7 +214,15 @@ class RemoteController:
             except (OSError, json.JSONDecodeError):
                 payload = {"status": exc.code, "reason": exc.reason}
             raise RemoteError(f"远端 {method} {url} 返回非 2xx（{exc.code}）: {payload}") from exc
-        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            OSError,
+            TimeoutError,
+        ) as exc:
+            # 第四轮体检批次C：补捕 http.client.HTTPException——响应中途的
+            # IncompleteRead / BadStatusLine（网关 504/502 常见形态）此前会穿透
+            # RemoteUnreachable 统一映射，API 层 504 语义失效
             raise RemoteUnreachable(f"远端 {method} {url} 不可达: {exc}") from exc
 
     # ------------------------------------------------------------------ #

@@ -27,6 +27,59 @@ _LEVEL_ORDER = {"short_term": 0, "long_term": 1, "permanent": 2}
 # 文本相似去重阈值（对齐 CX-O DeduplicationEngine.threshold=0.85）
 DEDUP_THRESHOLD = 0.85
 
+# 写入口相似判定的有界扫描上限（中-1c，第四轮体检批次B）：
+# _find_similar 仅取最近 N 条做相似判定，避免每次写入对全 agent 全表扫描
+FIND_SIMILAR_SCAN_LIMIT = 500
+
+
+def tokenize_text(text) -> set:
+    """共享分词：CJK 连续段取相邻两字 bigram，ASCII 拉丁/数字连续段取整词小写。
+
+    中-2（第四轮体检批次B）：manager 与 pipeline 原先各自用 ``lower().split()``
+    空白切分，中文整句落为单 token——写入口去重恒不命中、keyword_score 恒 0。
+    统一收敛为本实现（pipeline 顶层导入本函数，单份实现避免重复；不引入
+    jieba 等新依赖）。规则：
+
+    - 连续 ASCII 字母/数字 -> 整词小写（与原空白切分对英文的行为一致）；
+    - 连续 CJK（U+4E00–U+9FFF）段长度 >=2 -> 相邻两字 bigram；单字成段 -> 该字本身；
+    - 其余字符（空白/标点/其他符号）视作分隔符。
+
+    Returns:
+        set[str]: token 集合（空输入返回空集）。
+    """
+    tokens = set()
+    if text is None:
+        return tokens
+    word_buf = []
+    cjk_buf = []
+
+    def _flush_word():
+        if word_buf:
+            tokens.add("".join(word_buf))
+            word_buf.clear()
+
+    def _flush_cjk():
+        if len(cjk_buf) >= 2:
+            for i in range(len(cjk_buf) - 1):
+                tokens.add(cjk_buf[i] + cjk_buf[i + 1])
+        elif len(cjk_buf) == 1:
+            tokens.add(cjk_buf[0])
+        cjk_buf.clear()
+
+    for ch in str(text).lower():
+        if ch.isascii() and ch.isalnum():
+            _flush_cjk()
+            word_buf.append(ch)
+        elif "\u4e00" <= ch <= "\u9fff":
+            _flush_word()
+            cjk_buf.append(ch)
+        else:
+            _flush_word()
+            _flush_cjk()
+    _flush_word()
+    _flush_cjk()
+    return tokens
+
 
 class MemoryManager:
     """记忆管理器门面：存储 + 衰减 + 三维打分 + 去重 + 分层升降级。"""
@@ -63,11 +116,15 @@ class MemoryManager:
     # -------------------------------------------------------- 工具
     @staticmethod
     def _text_similarity(text1, text2) -> float:
-        """两个文本的 Jaccard 相似度（对齐 CX-O deduplication._calculate_text_similarity）。"""
+        """两个文本的 Jaccard 相似度（对齐 CX-O deduplication._calculate_text_similarity）。
+
+        分词统一走共享 tokenize_text（中-2：中文 bigram + 拉丁整词），
+        修复中文整句单 token 导致的相似度恒 0、去重恒不命中问题。
+        """
         if not text1 or not text2:
             return 0.0
-        set1 = set(text1.lower().split())
-        set2 = set(text2.lower().split())
+        set1 = tokenize_text(text1)
+        set2 = tokenize_text(text2)
         if not set1 or not set2:
             return 0.0
         inter = len(set1 & set2)
@@ -75,8 +132,13 @@ class MemoryManager:
         return inter / union if union else 0.0
 
     def _find_similar(self, content, agent_id):
-        """在同 agent 下查找与 content 相似度达阈值的已有记忆，命中返回 (id, 相似度)。"""
-        for mem in self.store.list(agent_id=agent_id, include_deleted=False):
+        """在同 agent 下查找与 content 相似度达阈值的已有记忆，命中返回 (id, 相似度)。
+
+        中-1c（第四轮体检批次B）：改用 storage.list_recent 有界扫描——仅取
+        最近 FIND_SIMILAR_SCAN_LIMIT 条（id 降序）做相似判定，不再每次写入
+        全 agent 全表扫描。
+        """
+        for mem in self.store.list_recent(agent_id=agent_id, limit=FIND_SIMILAR_SCAN_LIMIT):
             sim = self._text_similarity(content, mem.get("content", ""))
             if sim >= self.dedup_threshold:
                 return mem["id"], sim
@@ -306,7 +368,9 @@ class MemoryManager:
             _decay_calculator=self.decay,
         )
 
-        deduped = self._dedup_retrieved(scored)
+        # 中-1b（第四轮体检批次B）：先截断再去重——只对最终 top 候选两两比较，
+        # 去重后不足 max_memories 不再回捞（保持简单），避免全量候选 O(N²) 比较
+        deduped = self._dedup_retrieved(scored[: max(0, int(max_memories))])
 
         if min_score is not None:
             deduped = [m for m in deduped if m.get("final_score", 0) >= min_score]

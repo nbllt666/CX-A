@@ -322,12 +322,51 @@ def assemble(electron_dist, backend_dist, portable_root):
     return portable_root
 
 
+def _bundled_data_whitelist():
+    """从 manifest 读取落在 data/ 前缀下的内置组件目录，构造 zip 保留白名单。
+
+    单一真相源为 installer/manifest.json（经 bootstrap.load_manifest 读取，懒加载
+    与 assemble 同模式）。返回 os.sep 归一化的相对路径列表；manifest 缺失/损坏时
+    返回空列表，zip 侧退化为 data/ 整棵排除的保守行为（与旧口径一致，天然兜底）。
+
+    :return: list[str] 形如 "data\\lancedb" 的白名单前缀（Windows 下 os.sep 归一）。
+    """
+    try:
+        from installer import bootstrap
+
+        manifest = bootstrap.load_manifest()
+        prefixes = []
+        for comp in manifest.get("components", []):
+            rel = os.path.normpath(str(comp.get("install_target", "")))
+            if rel == "data" or rel.startswith("data" + os.sep):
+                prefixes.append(rel)
+        return prefixes
+    except (ImportError, OSError, ValueError, KeyError, TypeError):
+        # 清单缺失 / JSON 损坏 / 结构异常：保守退化为 data/ 整棵排除
+        return []
+
+
+def _under_whitelist(rel_path, prefixes):
+    """判定相对路径命中白名单前缀（与前缀相等或位于其目录树下）。
+
+    :param rel_path: 相对便携根的文件路径（os.sep 归一）。
+    :param prefixes: _bundled_data_whitelist 返回的前缀列表。
+    :return: True 表示该文件属内置组件目录，应保留入 zip。
+    """
+    return any(rel_path == p or rel_path.startswith(p + os.sep) for p in prefixes)
+
+
 def zip_portable(portable_root, release_dir):
     """把便携根压成 zip（步骤5）。
 
-    用户数据排除（A-1）：便携根顶层 config.json 与 data/ 整棵目录不写入 zip，
-    避免升级解压覆盖用户配置（含 Fernet 加密 Key）与记忆库；首启由
-    backend_entry/启动链 auto-init 按默认值重新生成。
+    用户数据排除（A-1，批次E修订）：便携根顶层 config.json、data/ 下白名单外
+    内容（memories.db 等运行期生成物）与 logs/ 树不写入 zip，避免升级解压覆盖
+    用户配置（含 Fernet 加密 Key）与记忆库；首启由 backend_entry/启动链
+    auto-init 按默认值重新生成。
+    内置组件保留（批次E）：manifest 各组件 install_target 落在 data/ 下的目录
+    （local_llm / lancedb / voices/cx-open / SenseVoiceSmall）为 bundled 资产
+    落位点，随包分发——打包期便携根由 assemble 全新组装，仅含 bundled 资产与
+    bootstrap 初始化产物，不含终端用户运行数据，无覆盖风险。
     顶层目录固定（A-4）：arcname 恒以 CX-A-portable/ 前缀开头，与便携根
     实际目录名解耦（清理失败回退的 portable-<时间戳> 目录解压结果一致）。
 
@@ -339,20 +378,28 @@ def zip_portable(portable_root, release_dir):
     zip_path = os.path.join(release_dir, f"{ZIP_BASENAME}.zip")
     if os.path.exists(zip_path):
         os.remove(zip_path)
+    whitelist = _bundled_data_whitelist()
     _log_info(f"步骤5：压缩 -> {zip_path}")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for base, _dirs, files in os.walk(portable_root):
             rel_base = os.path.relpath(base, portable_root)
-            # A-1：data/ 整棵为用户运行数据，walk 层直接剪枝不入包
-            if rel_base.split(os.sep)[0] == "data":
+            # 批次E：logs/ 为运行期日志产物，整棵不入包
+            if rel_base.split(os.sep)[0] == "logs":
                 continue
             for name in files:
                 # A-1：便携根顶层的 config.json 为用户配置，不入包
                 if rel_base == "." and name == "config.json":
                     continue
                 full = os.path.join(base, name)
+                rel_file = os.path.relpath(full, portable_root)
+                # A-1（批次E修订）：data/ 不再整棵剪枝——manifest 白名单内的
+                # 内置组件目录保留入包；memories.db 等白名单外运行期产物仍排除
+                if rel_file.split(os.sep)[0] == "data" and not _under_whitelist(
+                    rel_file, whitelist
+                ):
+                    continue
                 # A-4：arcname 固定 CX-A-portable/ 前缀，与实际目录名解耦
-                rel = ZIP_TOP_DIR + os.path.relpath(full, portable_root)
+                rel = ZIP_TOP_DIR + rel_file
                 zf.write(full, rel)
     size_mb = os.path.getsize(zip_path) / (1024 * 1024)
     _log_info(f"zip 完成：{size_mb:.1f} MB")

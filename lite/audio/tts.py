@@ -117,15 +117,38 @@ class MeloTTSBackend(TTSBackend):
         return engine
 
     def _voice_path(self, voice):
-        """推导某音色的模型目录路径：``data/voices/<voice>``（M13：删除永不填充的 _voice_map 死分支）。
+        """推导某音色的模型目录路径，区分"裸 id"与"绝对路径"两种入参形态。
 
-        H-2（第三轮体检批次3）：voice 含路径穿越特征（``/``、``\\``、``..``、盘符）
-        时返回 None——不再拼接逃逸 ``data/voices/`` 根目录的任意路径，由调用方
-        回退默认音色。与 VoiceManager.resolve_voice 的 L13 校验同口径。
+        H-2（第三轮体检批次3）+ 第四轮体检批次C：``voice`` 含路径穿越特征
+        （``/``、``\\``、``..``、盘符）时按裸 id 口径拒绝——不拼接逃逸
+        ``data/voices/`` 根目录的任意路径。
+
+        绝对路径形态（与 :meth:`VoiceManager.resolve_voice` 的返回值契约对齐，
+        该契约返回音色包绝对路径）：仅当位于 ``self.voice_dir`` 前缀内
+        （``os.path.commonpath`` 校验）且目录真实存在时放行；越出音色根目录、
+        目录不存在或跨盘无法判定前缀时返回 ``None``，由调用方回退默认音色。
+
+        :param voice: 音色标识（裸 id）或音色包绝对路径
+        :return: 音色模型目录路径；非法或越界返回 None
         """
-        if is_unsafe_voice_id(voice):
+        if not isinstance(voice, str) or not voice:
             return None
-        return os.path.join(self.voice_dir, voice)
+        if not is_unsafe_voice_id(voice):
+            # 裸 id（无分隔符/盘符/穿越特征）：照常拼接音色根目录
+            return os.path.join(self.voice_dir, voice)
+        # 含路径特征的入参：按绝对路径形态校验——必须在音色根目录前缀内且存在
+        candidate = os.path.abspath(voice)
+        voice_root = os.path.abspath(self.voice_dir)
+        try:
+            common = os.path.commonpath([candidate, voice_root])
+        except ValueError:
+            # 跨盘 / 绝对相对混合等无法判定公共前缀的情形：一律拒绝
+            return None
+        if common != voice_root:
+            return None
+        if not os.path.isdir(candidate):
+            return None
+        return candidate
 
     def synthesize(self, text, voice=None):
         """合成文本为 wav 音频字节（真实引擎委托）。
@@ -139,18 +162,21 @@ class MeloTTSBackend(TTSBackend):
         """
         self._ensure_lib()
         _voice = voice or self.default_voice
-        # H-2：非法音色标识（路径穿越特征）告警并回退默认音色，不拼接逃逸路径；
+        # H-2 + 第四轮批次C：非法音色入参（路径穿越特征的裸 id，或越出音色根
+        # 目录的绝对路径）告警并回退默认音色，不拼接逃逸路径；
         # default_voice 亦非法（构造参数异常）时最终兜底官方默认 cx-open
-        if is_unsafe_voice_id(_voice):
+        _voice_path = self._voice_path(_voice)
+        if _voice_path is None:
             warnings.warn(
-                f"音色标识含路径穿越特征，已拒绝并回退官方默认音色：{_voice!r}",
+                f"音色标识含路径穿越特征或越出音色根目录，已拒绝并回退官方默认音色：{_voice!r}",
                 UserWarning,
                 stacklevel=2,
             )
             _voice = self.default_voice
-            if is_unsafe_voice_id(_voice):
+            _voice_path = self._voice_path(_voice)
+            if _voice_path is None:
                 _voice = DEFAULT_VOICE_ID
-        _voice_path = self._voice_path(_voice)
+                _voice_path = self._voice_path(_voice)
         cfg = os.path.join(_voice_path, "config.json")
         ckpt = os.path.join(_voice_path, "ckpt.txt")  # 训练产物常见名；视后端而定
         has_cfg = os.path.exists(cfg)

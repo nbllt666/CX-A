@@ -72,6 +72,22 @@ def test_defaults_values():
     assert DEFAULTS["computer_control"] == {"authorized": False, "confirm_dangerous": True}
     assert DEFAULTS["sync"] == {"enabled": False}
     assert DEFAULTS["remote"] == {"endpoint": "", "enabled": False}
+    # 轻量版扩展段（批次E补齐：对照 config_manager.DEFAULTS acp/cxfc/tools）
+    assert DEFAULTS["acp"] == {
+        "enabled": False,
+        "agent_id": "cxa-agent-001",
+        "heartbeat_interval": 10,
+        "lan_discovery": False,
+        "group_enabled": False,
+        "cloud_relay": True,
+        "cloud_relay_endpoint": "",
+    }
+    assert DEFAULTS["cxfc"] == {"enabled": False, "embedded_only": True}
+    assert DEFAULTS["tools"] == {
+        "computer_control": False,
+        "memory_tools": True,
+        "system_tools": True,
+    }
 
 
 # ------------------------------------------------------------------ #
@@ -135,21 +151,22 @@ def test_missing_section_autofill(tmp_path):
 # 4. 热更新段判定                                                    #
 # ------------------------------------------------------------------ #
 
-def test_reloadable_judgement():
-    """cloud 可热更新，vector / embedding 需重启。"""
-    assert cfg_reloadable("cloud") is True
-    assert cfg_reloadable("tts") is True
-    assert cfg_reloadable("vector") is False
-    assert cfg_reloadable("embedding") is False
-
-
-def cfg_reloadable(section):
-    """复用 reloadable 的静态语义（同 reloadable 判定仅依赖常量表）。"""
-    if section in HOT_RELOAD_SECTIONS:
-        return True
-    if section in NEED_RESTART_SECTIONS:
-        return False
-    return None
+def test_reloadable_judgement(tmp_path):
+    """reloadable 真实语义（批次E：直接调用被测方法 ConfigManager.reloadable）：
+    cloud/tts 等热更新段 True，vector/embedding 需重启 False，未知段 None。"""
+    cfg = _make_manager(tmp_path)
+    # 热更新段抽样（含轻量版扩展段 acp/cxfc/tools）
+    assert cfg.reloadable("cloud") is True
+    assert cfg.reloadable("tts") is True
+    assert cfg.reloadable("memory") is True
+    assert cfg.reloadable("acp") is True
+    assert cfg.reloadable("cxfc") is True
+    assert cfg.reloadable("tools") is True
+    # 需重启段
+    assert cfg.reloadable("vector") is False
+    assert cfg.reloadable("embedding") is False
+    # 未知段
+    assert cfg.reloadable("no_such_section") is None
 
 
 def test_reloadable_sections_complete():

@@ -99,3 +99,88 @@ def test_default_urllib_post(monkeypatch):
     assert captured["method"] == "POST"
     import json as _json
     assert _json.loads(captured["data"]) == {"action": "message", "request_id": "abc"}
+
+
+# ------------------------------------------------------------------ #
+# 3. 第四轮体检批次C：鉴权头 / 明文 HTTP 告警 / 序列化归一               #
+# ------------------------------------------------------------------ #
+
+class _CapturingResp:
+    """可捕获请求头的假响应（上下文协议 + read）。"""
+
+    def __init__(self, captured, body=b'{"ok": true}'):
+        self._captured = captured
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def test_default_urllib_post_with_token_adds_auth_header(monkeypatch):
+    """构造传入 token 时，缺省传输请求附 Authorization: Bearer <token> 头。"""
+    captured = {}
+
+    def _fake_urlopen(request, timeout=None):
+        captured["headers"] = dict(getattr(request, "headers", {}) or {})
+        return _CapturingResp(captured)
+
+    monkeypatch.setattr(cr.urllib.request, "urlopen", _fake_urlopen)
+
+    relay = CloudRelay(endpoint="https://relay.example/relay", token="sekrit")
+    assert relay.send({"action": "message"}) == {"ok": True}
+    assert captured["headers"]["Authorization"] == "Bearer sekrit"
+
+
+def test_default_urllib_post_without_token_no_auth_header(monkeypatch):
+    """未配置 token 时不带 Authorization 头（既有行为不变）。"""
+    captured = {}
+
+    def _fake_urlopen(request, timeout=None):
+        captured["headers"] = dict(getattr(request, "headers", {}) or {})
+        return _CapturingResp(captured)
+
+    monkeypatch.setattr(cr.urllib.request, "urlopen", _fake_urlopen)
+
+    relay = CloudRelay(endpoint="https://relay.example/relay")
+    relay.send({"action": "message"})
+    assert "Authorization" not in captured["headers"]
+
+
+def test_send_non_serializable_payload_raises_cloud_relay_error():
+    """不可序列化负载归一为 CloudRelayError（修复前裸 TypeError 穿透契约）。"""
+    relay = CloudRelay(endpoint="https://relay.example/relay")
+    with pytest.raises(CloudRelayError):
+        relay.send({"bad": object()})
+
+
+def test_plain_http_endpoint_warns_once(caplog, monkeypatch):
+    """endpoint 为 http:// 时一次性 LOGGER.warning 明文告警（M-16 口径），https 不告警。"""
+    import logging
+
+    import urllib.error
+
+    def _fail_urlopen(request, timeout=None):
+        raise urllib.error.URLError("boom")
+
+    monkeypatch.setattr(cr.urllib.request, "urlopen", _fail_urlopen)
+
+    relay = CloudRelay(endpoint="http://relay.example/relay")
+    with caplog.at_level(logging.WARNING, logger="lite.acp.cloud_relay"):
+        with pytest.raises(CloudRelayError):
+            relay.send({"action": "message"})
+        with pytest.raises(CloudRelayError):
+            relay.send({"action": "message"})
+    assert sum("明文 HTTP" in rec.getMessage() for rec in caplog.records) == 1
+
+    caplog.clear()
+    https_relay = CloudRelay(endpoint="https://relay.example/relay")
+    with caplog.at_level(logging.WARNING, logger="lite.acp.cloud_relay"):
+        with pytest.raises(CloudRelayError):
+            https_relay.send({"action": "message"})
+    assert caplog.records == []

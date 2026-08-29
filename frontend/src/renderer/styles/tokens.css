@@ -63,7 +63,6 @@
   /* ======================== 2. 语义层 semantic（浅色） ======================== */
 
   --bg-primary: var(--gray-50);
-  --bg-primary-rgb: 250 250 252;
   --bg-secondary: var(--white);
   --bg-tertiary: var(--gray-100);
   --text-primary: var(--gray-900);
@@ -98,7 +97,6 @@
 /* ======================== 2. 语义层 semantic（暗色） ======================== */
 [data-theme='dark'] {
   --bg-primary: var(--gray-900);
-  --bg-primary-rgb: 18 18 26;
   --bg-secondary: #1a1a28;
   --bg-tertiary: var(--gray-800);
   --text-primary: var(--gray-50);

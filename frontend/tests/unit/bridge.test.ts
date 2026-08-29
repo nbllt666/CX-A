@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import {
   isElectron,
   getAppInfo,
-  onModeSwitch,
   openPetOverlay,
   closePetOverlay,
 } from '../../src/renderer/bridge';
@@ -34,11 +33,5 @@ describe('bridge.ts 非 Electron 环境（window.cxaAPI 缺失）', () => {
 
   it('closePetOverlay() 降级 no-op，resolve false 不抛异常', async () => {
     await expect(closePetOverlay()).resolves.toBe(false);
-  });
-
-  it('onModeSwitch(cb) 降级为 no-op，返回可调用的取消订阅函数', () => {
-    const unsub = onModeSwitch(() => {});
-    expect(typeof unsub).toBe('function');
-    expect(() => unsub()).not.toThrow();
   });
 });

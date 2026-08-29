@@ -33,6 +33,23 @@ class AcpDiscoveryError(Exception):
     """局域网发现错误（未启动即广播 / socket 异常等）。"""
 
 
+def _normalize_port(raw):
+    """归一化信标端口（第四轮体检批次C）：类型非法或越界一律置 0。
+
+    选型口径（简单一致）：非 int（含 bool，bool 为 int 子类但语义非端口）或
+    越出 1-65535 的值 → 置 0（视为"未宣告端口"），保留该 agent 不丢弃——
+    端口字段可由上层调用方再行校验。
+
+    :param raw: 信标报文中的 port 原始值
+    :return: 合法端口（1-65535）；非法返回 0
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 0
+    if raw < 1 or raw > 65535:
+        return 0
+    return raw
+
+
 class LiteLanDiscovery:
     """轻量 UDP 局域网发现器。
 
@@ -53,6 +70,10 @@ class LiteLanDiscovery:
         self.found_agents = []
         #: 已见 (agent_id, addr) 集合（N9：重复信标不再重复登记）
         self._seen_agents = set()
+        #: (agent_id, addr) → found_agents 中 agent dict 的引用表
+        #: （第四轮体检批次C：重复信标命中去重时经此刷新 last_seen 保鲜；
+        #: 与 _seen_agents 同步增删，prune_expired 时同步清理）
+        self._agent_records = {}
         #: 上次超限告警时刻（monotonic 秒；N9 告警限频：每秒至多一条）
         self._last_overflow_warn = 0.0
         self._running = False
@@ -184,6 +205,10 @@ class LiteLanDiscovery:
         capabilities）归一化为 agent dict；命中合法 ``ACP_BEACON`` 时追加到
         ``found_agents``。非法报文返回 None。
 
+        第四轮体检批次C：``port`` 经 :func:`_normalize_port` 归一化（非 int 或
+        越界置 0）；产物新增 ``last_seen``（墙钟秒），重复信标命中去重时刷新
+        ``last_seen`` 保鲜，供 :meth:`prune_expired` 判定记录时效。
+
         :param data: 原始字节报文
         :param addr: 来源地址 (host, port)
         :return: 归一化 agent dict；非法报文返回 None
@@ -195,24 +220,29 @@ class LiteLanDiscovery:
         if not isinstance(msg, dict) or msg.get("type") != MSG_TYPE:
             return None
         agent_id = msg.get("agent_id", "")
+        now = time.time()
         agent = {
             "agent_id": agent_id,
             "agent_name": msg.get("agent_name", ""),
             "host": addr[0],
-            "port": msg.get("port", 0),
+            "port": _normalize_port(msg.get("port", 0)),
             "capabilities": list(msg.get("capabilities", []) or []),
             "version": msg.get("version", "1.0.0"),
             "timestamp": msg.get("timestamp", ""),
+            "last_seen": now,
         }
         if agent_id:
             # N9：按 (agent_id, addr) 去重 + 条目上限，防恶意信标污染与内存放大
             key = (agent_id, (addr[0], addr[1]))
-            if key in self._seen_agents:
+            record = self._agent_records.get(key)
+            if record is not None:
+                # 重复信标：刷新已登记记录的 last_seen 保鲜，不重复登记
+                record["last_seen"] = now
                 return agent
             if len(self.found_agents) >= MAX_FOUND_AGENTS:
-                now = time.monotonic()
-                if now - self._last_overflow_warn >= 1.0:
-                    self._last_overflow_warn = now
+                now_mono = time.monotonic()
+                if now_mono - self._last_overflow_warn >= 1.0:
+                    self._last_overflow_warn = now_mono
                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
                     print(
                         f"[{ts}] [WARNING] 局域网发现条目已达上限 {MAX_FOUND_AGENTS}，"
@@ -224,6 +254,33 @@ class LiteLanDiscovery:
             # 防止 _seen_agents 本身成为内存放大点
             if len(self._seen_agents) >= _MAX_SEEN_AGENTS:
                 self._seen_agents.clear()
+                self._agent_records.clear()
             self._seen_agents.add(key)
+            self._agent_records[key] = agent
             self.found_agents.append((agent, addr))
         return agent
+
+    def prune_expired(self, max_age_seconds=300):
+        """清理超时未再宣告的发现记录（第四轮体检批次C，供长驻调用方定期调用）。
+
+        以记录的 ``last_seen``（墙钟秒）为时效基准；被清理记录同步从去重集合
+        中移除，使同一节点后续信标可重新登记。本方法不强制接入调用点——由
+        长驻进程按需周期调用，避免 ``found_agents`` 携带陈旧记录。
+
+        :param max_age_seconds: 记录保留时长（秒），默认 300
+        :return: 清理掉的记录条数
+        """
+        now = time.time()
+        kept = []
+        removed = 0
+        for agent, addr in self.found_agents:
+            key = (agent.get("agent_id", ""), (addr[0], addr[1]))
+            if now - agent.get("last_seen", 0) > max_age_seconds:
+                removed += 1
+                self._seen_agents.discard(key)
+                self._agent_records.pop(key, None)
+            else:
+                kept.append((agent, addr))
+        if removed:
+            self.found_agents[:] = kept
+        return removed

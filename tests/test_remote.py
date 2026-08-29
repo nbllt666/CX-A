@@ -6,6 +6,7 @@
 映射为 RemoteUnreachable。
 """
 
+import http.client
 import urllib.error
 
 import pytest
@@ -152,6 +153,21 @@ def test_transport_urlerror_to_unreachable():
 
 def test_transport_oserror_to_unreachable():
     transport = _RecorderTransport(error=OSError("connection refused"))
+    ctrl = _enabled_controller(transport)
+    with pytest.raises(RemoteUnreachable):
+        ctrl.get_status()
+
+
+# ---------------------------------------------------------------- 第四轮体检批次C：HTTPException 归一
+@pytest.mark.parametrize(
+    "http_exc",
+    [http.client.IncompleteRead(b"partial"), http.client.BadStatusLine("502 Bad Gateway")],
+    ids=["IncompleteRead", "BadStatusLine"],
+)
+def test_transport_http_exception_to_unreachable(http_exc):
+    """http.client.HTTPException（网关 504/502 中断形态）应映射为 RemoteUnreachable，
+    不再穿透统一异常契约（API 层 504 语义依赖）。"""
+    transport = _RecorderTransport(error=http_exc)
     ctrl = _enabled_controller(transport)
     with pytest.raises(RemoteUnreachable):
         ctrl.get_status()

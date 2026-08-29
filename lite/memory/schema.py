@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 """
 
+# 检索高频过滤组合索引（第四轮体检批次B·中-1a）：
+# list / list_recent / 检索候选查询均按 agent_id + is_deleted 过滤，
+# 组合索引避免全表扫描；IF NOT EXISTS 幂等，既有库在 storage 初始化处自动补建。
+CREATE_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(agent_id, is_deleted)"
+)
+
 # 逐字段契约：字段名 -> (SQL 声明类型, 默认值, 是否 NOT NULL)
 # 默认值以 SQL 落库值为准（python 侧用于 add 时字段自动补全）。
 COLUMNS = {

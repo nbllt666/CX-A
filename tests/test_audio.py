@@ -11,6 +11,7 @@
 """
 
 import math
+import os
 import struct
 import sys
 import types
@@ -578,3 +579,72 @@ def test_engine_cache_lru_eviction(tmp_path, monkeypatch):
     assert len(backend._engines) == 3
     assert keys[1] not in backend._engines
     assert keys[0] in backend._engines and keys[3] in backend._engines
+
+
+# ------------------------------------------------------------------ #
+# 第四轮体检批次C：绝对路径形态音色（与 resolve_voice 契约对齐）        #
+# ------------------------------------------------------------------ #
+
+
+def test_voice_path_accepts_absolute_path_inside_voice_dir(tmp_path):
+    """voice_dir 内合法绝对路径（resolve_voice 契约返回值）应可解析为引擎目录。"""
+    voices = tmp_path / "voices"
+    pack = voices / "custom_a"
+    pack.mkdir(parents=True)
+    (pack / "config.json").write_bytes(b"x")
+    backend = MeloTTSBackend(voice_dir=str(voices))
+    abs_path = str(pack)
+    assert backend._voice_path(abs_path) == os.path.abspath(abs_path)
+
+
+def test_voice_path_rejects_absolute_path_outside_voice_dir(tmp_path):
+    """目录外绝对路径被拒：返回 None，不逃逸音色根目录。"""
+    backend = MeloTTSBackend(voice_dir=str(tmp_path / "voices"))
+    outside = tmp_path / "elsewhere" / "pack"
+    outside.mkdir(parents=True)
+    assert backend._voice_path(str(outside)) is None
+
+
+def test_voice_path_rejects_absolute_path_missing_dir(tmp_path):
+    """voice_dir 前缀内但目录不存在的绝对路径同样拒绝（存在性校验）。"""
+    backend = MeloTTSBackend(voice_dir=str(tmp_path / "voices"))
+    ghost = str(tmp_path / "voices" / "ghost_pack")
+    assert backend._voice_path(ghost) is None
+
+
+def test_melotts_absolute_path_inside_voice_dir_uses_local_model(tmp_path, monkeypatch):
+    """绝对路径在 voice_dir 内且目录存在 → 合成走该目录的 config/ckpt，无回退告警。"""
+    import warnings
+
+    backend = _make_melotts_backend(
+        tmp_path, monkeypatch, {"full_pack": ["config.json", "ckpt.txt"]}
+    )
+    abs_path = str(tmp_path / "voices" / "full_pack")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(_StopAfterEngine):
+            backend.synthesize("你好", voice=abs_path)
+
+    assert _StopAfterEngine.config_path == os.path.join(abs_path, "config.json")
+    assert _StopAfterEngine.ckpt_path == os.path.join(abs_path, "ckpt.txt")
+    assert not any("路径穿越" in str(w.message) for w in caught)
+
+
+def test_melotts_absolute_path_outside_voice_dir_falls_back_with_warning(tmp_path, monkeypatch):
+    """目录外绝对路径：告警并回退官方默认音色，不加载外部目录。"""
+    import warnings
+
+    backend = _make_melotts_backend(tmp_path, monkeypatch, {})
+    outside = tmp_path / "outside_pack"
+    outside.mkdir()
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(_StopAfterEngine):
+            backend.synthesize("你好", voice=str(outside))
+
+    assert any("路径穿越特征" in str(w.message) for w in caught), [str(w.message) for w in caught]
+    # 回退官方默认：目录缺产物 → 引擎收到 None/None
+    assert _StopAfterEngine.config_path is None
+    assert _StopAfterEngine.ckpt_path is None

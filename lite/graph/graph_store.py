@@ -192,9 +192,10 @@ class GraphStore:
             self._conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
         try:
             self.vector_store.delete(node_id)
-        except Exception:
-            # 向量删除失败不影响图数据本身，容忍并继续。
-            pass
+        except Exception as exc:  # noqa: BLE001 - 向量删除失败不影响图数据本身，容忍并继续
+            # 低-9（第四轮体检批次B）：告警留痕（对齐 manager.soft_delete 容忍口径），
+            # 不再静默吞掉——运维可从日志发现向量库与图数据的漂移。
+            LOGGER.warning("节点 %s 向量删除失败（图数据已删除，容忍继续）：%s", node_id, exc)
         return True
 
     def list_nodes(self, limit=100, offset=0):

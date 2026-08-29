@@ -354,11 +354,14 @@ class LiteACP:
         """局域网发现（默认关）。
 
         M3 真实化流程：start 后主动 ``broadcast_presence`` 宣告本机一次，随后在
-        可配置的短暂等待窗口内分片轮询 ``found_agents``，窗口结束收集返回并确保
+        可配置的等待窗口内分片轮询 ``found_agents``，窗口结束收集返回并确保
         stop 清理。接收侧由 :class:`LiteLanDiscovery` 的后台线程 bind + recvfrom 完成。
 
-        :param timeout: 等待窗口秒数；缺省 2s。窗口内命中即提前收集可用发现结果，
-            超时则以最后快照为准。
+        第四轮体检批次C：固定窗口收集——窗口内持续累积 ``found_agents``（多节点
+        发现），不再命中首个信标即提前收窗（修复前单节点命中即提前返回，多节点
+        发现失效）。
+
+        :param timeout: 等待窗口秒数；缺省 2s。窗口结束后以最终快照为准。
         :param discovery_factory: 增量注入参数——自定义发现器工厂（测试确定性注入用）；
             缺省使用真实 :class:`LiteLanDiscovery`。
         :return: 发现的 agent dict 列表（已剔除本机自身信标）
@@ -379,10 +382,11 @@ class LiteACP:
                 )
             except Exception as exc:  # noqa: BLE001 - 广播失败不阻断发现收集
                 LOGGER.warning("局域网发现广播失败（继续被动收集）：%s", exc)
-            # 分片睡眠检查 found_agents，避免一次性 sleep 造成不可中断的长阻塞
+            # 固定窗口分片睡眠收集（第四轮体检批次C：去掉"命中即提前收窗"，
+            # 多节点信标在窗口内陆续到达均可收集），避免一次性 sleep 不可中断
             step = 0.05
             waited = 0.0
-            while waited < window and not discovery.found_agents:
+            while waited < window:
                 time.sleep(min(step, window - waited))
                 waited += min(step, window - waited)
             # 收集并剔除本机自身信标（同机回环会把自家广播也送达本端口）
@@ -422,12 +426,17 @@ class LiteACP:
     def _resolve_relay(self):
         """解析云端中转实例。
 
-        优先用注入的 relay_transport；缺省按配置 endpoint 惰性创建 :class:`CloudRelay`。
+        优先用注入的 relay_transport；缺省按配置 endpoint 惰性创建 :class:`CloudRelay`，
+        并透传可选鉴权令牌 ``acp.cloud_relay_token``（第四轮体检批次C，缺省空串
+        即不带鉴权头）。
         """
         if self._relay_transport is not None:
             return self._relay_transport
         if self._relay is None:
-            self._relay = CloudRelay(endpoint=self._cloud_relay_endpoint)
+            self._relay = CloudRelay(
+                endpoint=self._cloud_relay_endpoint,
+                token=self._get("acp", "cloud_relay_token", "") or "",
+            )
         return self._relay
 
     def relay_via_cloud(self, payload):

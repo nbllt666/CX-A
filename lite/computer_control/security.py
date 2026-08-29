@@ -28,7 +28,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
-from lite.computer_control.control import DANGEROUS_COMMANDS, ComputerControl
+from lite.computer_control.control import DANGEROUS_COMMANDS, DANGEROUS_TOKENS, ComputerControl
 
 __all__ = ["ControlAuthorizer"]
 
@@ -226,10 +226,19 @@ class ControlAuthorizer:
     def _is_destructive(command: str) -> bool:
         """判定命令是否命中幂等破坏操作模式（如删库 / 删除 / 清除关键词）。
 
+        批次A（第四轮体检）：在子串判定之外补**词元级判定**——拆 token 后任一
+        token 命中 :data:`DANGEROUS_TOKENS`（del/rd/rm 等）即判高危，覆盖
+        ``if exist x del x`` 中 del 为中间词元、子串表只含 delete 不含 del 的
+        穿透形态；预处理同步剥离 cmd 转义符 ``^``。
+
         :param command: 指令字符串
         :return: True 表示命中断言破坏模式
         """
-        cmd = (command or "").strip().lower()
+        cmd = (command or "").strip().lower().replace("^", "")
+        # 词元级判定（批次A）：del 等破坏词作为中间 token 出现时子串表查不到
+        tokens = [tok.strip("\"'") for tok in cmd.split()]
+        if any(tok in DANGEROUS_TOKENS for tok in tokens):
+            return True
         return any(pattern in cmd for pattern in _DESTRUCTIVE_IDEMPOTENT)
 
     def needs_confirmation(self, command: str) -> bool:

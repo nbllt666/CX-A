@@ -247,3 +247,31 @@ def test_corrupt_edge_properties_tolerated_as_empty_dict(graph):
     dirty = [e for e in edges if e["id"] == "dirty_edge"]
     assert len(dirty) == 1
     assert dirty[0]["properties"] == {}
+
+
+# ------------------------------------------------------------------ #
+# 低-9：delete_node 向量删除失败留痕（第四轮体检批次B）                 #
+# ------------------------------------------------------------------ #
+def test_delete_node_vector_failure_warns_not_silent(caplog):
+    """delete_node 向量删除失败时 LOGGER.warning 留痕（图数据删除语义不变），不再静默。"""
+    import logging
+
+    class _BoomVectorStore(InMemoryVectorStore):
+        def delete(self, vector_id):
+            raise RuntimeError("boom-delete")
+
+    store = GraphStore(
+        db_path=":memory:", embed_callable=fixed_embed, vector_store=_BoomVectorStore()
+    )
+    try:
+        store.upsert_node("n1", "Alice", "person")
+        with caplog.at_level(logging.WARNING, logger="lite.graph.graph_store"):
+            assert store.delete_node("n1") is True
+        # 节点本体已删除（向量失败不回滚），且告警留痕
+        assert store.get_node("n1") is None
+        assert any(
+            "n1" in record.getMessage() and "向量删除失败" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        store.close()

@@ -44,6 +44,9 @@ OFFLINE_PROMPT = "当前离线，开启本地模式可继续对话"
 #: 云端配置错误诊断态下的提示文案（N5：未配置 API Key 不得误诊为"断网"）
 CONFIG_ERROR_PROMPT = "云端配置未完成，请在设置中填写服务商与 API Key"
 
+#: mode_history 保留的尾部条数上限（第四轮体检批次C：防长驻进程无界增长）
+_MAX_MODE_HISTORY = 100
+
 
 def _llama_runtime_types():
     """惰性解析 LlamaRuntime / LlamaNotReady 类型（避免 fallback <-> runtime 循环导入）。
@@ -178,9 +181,12 @@ class OfflineFallbackManager:
         if mode == self._mode:
             return
         self._mode = mode
-        # 状态写入：模式变化以字符串记录（供 UI / GN-004 回溯）
+        # 状态写入：模式变化以字符串记录（供 UI / GN-004 回溯）；
+        # 第四轮体检批次C：仅保留尾部 _MAX_MODE_HISTORY 条，防长驻进程无界增长
         self.last_mode_event = f"{mode}"
         self.mode_history.append(self.last_mode_event)
+        if len(self.mode_history) > _MAX_MODE_HISTORY:
+            del self.mode_history[: len(self.mode_history) - _MAX_MODE_HISTORY]
         for listener in list(self._listeners):
             listener(mode)
 

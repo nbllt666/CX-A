@@ -163,6 +163,67 @@ def test_install_fresh_empty_data_dir_still_receives_assets(tmp_path, monkeypatc
     assert not any(p.suffix == ".tmp" for p in (tmp_path / "freshroot").rglob("*"))
 
 
+def test_install_returns_post_install_verification(tmp_path, monkeypatch):
+    """批次E：install() 返回的 problems 反映安装后状态——已落位组件不再列为待装。"""
+    root = str(tmp_path / "postroot")
+    os.makedirs(root)
+
+    # 为全部 builtin 组件准备源，使安装后全部就位
+    bundled_root = tmp_path / "bundled"
+    manifest = bootstrap.load_manifest()
+    for comp in manifest["components"]:
+        if comp["status"] != "builtin":
+            continue
+        src = bundled_root / comp["key"]
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "asset.bin").write_text("payload", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "BUNDLED_DIR", str(bundled_root))
+
+    problems, builtin_warnings = bootstrap.install(root)
+
+    # 源齐备：无缺失告警；安装后复查不应再有"待装态"报告
+    assert builtin_warnings == []
+    assert not any("待装态" in p for p in problems)
+
+
+def test_install_preserves_existing_file_asset_under_data(tmp_path, monkeypatch, capsys):
+    """批次E：文件型内置组件 dst 已存在且位于 data/ 前缀下时跳过覆盖并告警。"""
+    root = str(tmp_path / "fileroot")
+    os.makedirs(root)
+    bootstrap.ensure_dirs(root)
+
+    # 既有运行数据文件（未来文件型组件的潜在覆盖目标）
+    target = os.path.join(root, "data", "user_asset.bin")
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("user-data")
+
+    # 构造文件型内置组件源 + 自定义 manifest（install_target 落在 data/ 下）
+    bundled_root = tmp_path / "bundled"
+    bundled_root.mkdir(parents=True)
+    (bundled_root / "myfile.bin").write_text("builtin-payload", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "BUNDLED_DIR", str(bundled_root))
+    custom_manifest = {
+        "components": [
+            {
+                "name": "文件型组件",
+                "key": "myfile.bin",
+                "size_estimate": "约 1 KB",
+                "status": "builtin",
+                "install_target": os.path.join("data", "user_asset.bin"),
+                "notes": "测试用文件型组件。",
+            }
+        ]
+    }
+
+    warnings = bootstrap.install_builtin_assets(root, manifest=custom_manifest)
+
+    # 用户数据原样保留，内置载荷未覆盖
+    with open(target, encoding="utf-8") as fh:
+        assert fh.read() == "user-data"
+    assert warnings == []
+    assert "检测到已有运行数据" in capsys.readouterr().out
+
+
 # ------------------------------------------------------------------ #
 # first_run：全流程驱动                                              #
 # ------------------------------------------------------------------ #
@@ -440,7 +501,6 @@ def test_first_run_providers_derived_from_adapter():
     """L-8：first_run.DEFAULT_PROVIDERS 与 adapter.PROVIDER_BASE_URLS 同源。"""
     from lite.cloud.adapter import PROVIDER_BASE_URLS
 
-    assert FirstRunDriver  # 引用不悬空
     from installer import first_run as first_run_mod
 
     assert first_run_mod.DEFAULT_PROVIDERS == tuple(PROVIDER_BASE_URLS.keys())
@@ -489,8 +549,16 @@ def test_build_assemble_and_zip(tmp_path):
     # bootstrap 初始化产物：数据目录 + 默认 config
     assert os.path.isdir(os.path.join(portable_root, "data", "lancedb"))
     assert os.path.isfile(os.path.join(portable_root, "config.json"))
+    # 批次E：模拟 bundled 组件资产落入 manifest install_target（data/local_llm/...），
+    # 验证白名单内的内置组件目录应随包分发
+    marker = os.path.join(
+        portable_root, "data", "local_llm", "qwen3-embedding-0.6b", "model.gguf"
+    )
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    with open(marker, "wb") as fh:
+        fh.write(b"fake-gguf")
 
-    # zip：固定顶层前缀 + 关键条目 + 用户数据排除（A-1/A-4）
+    # zip：固定顶层前缀 + 关键条目 + 运行期产物排除（A-1/A-4，批次E修订）
     release_dir = str(tmp_path / "rel")
     zip_path = build_mod.zip_portable(portable_root, release_dir)
     assert os.path.isfile(zip_path)
@@ -502,13 +570,16 @@ def test_build_assemble_and_zip(tmp_path):
     assert all(n.startswith("CX-A-portable/") for n in names)
     assert "CX-A-portable/CX-A.exe" in names
     assert "CX-A-portable/runtime/backend/backend.exe" in names
-    # A-1：顶层 config.json 与 data/ 整棵均不入包（用户数据不被升级覆盖）
+    # A-1：顶层 config.json 与运行期产物（memories.db / logs）不入包
     assert "CX-A-portable/config.json" not in names
-    assert not any(n.startswith("CX-A-portable/data/") for n in names)
+    assert "CX-A-portable/data/memories.db" not in names
+    assert not any(n.startswith("CX-A-portable/logs/") for n in names)
+    # 批次E：manifest 白名单内的内置组件目录随包分发（不再 data/ 整棵缺席）
+    assert "CX-A-portable/data/local_llm/qwen3-embedding-0.6b/model.gguf" in names
 
 
 def test_zip_portable_excludes_user_data_and_fixed_prefix(tmp_path):
-    """A-1/A-4 专测：轻量伪造便携根验证 config.json 与 data/ 不入包、顶层前缀固定。"""
+    """A-1/A-4 专测（批次E修订）：运行期产物不入包、内置组件目录保留、顶层前缀固定。"""
     import zipfile
 
     from installer import build as build_mod
@@ -521,11 +592,21 @@ def test_zip_portable_excludes_user_data_and_fixed_prefix(tmp_path):
     (root / "runtime" / "backend" / "_internal").mkdir(parents=True)
     (root / "runtime" / "backend" / "backend.exe").write_bytes(b"fake-backend")
     (root / "runtime" / "backend" / "_internal" / "lib.dll").write_bytes(b"fake-dll")
-    # 用户数据：顶层 config.json + data/ 整棵（含嵌套子目录）
+    # 运行期产物：顶层 config.json + memories.db + 白名单外 data 子目录 + logs/
     (root / "config.json").write_text('{"cloud": {}}', encoding="utf-8")
-    (root / "data" / "lancedb").mkdir(parents=True)
+    (root / "data").mkdir(parents=True)
     (root / "data" / "memories.db").write_bytes(b"sqlite-payload")
-    (root / "data" / "lancedb" / "vectors-0001.lance").write_bytes(b"user-vectors")
+    (root / "data" / "runtime_tables").mkdir(parents=True)
+    (root / "data" / "runtime_tables" / "user.tbl").write_bytes(b"user-runtime")
+    (root / "logs").mkdir(parents=True)
+    (root / "logs" / "app.log").write_text("log-line", encoding="utf-8")
+    # 内置组件目录（模拟 bundled 资产落入 manifest install_target 白名单）
+    (root / "data" / "lancedb").mkdir(parents=True)
+    (root / "data" / "lancedb" / "vectors-0001.lance").write_bytes(b"builtin-vectors")
+    (root / "data" / "local_llm" / "qwen3-embedding-0.6b").mkdir(parents=True)
+    (root / "data" / "local_llm" / "qwen3-embedding-0.6b" / "model.gguf").write_bytes(
+        b"fake-gguf"
+    )
 
     zip_path = build_mod.zip_portable(str(root), str(tmp_path / "rel"))
 
@@ -539,9 +620,14 @@ def test_zip_portable_excludes_user_data_and_fixed_prefix(tmp_path):
     assert "CX-A-portable/resources/app.asar" in names
     assert "CX-A-portable/runtime/backend/backend.exe" in names
     assert "CX-A-portable/runtime/backend/_internal/lib.dll" in names
-    # A-1：用户配置与运行数据整棵缺席
+    # A-1：运行期产物缺席（顶层 config.json / memories.db / 白名单外 data 子目录 / logs）
     assert "CX-A-portable/config.json" not in names
-    assert not any(n.startswith("CX-A-portable/data/") for n in names)
+    assert "CX-A-portable/data/memories.db" not in names
+    assert not any(n.startswith("CX-A-portable/data/runtime_tables/") for n in names)
+    assert not any(n.startswith("CX-A-portable/logs/") for n in names)
+    # 批次E：manifest 白名单内的内置组件目录随包分发
+    assert "CX-A-portable/data/lancedb/vectors-0001.lance" in names
+    assert "CX-A-portable/data/local_llm/qwen3-embedding-0.6b/model.gguf" in names
 
 
 def test_build_skip_electron_rejects_incomplete_artifacts(tmp_path, monkeypatch):

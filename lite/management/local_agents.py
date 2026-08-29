@@ -12,9 +12,14 @@ ensure_ascii=False 写回 agents.json，保证中文人设不做 \\u 转义。
 """
 
 import json
+import logging
 import os
+import shutil
 import uuid
 from datetime import datetime
+
+#: 模块日志记录器（第四轮体检批次C：损坏隔离等关键事件走 LOGGER 中文告警）
+LOGGER = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ 路径推导
 # local_agents.py -> lite/management -> lite -> 项目根（逐级上溯 3 次）
@@ -153,14 +158,71 @@ class AgentManager:
         """推导默认存储路径：<项目根>/data/agents.json。"""
         return os.path.join(_PROJECT_ROOT, "data", "agents.json")
 
+    def _isolate_corrupt_file(self):
+        """损坏隔离（第四轮体检批次C）：把原 agents.json 移出正式位，防种子覆盖用户数据。
+
+        优先改名隔离为 ``agents.json.corrupt-<时间戳>``（数据零丢失）；改名失败
+        （OSError，如目录只读/文件被锁）时退而求其次复制 ``.bak`` 留底；两者均
+        失败时仅记录错误并返回 None（原文件保留在原位）。
+
+        :return: 隔离/备份文件路径；隔离失败返回 None
+        """
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S%f")
+        isolated = f"{self._path}.corrupt-{ts}"
+        try:
+            os.replace(self._path, isolated)
+            return isolated
+        except OSError as rename_exc:
+            backup = self._path + ".bak"
+            try:
+                shutil.copy2(self._path, backup)
+                LOGGER.error(
+                    "agents.json 损坏隔离：改名失败（%s），已复制 .bak 留底：%s",
+                    rename_exc, backup,
+                )
+                return backup
+            except OSError as copy_exc:
+                LOGGER.error(
+                    "agents.json 损坏隔离失败，原文件保留于原位待人工处理："
+                    "改名异常（%s）、复制 .bak 异常（%s）",
+                    rename_exc, copy_exc,
+                )
+                return None
+
     def _load(self):
-        """加载 agents.json；文件不存在则初始化种子并写盘。"""
+        """加载 agents.json；文件不存在则初始化种子并写盘。
+
+        第四轮体检批次C：解析失败（非法 JSON）/ 读取失败（OSError）/ 顶层结构
+        非列表时，先把原文件改名隔离（``.corrupt-<时间戳>``，改名失败至少复制
+        ``.bak`` 留底）并 ``LOGGER.error`` 中文告警，再按首启流程初始化种子——
+        修复前损坏文件被吞异常置空后，种子数据直接覆盖写回，用户数据物理丢失。
+        """
         if os.path.exists(self._path):
             try:
                 with open(self._path, "r", encoding="utf-8") as f:
                     raw_list = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                raw_list = []
+            except json.JSONDecodeError as exc:
+                isolated = self._isolate_corrupt_file()
+                LOGGER.error(
+                    "agents.json 解析失败（%s），原文件已隔离至 %s，将初始化默认种子；原始数据未删除",
+                    exc, isolated or "（隔离失败，原文件保留原位）",
+                )
+                raw_list = None
+            except OSError as exc:
+                isolated = self._isolate_corrupt_file()
+                LOGGER.error(
+                    "agents.json 读取失败（%s），原文件已尝试隔离至 %s，将初始化默认种子",
+                    exc, isolated or "（隔离失败，原文件保留原位）",
+                )
+                raw_list = None
+            if raw_list is not None and not isinstance(raw_list, list):
+                # 顶层结构非法（应为列表）：同样按损坏隔离处理，防止覆盖写回
+                isolated = self._isolate_corrupt_file()
+                LOGGER.error(
+                    "agents.json 顶层结构非法（应为列表，实际 %s），原文件已隔离至 %s，将初始化默认种子",
+                    type(raw_list).__name__, isolated or "（隔离失败，原文件保留原位）",
+                )
+                raw_list = None
         else:
             raw_list = None
 

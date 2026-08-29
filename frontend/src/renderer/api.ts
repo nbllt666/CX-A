@@ -20,16 +20,12 @@ export const API_ENDPOINTS = {
   chat: {
     /** 发起聊天 */
     sendMessage: `${API_BASE}/chat/messages`,
-    /** 拉取历史消息 */
-    history: `${API_BASE}/chat/history`,
   },
   memories: {
     /** 记忆列表 */
     list: `${API_BASE}/memories`,
     /** 记忆检索 */
     search: `${API_BASE}/memories/search`,
-    /** 软删除单条记忆（按 id） */
-    delete: (id: string | number) => `${API_BASE}/memories/${id}`,
   },
   settings: {
     /** 用户可读配置视图（GET，不含 API Key） */
@@ -119,7 +115,16 @@ export async function requestJson<T>(
     clearTimeout(timer);
   }
   if (!res.ok) {
-    throw new Error(`后端请求失败: ${res.status} ${res.statusText}`);
+    // D5 修复：非 2xx 时读取响应体片段（截断 200 字符）拼入错误信息，
+    // 让后端错误码 / 错误说明对调用方可见；响应体不可读时静默跳过。
+    let detail = '';
+    try {
+      const text = await res.text();
+      if (text) detail = ` ${text.slice(0, 200)}`;
+    } catch {
+      /* 响应体不可读（流已消费等）时跳过 */
+    }
+    throw new Error(`后端请求失败: ${res.status} ${res.statusText}${detail}`);
   }
   return res.json() as Promise<T>;
 }

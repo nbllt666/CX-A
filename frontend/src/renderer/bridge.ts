@@ -11,7 +11,6 @@ export interface AppInfo {
 
 interface CxaBridge {
   getAppInfo: () => Promise<AppInfo>;
-  onModeSwitch: (cb: (mode: string) => void) => () => void;
   /** 打开桌宠透明悬浮窗 */
   openPetOverlay: () => Promise<boolean>;
   /** 关闭桌宠透明悬浮窗 */
@@ -41,19 +40,6 @@ export async function getAppInfo(): Promise<AppInfo> {
     return window.cxaAPI.getAppInfo();
   }
   return MOCK_APP_INFO;
-}
-
-/**
- * 订阅主进程发起的「视图面切换」。纯浏览器降级为 no-op。
- * @returns 取消订阅函数
- */
-export function onModeSwitch(cb: (mode: 'companion' | 'management') => void): () => void {
-  if (isElectron() && window.cxaAPI) {
-    return window.cxaAPI.onModeSwitch((mode) => {
-      if (mode === 'companion' || mode === 'management') cb(mode);
-    });
-  }
-  return () => {};
 }
 
 /**

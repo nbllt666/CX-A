@@ -20,8 +20,12 @@
     result   = min(enhanced, 1.0)
 """
 
+import logging
 import math
 from datetime import datetime
+
+# 原生日志记录器（低-8：脏参数告警留痕）
+LOGGER = logging.getLogger(__name__)
 
 # 参数默认值（对齐 CX-O decay.py 源码）
 EBBINGHAUS_DEFAULTS = {"t50": 30.0, "k": 2.0}
@@ -87,6 +91,20 @@ def _parse_datetime(text):
     return dt
 
 
+def _param_float(params, key, default):
+    """从衰减参数 dict 取 float；脏值容错回退默认（低-8，第四轮体检批次B）。
+
+    params 含非数值（如 JSON 侧写坏的 "t50": "abc" / null）时单参数告警并
+    回退默认值，单条脏数据不再使整条检索链异常。
+    """
+    raw = params.get(key, default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        LOGGER.warning("衰减参数 %s=%r 非法，回退默认值 %s", key, raw, default)
+        return float(default)
+
+
 class DecayCalculator:
     """记忆衰减计算器——按衰减类型计算时间衰减、再激活加成后的记忆分数（因子 0~1）。"""
 
@@ -135,18 +153,19 @@ class DecayCalculator:
         if days_elapsed is None or days_elapsed <= 0:
             return 1.0
         dtype = (decay_type or "ebbinghaus_opt").lower()
-        params = params or {}
+        # 低-8：params 非 dict（脏数据形态）一律按空参数回退默认，不再 AttributeError
+        params = params if isinstance(params, dict) else {}
 
         if dtype in ZERO_ALIASES:
             return 1.0
         if dtype in EBBINGHAUS_ALIASES:
-            t50 = float(params.get("t50", EBBINGHAUS_DEFAULTS["t50"]))
-            k = float(params.get("k", EBBINGHAUS_DEFAULTS["k"]))
+            t50 = _param_float(params, "t50", EBBINGHAUS_DEFAULTS["t50"])
+            k = _param_float(params, "k", EBBINGHAUS_DEFAULTS["k"])
             return self.calculate_ebbinghaus_decay(1.0, days_elapsed, t50=t50, k=k)
         # two_stage（默认）
-        alpha = float(params.get("alpha", TWO_STAGE_DEFAULTS["alpha"]))
-        lambda1 = float(params.get("lambda1", TWO_STAGE_DEFAULTS["lambda1"]))
-        lambda2 = float(params.get("lambda2", TWO_STAGE_DEFAULTS["lambda2"]))
+        alpha = _param_float(params, "alpha", TWO_STAGE_DEFAULTS["alpha"])
+        lambda1 = _param_float(params, "lambda1", TWO_STAGE_DEFAULTS["lambda1"])
+        lambda2 = _param_float(params, "lambda2", TWO_STAGE_DEFAULTS["lambda2"])
         return self.calculate_exponential_decay(
             1.0, days_elapsed, alpha=alpha, lambda1=lambda1, lambda2=lambda2
         )

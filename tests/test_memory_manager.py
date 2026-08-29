@@ -210,3 +210,35 @@ def test_soft_delete_survives_vector_store_error(mgr):
     assert m.soft_delete(mid) is True
     # 软删除已生效（get 侧 is_deleted=1）
     assert m.store.get(mid)["is_deleted"] == 1
+
+
+# ---------------------------------------------------------------- 中文分词（中-2，第四轮体检批次B）
+def test_tokenize_text_mixed_script():
+    """共享分词：拉丁整词小写、CJK 相邻 bigram、标点/空白为分隔符。"""
+    from lite.memory.manager import tokenize_text
+
+    assert tokenize_text("alpha Beta 12") == {"alpha", "beta", "12"}
+    assert tokenize_text("冷萃") == {"冷萃"}
+    assert tokenize_text("用户偏好冷萃咖啡") == {
+        "用户", "户偏", "偏好", "好冷", "冷萃", "萃咖", "咖啡",
+    }
+    assert tokenize_text("") == set()
+    assert tokenize_text(None) == set()
+
+
+def test_chinese_similarity_one_char_diff_above_half(mgr):
+    """中文两条仅差一字的记忆相似度应超 0.5（修复前整句单 token 相似度恒 0）。"""
+    a = "她喜欢在午后的图书馆靠窗位置安静地读一本厚厚的散文集并做摘抄笔记"
+    b = "她喜欢在午后的图书馆靠门位置安静地读一本厚厚的散文集并做摘抄笔记"
+    sim = MemoryManager._text_similarity(a, b)
+    assert sim > 0.5, f"bigram 分词后相似度应显著大于 0，实际 {sim:.3f}"
+
+
+def test_chinese_write_dedup_triggered(mgr):
+    """两条仅差一字的 32 字中文记忆（bigram 相似度约 0.88）在写入口被去重。"""
+    a = "她喜欢在午后的图书馆靠窗位置安静地读一本厚厚的散文集并做摘抄笔记"
+    b = "她喜欢在午后的图书馆靠门位置安静地读一本厚厚的散文集并做摘抄笔记"
+    mid1 = mgr.add_memory(a)
+    mid2 = mgr.add_memory(b)
+    assert mid1 is not None
+    assert mid2 is None, f"相似度 {MemoryManager._text_similarity(a, b):.3f} 应达默认阈值 0.85"

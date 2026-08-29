@@ -10,10 +10,20 @@ export const PET_ENABLED_KEY = 'cx-a.petEnabled';
 /** 读取持久化开关（默认关闭）；存储不可用时静默回退为关闭。 */
 function readStoredEnabled(): boolean {
   try {
-    return window.localStorage.getItem(PET_ENABLED_KEY) === 'true';
+    return parseStoredEnabled(window.localStorage.getItem(PET_ENABLED_KEY));
   } catch {
     return false;
   }
+}
+
+/**
+ * 解析持久化开关值（D7 修复：统一布尔编码）。
+ * 新约定为 '1'/'0'（与 SettingsPage.writeLsBool 一致）；同时兼容读取旧值
+ * 'true'/'false'——历史版本与 PetOverlay 关闭按钮仍会写入 'false'，兼容读取
+ * 保证旧值语义不丢失，后续由新写入自然覆盖。
+ */
+function parseStoredEnabled(raw: string | null): boolean {
+  return raw === '1' || raw === 'true';
 }
 
 /**
@@ -31,7 +41,8 @@ export function usePetEnabled() {
   const setEnabled = useCallback((next: boolean) => {
     setEnabledState(next);
     try {
-      window.localStorage.setItem(PET_ENABLED_KEY, String(next));
+      // 统一写入 '1'/'0'（与 SettingsPage.writeLsBool 同一约定，D7）
+      window.localStorage.setItem(PET_ENABLED_KEY, next ? '1' : '0');
     } catch {
       /* 存储不可用（隐私模式等）时静默忽略 */
     }
@@ -54,7 +65,7 @@ export function usePetEnabled() {
   // 跨窗口同步：Electron 悬浮窗 / 多窗口修改该 key 时跟随刷新
   useEffect(() => {
     const onStorage = (e: StorageEvent) => {
-      if (e.key === PET_ENABLED_KEY) setEnabledState(e.newValue === 'true');
+      if (e.key === PET_ENABLED_KEY) setEnabledState(parseStoredEnabled(e.newValue));
     };
     window.addEventListener('storage', onStorage);
     return () => window.removeEventListener('storage', onStorage);

@@ -61,6 +61,9 @@ function rowToView(r: MemoryRow): ViewMemory {
 
 const OFFLINE_FALLBACK = MOCK_MEMORIES.map(mockToView);
 
+/** 单次拉取的记忆条数上限（与后端 /api/memories?limit= 约定一致，D9） */
+const MEMORY_LIMIT = 200;
+
 /** 本地关键词过滤（离线 / keyword 为空 / 搜索失败时的兜底） */
 function matchLocal(m: ViewMemory, keyword: string): boolean {
   return (
@@ -90,7 +93,7 @@ export default function MemoriesPage() {
     let alive = true;
     (async () => {
       try {
-        const rows = await fetchMemories({ limit: 200 });
+        const rows = await fetchMemories({ limit: MEMORY_LIMIT });
         if (!alive) return;
         setData(rows.map(rowToView));
         setMode('online');
@@ -201,6 +204,13 @@ export default function MemoriesPage() {
           </p>
         )}
       </div>
+
+      {/* D9 修复：拉取数达上限时显式告知，避免「硬截断无提示」 */}
+      {mode === 'online' && data.length >= MEMORY_LIMIT && (
+        <p className="pt-1 text-center text-xs text-[var(--text-tertiary)]">
+          仅显示最近 {MEMORY_LIMIT} 条记忆
+        </p>
+      )}
     </div>
   );
 }

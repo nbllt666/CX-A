@@ -42,11 +42,15 @@ import argparse
 import base64
 import hmac
 import json
+import logging
 import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
+
+# 原生日志记录器（低-5：内部异常完整消息仅写日志，不外泄到响应体）
+LOGGER = logging.getLogger(__name__)
 
 # 聊天服务未启用守卫错误码（前端本期走 Mock 演示，端点存在但明确提示）
 CHAT_SERVICE_DISABLED = "chat_service_disabled"
@@ -76,6 +80,27 @@ _MAX_LIST_LIMIT = 1000
 
 # agent_id 最大长度（L-5）：入库字段限长，防任意长字符串写库
 _MAX_AGENT_ID_CHARS = 100
+
+# 记忆 id 合法范围（低-6，第四轮体检批次B）：SQLite INTEGER 为 64 位有符号，
+# 范围外的 id 直接入库会触发 sqlite OverflowError → 500，边界处显式 400
+_INT64_MIN = -(2 ** 63)
+_INT64_MAX = 2 ** 63 - 1
+
+# 回环监听地址集合（中-4 启动安全闸判定口径，第四轮体检批次B）
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _is_loopback_host(host) -> bool:
+    """判断监听地址是否为本机回环地址（127.0.0.1 / localhost / ::1）。
+
+    兼容 IPv6 字面量的方括号形态（[::1]）与大小写混写。
+    """
+    return str(host or "").strip().strip("[]").lower() in _LOOPBACK_HOSTS
+
+
+def _env_api_token() -> str:
+    """实时读取启动令牌 env（main 安全闸判定用，不依赖 import 期快照）。"""
+    return os.environ.get("CXA_API_TOKEN", "").strip()
 
 
 class _BodyTooLarge(Exception):
@@ -133,6 +158,7 @@ from lite.memory.embedding import LiteEmbeddingProvider  # noqa: E402
 from lite.memory.pipeline import MemoryRetrievalPipeline  # noqa: E402
 from lite.memory.storage import MemoryStore  # noqa: E402
 from lite.memory.vector_store import InMemoryVectorStore  # noqa: E402
+from lite import __version__ as LITE_VERSION  # noqa: E402
 from lite.management.local_agents import AgentManager, AgentNotFound  # noqa: E402
 from lite.management.remote import (  # noqa: E402
     RemoteController,
@@ -193,6 +219,23 @@ def build_deps(data_dir=None, config_path=None):
     config = ConfigManager(config_path=config_path or os.path.join(data_dir, "config.json"))
     store = MemoryStore(db_path=os.path.join(data_dir, "memories.db"))
     embed = LiteEmbeddingProvider(dim=64)
+    # 批次E（降级透明化，最小面）：读取 vector.backend 配置——InMemoryVectorStore
+    # 为当前装配兜底不变；配置指定 lancedb 但当前环境缺失该依赖（frozen 产物
+    # excludes lancedb 的常规形态）时中文告警，消除静默降级。探测用
+    # find_spec 无副作用（不触发 lancedb 真实导入/连接）；lancedb 实际接线
+    # 属后续装配升级范畴（64 维桩嵌入下切换 LanceDB 会改变检索排序语义）。
+    vector_backend = str(
+        config.get("vector", "backend", DEFAULTS["vector"]["backend"]) or ""
+    ).strip().lower()
+    if vector_backend == "lancedb":
+        import importlib.util
+
+        if importlib.util.find_spec("lancedb") is None:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "配置指定 LanceDB 但当前环境不可用，已降级为内存向量库"
+            )
     vector_store = InMemoryVectorStore()
     pipeline = MemoryRetrievalPipeline(
         store=store,
@@ -450,7 +493,9 @@ def make_handler(
                     "Access-Control-Allow-Origin": origin,
                     "Vary": "Origin",
                     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-                    "Access-Control-Allow-Headers": "Content-Type",
+                    # 中-3（第四轮体检批次B）：预检允许头补 X-Client-Token——
+                    # 令牌模式下浏览器跨源请求必须携带该自定义头，缺了即与令牌闸矛盾
+                    "Access-Control-Allow-Headers": "Content-Type, X-Client-Token",
                 }
             return {}
 
@@ -459,8 +504,16 @@ def make_handler(
             self._send_json({"ok": False, "error": "forbidden", "message": "Host 校验失败：拒绝访问"}, 403)
 
         def _guard_internal_error(self, exc):
-            """全局异常兜底：回结构化 500，确保畸形输入不致连接中断。"""
-            self._send_json({"ok": False, "error": "internal error", "detail": str(exc)[:200]}, 500)
+            """全局异常兜底：回结构化 500，确保畸形输入不致连接中断。
+
+            低-5（第四轮体检批次B）：对外只回错误码与异常类别摘要（类名），
+            完整异常消息（可能含内部路径/实现细节）仅经 LOGGER.exception 写
+            服务端日志，不再外泄到响应体。
+            """
+            LOGGER.exception("接口处理异常 path=%s", getattr(self, "path", "?"))
+            self._send_json(
+                {"ok": False, "error": "internal error", "detail": exc.__class__.__name__}, 500
+            )
 
         def _reject_bad_json(self):
             """malformed / 非 dict 请求体的统一 400（L2 收口：与空 body 明确区分）。"""
@@ -512,7 +565,7 @@ def make_handler(
                 {
                     "status": "ok",
                     "app": "CX-A/CX-Lite",
-                    "version": "0.1.0",
+                    "version": LITE_VERSION,
                     "uptime_seconds": round(time.monotonic() - self._STARTED_AT, 2),
                     "companion": True,
                 }
@@ -823,6 +876,13 @@ def make_handler(
             except ValueError:
                 self._send_json({"ok": False, "error": "bad_request", "message": "id 必须是整数"}, 400)
                 return
+            # 低-6（第四轮体检批次B）：超出 64 位有符号整数范围的 id 直接入库会触发
+            # sqlite OverflowError → 500，边界处显式 400
+            if not (_INT64_MIN <= memory_id <= _INT64_MAX):
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "id 超出有效范围（64 位整数）"}, 400
+                )
+                return
 
             # M-10（第三轮体检批次3）：优先走 manager.soft_delete（软删 + 同步
             # 清理向量库孤儿向量）；manager 缺席时回落 store 直删保持旧行为
@@ -1119,9 +1179,14 @@ def make_handler(
                         {"ok": False, "error": "not_authorized", "message": outcome.get("error")}, 403
                     )
                 else:
-                    self._send_json(
-                        {"ok": False, "error": "tool_failed", "message": outcome.get("error")}, 400
-                    )
+                    # 低-5（第四轮体检批次B）：工具执行失败的 error 可能含内部异常
+                    # 文本（registry 侧包装 str(exc)），对外只回固定类别摘要，
+                    # 完整错误写日志；结构化 error_code（若有）非自由文本可透传
+                    LOGGER.warning("内置工具 %s 执行失败：%s", name, outcome.get("error"))
+                    payload = {"ok": False, "error": "tool_failed", "message": "工具执行失败"}
+                    if outcome.get("error_code"):
+                        payload["error_code"] = outcome.get("error_code")
+                    self._send_json(payload, 400)
                 return
             self._send_json({"ok": True, "result": outcome.get("result")})
 
@@ -1414,6 +1479,26 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     host, port = args.host, args.port
+    # 中-4（第四轮体检批次B）启动安全闸：非回环监听 + 未配置 CXA_API_TOKEN 的组合
+    # 意味着 LAN 内任意主机可无令牌调用 /api/computer/authorize 等端点（远程控制面
+    # 完全暴露）。默认拒绝启动；CXA_ALLOW_UNSAFE=1 显式放行并打印醒目风险横幅。
+    if not _is_loopback_host(host) and not _env_api_token():
+        if os.environ.get("CXA_ALLOW_UNSAFE", "").strip() == "1":
+            print("=" * 68)
+            print("[安全警告] CXA_ALLOW_UNSAFE=1：API 服务将以【无令牌】模式绑定非回环地址")
+            print(f"[安全警告] 监听 {host}:{port} —— LAN 内任意主机可调用电脑控制/授权端点！")
+            print("[安全警告] 仅限临时调试使用，生产环境必须设置 CXA_API_TOKEN。")
+            print("=" * 68)
+        else:
+            print(
+                f"[ERROR] 拒绝启动：监听地址 {host} 为非回环地址且未设置 CXA_API_TOKEN，"
+                "LAN 内任意主机可无令牌调用电脑控制等端点。"
+            )
+            print(
+                "[ERROR] 请设置环境变量 CXA_API_TOKEN 启用令牌校验后重启；"
+                "确有需要可临时设置 CXA_ALLOW_UNSAFE=1 强行放行（风险自负）。"
+            )
+            sys.exit(1)
     server = create_server(host=host, port=port, data_dir=args.data_dir, config_path=args.config)
     print(f"[INFO] 记忆 API 服务已启动: http://{host}:{port}/api/health")
     try:

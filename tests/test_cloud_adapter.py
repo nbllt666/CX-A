@@ -10,12 +10,15 @@
 - reload 后 provider 切换生效
 """
 
+import http.client
+
 import pytest
 
 from lite.cloud.adapter import (
     PROVIDER_BASE_URLS,
     CloudAdapter,
     CloudConfigError,
+    CloudUnavailableError,
 )
 from lite.config import ConfigManager
 
@@ -341,3 +344,53 @@ def test_model_resolution_survives_reload(tmp_path):
     adapter2.reload()
     captured2 = _capture_sse_payload(adapter2)
     assert captured2["payload"]["model"] == "from-config"
+
+
+# ------------------------------------------------------------------ #
+# 9. 第四轮体检批次C：HTTPException 归一 + 探测响应关闭                 #
+# ------------------------------------------------------------------ #
+
+@pytest.mark.parametrize(
+    "http_exc",
+    [http.client.IncompleteRead(b"partial"), http.client.BadStatusLine("502 Bad Gateway")],
+    ids=["IncompleteRead", "BadStatusLine"],
+)
+def test_stream_chat_maps_http_exception_to_unavailable(tmp_path, http_exc):
+    """流式响应中途抛 http.client.HTTPException（API 网关 504/502 常见形态）应
+    归一为 CloudUnavailableError，不再穿透统一异常契约（fallback 降级依赖）。"""
+    adapter, _ = _make_adapter(tmp_path)
+
+    def _fake_post_sse(endpoint, payload, headers):
+        raise http_exc
+        yield  # pragma: no cover - 使函数成为生成器
+
+    adapter._post_sse = _fake_post_sse
+    with pytest.raises(CloudUnavailableError):
+        list(adapter.chat([{"role": "user", "content": "hi"}]))
+
+
+def test_http_get_closes_requests_response(tmp_path, monkeypatch):
+    """第四轮体检批次C：_http_get 的 requests 探测响应以 with 确定性关闭，
+    不留滞留连接。"""
+    import types
+
+    from lite.cloud import adapter as adapter_mod
+
+    adapter, _ = _make_adapter(tmp_path)
+    closed = {"flag": False}
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            closed["flag"] = True
+            return False
+
+    fake_requests = types.ModuleType("requests")
+    fake_requests.get = lambda url, timeout=None: _FakeResp()
+    monkeypatch.setattr(adapter_mod, "_HAS_REQUESTS", True)
+    monkeypatch.setattr(adapter_mod, "requests", fake_requests)
+
+    assert adapter._http_get("https://example.com", 2) is True
+    assert closed["flag"] is True

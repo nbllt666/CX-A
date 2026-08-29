@@ -336,3 +336,32 @@ def test_needs_confirmation_combined_command_segments(tmp_path):
     # 无危险段且无包裹器段的组合命令不误报
     assert auth.needs_confirmation("echo hi & echo bye") is False
     assert auth.needs_confirmation("dir /s & whoami") is False
+
+
+# ------------------------------------------------------------------ #
+# 批次A（第四轮体检）：控制流包裹词 / 词元级破坏判定                    #
+# ------------------------------------------------------------------ #
+
+
+def test_needs_confirmation_hits_control_flow_wrappers(tmp_path):
+    """批次A：``if exist x del x`` / ``for ... do del ...`` 三层护栏全穿透形态补齐。
+
+    修复前：首 token=if/for 不在包裹器名单、_is_destructive 查 delete 不查 del、
+    黑名单段首前缀不命中——三层护栏全空，直接放行执行。
+    """
+    auth = ControlAuthorizer(data_dir=str(tmp_path))
+    assert auth.needs_confirmation("if exist x del x") is True
+    assert auth.needs_confirmation("for %i in (1) do del c:\\x") is True
+    # 仅控制流包裹、无破坏词的命令也进确认闸（保守方向）
+    assert auth.needs_confirmation("if exist file echo ok") is True
+
+
+def test_is_destructive_covers_destructive_tokens(tmp_path):
+    """批次A：_is_destructive 补词元级判定（del/rd/rm 等），^ 转义先剥离。"""
+    assert ControlAuthorizer._is_destructive("if exist x del x") is True
+    assert ControlAuthorizer._is_destructive("d^el x") is True
+    assert ControlAuthorizer._is_destructive("for %i in (1) do rm x") is True
+    # delete 子串判定保留兜底；无害词不含破坏词元不误报
+    assert ControlAuthorizer._is_destructive("git delete-branch x") is True
+    assert ControlAuthorizer._is_destructive("whoami") is False
+    assert ControlAuthorizer._is_destructive("dir /s") is False

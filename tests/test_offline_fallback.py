@@ -379,3 +379,21 @@ def test_successful_probe_clears_diagnostic_state():
     mgr._config_error = "历史配置错误"
     assert mgr.refresh_online(force=True) is True
     assert mgr._config_error is None
+
+
+# ------------------------------------------------------------------ #
+# 第四轮体检批次C：mode_history 尾部 100 条有界                          #
+# ------------------------------------------------------------------ #
+
+def test_mode_history_bounded_to_tail_100():
+    """mode_history 无界追加改为保留尾部 100 条（长驻进程防内存缓慢增长）。"""
+    from lite.cloud.fallback import _MAX_MODE_HISTORY
+
+    mgr, _ = _make_manager(online=True)
+    for i in range(_MAX_MODE_HISTORY + 50):
+        mgr.change_mode("local" if i % 2 == 0 else "cloud")
+
+    assert len(mgr.mode_history) == _MAX_MODE_HISTORY
+    # 保留尾部：首个条目对应第 51 次切换（i=50，偶数 -> "local"）
+    assert mgr.mode_history[0] == "local"
+    assert mgr.mode_history[-1] == "cloud"

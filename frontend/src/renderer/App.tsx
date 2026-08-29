@@ -51,9 +51,15 @@ export default function App() {
   // 读取应用信息（electron 下走桥，浏览器下走 mock）
   useEffect(() => {
     let alive = true;
-    getAppInfo().then((info) => {
-      if (alive) setAppInfo(info);
-    });
+    getAppInfo()
+      .then((info) => {
+        if (alive) setAppInfo(info);
+      })
+      .catch(() => {
+        // D4 修复：桥不可用 / IPC 异常时降级——appInfo 保持 null（TopBar 自动隐藏版本徽标），
+        // 不产生 unhandled rejection
+        if (alive) setAppInfo(null);
+      });
     return () => {
       alive = false;
     };

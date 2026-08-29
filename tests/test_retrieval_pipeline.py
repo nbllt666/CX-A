@@ -215,3 +215,48 @@ def test_build_context_empty_and_single():
     text = _build_context([{"content": "hello world"}])
     assert text.startswith("【回忆】")
     assert "1. hello world" in text
+
+
+# ---------------------------------------------------------------- 中文分词（中-2，第四轮体检批次B）
+def test_chinese_keyword_score_positive(pipeline):
+    """含中文关键词的查询 keyword_score 应 > 0（修复前整句单 token 恒 0）。"""
+    pipeline.add("用户偏好冷萃咖啡不加糖")
+    res = pipeline.retrieve("冷萃", top_k=5)
+    assert res["memories"], "中文关键词应召回记忆"
+    assert res["memories"][0]["keyword_score"] > 0
+
+
+def test_chinese_text_similarity_shared_tokenizer():
+    """manager 与 pipeline 共用同一分词实现：中文仅差一字相似度显著大于 0。"""
+    from lite.memory.manager import MemoryManager
+
+    a = "她喜欢在午后的图书馆靠窗位置安静地读一本厚厚的散文集并做摘抄笔记"
+    b = "她喜欢在午后的图书馆靠门位置安静地读一本厚厚的散文集并做摘抄笔记"
+    assert MemoryManager._text_similarity(a, b) > 0.5
+
+
+class _SpyVectorStore(InMemoryVectorStore):
+    """记录 search 收到 top_k 的探针向量库（低-7 断言用）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.search_top_ks = []
+
+    def search(self, vector, top_k=10):
+        self.search_top_ks.append(top_k)
+        return super().search(vector, top_k=top_k)
+
+
+def test_explicit_top_k_zero_clamped_to_one(tmp_path):
+    """低-7：显式 top_k=0 按候选下限 1 处理（向量召回 1×2），不再回落缺省 20。"""
+    spy = _SpyVectorStore()
+    pipe = MemoryRetrievalPipeline(
+        store=MemoryStore(db_path=str(tmp_path / "memories.db")),
+        vector_store=spy,
+        embed=LiteEmbeddingProvider(dim=64),
+    )
+    pipe.add("some memory content for probe")
+    pipe.retrieve("probe", top_k=0)
+    assert spy.search_top_ks == [2]  # cand_n = max(1, 0) = 1 → 召回 2 条
+    pipe.retrieve("probe")
+    assert spy.search_top_ks[-1] == 40  # 缺省 20 → 召回 40 条

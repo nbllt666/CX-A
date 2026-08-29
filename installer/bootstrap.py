@@ -229,6 +229,11 @@ def install_builtin_assets(root, manifest=None):
         if os.path.isdir(src):
             _copytree(src, dst, root=root)
         else:
+            # 批次E：文件型组件与目录型同口径的运行数据保护——dst 已存在且位于
+            # data/ 运行数据前缀下时跳过覆盖并告警，防止未来组件擦除用户数据
+            if _under_data_prefix(dst, root) and os.path.exists(dst):
+                _log_warn(f"检测到已有运行数据，跳过覆盖：{dst}")
+                continue
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(src, dst)
         _log_info(f"[安装] {comp['name']} -> {comp['install_target']}")
@@ -277,14 +282,18 @@ def install(root=None):
     """一键安装编排：目录初始化 → 组件校验 → 内置组件落位 → 数据目录初始化。
 
     全程中文 [INFO] 提示。返回 （problems, builtin_warnings），供调用方展示或落盘。
+    批次E：problems 为安装完成后复查 verify_components 的终态结果——刚落位的
+    组件不再被误报为"待装态"；安装前快照仅用于过程中的告警输出。
     """
     root = root or PROJECT_ROOT
     ensure_dirs(root)
-    problems = verify_components(root)
-    for p in problems:
+    # 安装前快照：仅用于过程告警输出（让用户知道安装前缺什么）
+    for p in verify_components(root):
         _log_warn(p)
     builtin_warnings = install_builtin_assets(root)
     init_workplace(root)
+    # 批次E：安装后复查，保证返回报告反映安装后实况
+    problems = verify_components(root)
     _log_info("一键安装流程完成。")
     return problems, builtin_warnings
 

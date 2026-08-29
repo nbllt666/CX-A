@@ -23,7 +23,7 @@ from lite.runtime import (
     LlamaNotReady,
     LlamaRuntime,
 )
-from lite.runtime.llama_runtime import DEFAULT_EMBEDDING_MODEL
+from lite.runtime.llama_runtime import DEFAULT_EMBEDDING_MODEL, _estimate_prompt_tokens
 
 
 class FakeLlama:
@@ -312,21 +312,46 @@ def test_init_reads_n_ctx_override():
 
 def test_fit_prompt_hard_clip_single_huge_line(llm_model, fake_llama_cpp):
     """单条超限（无行可删）时走硬截断尾部兜底，且保底最后一轮内容仍在头部预算内。"""
-    rt = LlamaRuntime(config={"local_llm": {"n_ctx": 256}})  # judge 预算=(256-8-64)*4=736
+    rt = LlamaRuntime(config={"local_llm": {"n_ctx": 256}})  # judge 预算 = 256-8-64 = 184 token
     rt.load_local_llm(llm_model)
-    rt.judge_should_reply("聊" * 20000)  # 判定模板+巨量输入远超 736
+    rt.judge_should_reply("聊" * 20000)  # 判定模板+巨量中文输入远超 184 token
     prompt = FakeLlama.last_prompt
-    assert len(prompt) <= (256 - 8 - 64) * 4
+    assert _estimate_prompt_tokens(prompt) <= (256 - 8 - 64)
+
+
+def test_estimate_prompt_tokens_cjk_vs_ascii():
+    """第四轮体检批次C：token 估算按 CJK 占比折算——纯 ASCII 4 字符/token，
+    纯中文约 1.3 字符/token（每字符 0.75 token），混合各按占比折算。"""
+    assert _estimate_prompt_tokens("") == 0
+    assert _estimate_prompt_tokens("a" * 400) == pytest.approx(100.0)
+    assert _estimate_prompt_tokens("聊" * 400) == pytest.approx(300.0)
+    mixed = "a" * 200 + "聊" * 200
+    assert _estimate_prompt_tokens(mixed) == pytest.approx(50.0 + 150.0)
+
+
+def test_cjk_prompt_budget_trims_where_ascii_budget_passed(llm_model, fake_llama_cpp):
+    """第四轮体检批次C：旧"4 字符/token"口径下"合规"的长中文 prompt
+    （约 726 字符 ≤ 736 字符预算，真实 token 约 545 早已溢出 184 预算），
+    新 CJK 折算口径下必须被裁剪到 token 预算内。"""
+    rt = LlamaRuntime(config={"local_llm": {"n_ctx": 256}})  # judge 预算 = 184 token
+    rt.load_local_llm(llm_model)
+    rt._llm.fixed_text = "是"
+    rt.judge_should_reply("好" * 650)
+    prompt = FakeLlama.last_prompt
+    assert _estimate_prompt_tokens(prompt) <= (256 - 8 - 64)
+    assert len(prompt) < 726, "旧字符口径下不会被裁剪的中文 prompt 未按新预算收敛"
 
 
 def test_offline_chat_trims_long_history_under_budget(llm_model, fake_llama_cpp):
-    """M11 要求用例：超长历史（经 chat_window 截断仍超出预算）被裁剪后调用成功，
-    投递 prompt 长度不超过预算上限，且重建时保底 system + 最近一轮。"""
-    rt = LlamaRuntime(config=None)  # 默认 n_ctx=2048 -> offline 预算=(2048-128-64)*4=7424
+    """M11 + 第四轮体检批次C：超长中文历史（经 chat_window 截断仍超出 token 预算）
+    被裁剪后投递 prompt 的 CJK 折算估算不超过预算，且保底 system 行 +
+    最近一轮起始内容（消息级重建 → 行级兜底 → 硬截断）。"""
+    rt = LlamaRuntime(config=None)  # 默认 n_ctx=2048 -> offline 预算 = 2048-128-64 = 1856 token
     assert rt.load_local_llm(llm_model) is True
     rt._llm.fixed_text = "收到"
 
-    # 每轮 6000 字符：chat_window 取最近 6 条约 36k 字符，必超 7424 预算 -> 触发消息级删减
+    # 每轮 6000 中文：chat_window 取最近 6 条约 36k 字符，CJK 折算约 2.7 万 token
+    # -> 消息级重建（system + 最近一轮约 4.5k token）仍超 -> 行级兜底 + 硬截断
     messages = [{"role": "system", "content": "你是 CX-A 助手"}]
     for i in range(20):
         messages.append({"role": "user", "content": f"历史第{i}轮：" + "聊" * 6000})
@@ -334,11 +359,13 @@ def test_offline_chat_trims_long_history_under_budget(llm_model, fake_llama_cpp)
 
     assert out == "收到"
     prompt = FakeLlama.last_prompt
-    limit = (2048 - 128 - 64) * 4
-    assert len(prompt) <= limit, f"prompt 长度 {len(prompt)} 超过预算 {limit}"
-    # 保底 system + 最近一轮（消息级重建绕开 chat_window 对 system 的截断）
+    budget = 2048 - 128 - 64
+    assert _estimate_prompt_tokens(prompt) <= budget, (
+        f"prompt token 估算 {_estimate_prompt_tokens(prompt)} 超过预算 {budget}"
+    )
+    # 保底 system 头部保留、最近一轮的起始内容仍在（硬截断保留前缀）
     assert prompt.startswith("system: ")
-    assert messages[-1]["content"] in prompt
+    assert "历史第19轮" in prompt
 
 
 # ------------------------------------------------------------------ #

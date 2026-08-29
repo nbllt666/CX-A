@@ -246,3 +246,40 @@ def test_save_atomic_no_leftover_tmp_on_success(tmp_path):
     assert leftovers == []
     parsed = json.loads(path.read_text("utf-8"))
     assert [a["name"] for a in parsed] == ["软软", "小夜"]
+
+
+# ---------------------------------------------------------------- 第四轮体检批次C：损坏隔离
+def test_corrupt_json_isolated_not_overwritten(tmp_path, caplog):
+    """损坏 agents.json：先改名隔离（.corrupt-<时间戳>）再初始化种子，
+    原始数据不得被种子覆盖丢失，且打印中文 ERROR 告警。"""
+    import logging
+
+    path = tmp_path / "agents.json"
+    corrupt_raw = "{这不是合法 JSON"
+    path.write_text(corrupt_raw, encoding="utf-8")
+
+    with caplog.at_level(logging.ERROR, logger="lite.management.local_agents"):
+        mgr = AgentManager(path=str(path))
+
+    # 原损坏内容被完整隔离保留（未物理丢失）
+    isolated = list(tmp_path.glob("agents.json.corrupt-*"))
+    assert len(isolated) == 1
+    assert isolated[0].read_text(encoding="utf-8") == corrupt_raw
+    # 正式位为种子初始化产物（新文件内容与损坏内容不同）
+    parsed = json.loads(path.read_text("utf-8"))
+    assert parsed[0]["id"] == "default"
+    assert mgr.list()[0].name == "软软"
+    # 中文 ERROR 告警已记录
+    assert any("解析失败" in rec.getMessage() for rec in caplog.records)
+
+
+def test_non_list_top_level_isolated(tmp_path):
+    """顶层结构非列表（如被写成 dict）同样按损坏隔离，防种子覆盖写回。"""
+    path = tmp_path / "agents.json"
+    path.write_text('{"id": "default"}', encoding="utf-8")
+    mgr = AgentManager(path=str(path))
+    isolated = list(tmp_path.glob("agents.json.corrupt-*"))
+    assert len(isolated) == 1
+    assert json.loads(isolated[0].read_text("utf-8")) == {"id": "default"}
+    # 正式位重建为种子列表
+    assert [a.id for a in mgr.list()] == ["default"]

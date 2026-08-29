@@ -189,3 +189,30 @@ def test_age_seconds_with_aware_created_no_crash():
     expected_naive = _dt.fromisoformat(created).astimezone().replace(tzinfo=None)
     expected_age = (_dt.strptime(now_text, "%Y-%m-%d %H:%M:%S.%f") - expected_naive).total_seconds()
     assert age == pytest.approx(expected_age)
+
+
+# ---------------------------------------------------------------- 脏参数容错（低-8，第四轮体检批次B）
+def test_decay_factor_dirty_param_values_fall_back(calc):
+    """单参数脏值（"abc"/None）告警并回退默认，结果与干净参数一致。"""
+    dirty = calc.score(
+        importance=0.5, age_seconds=30 * DAY, decay_type="ebbinghaus_opt",
+        params={"t50": "abc", "k": None},
+    )
+    clean = calc.score(
+        importance=0.5, age_seconds=30 * DAY, decay_type="ebbinghaus_opt",
+        params={"t50": 30.0, "k": 2.0},
+    )
+    assert dirty == pytest.approx(clean)
+
+
+def test_decay_factor_non_dict_params_tolerated(calc):
+    """params 为非 dict（脏数据形态）按空参数回退默认，不再 AttributeError。"""
+    s = calc.score(importance=0.5, age_seconds=30 * DAY, decay_type="two_stage", params="not-a-dict")
+    clean = calc.score(importance=0.5, age_seconds=30 * DAY, decay_type="two_stage", params=None)
+    assert s == pytest.approx(clean)
+
+
+def test_retention_with_dirty_params_no_crash(calc):
+    """retention 直调脏参数同样容错回退默认。"""
+    r = calc.retention(0.5, 10 * DAY, "two_stage", {"alpha": "x"})
+    assert 0.0 <= r <= 0.5

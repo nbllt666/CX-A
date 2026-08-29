@@ -325,7 +325,6 @@ def test_package_exports_alignment():
 
 def test_execute_alias_matches_call_tool():
     """execute 与 call_tool 等价（同义别名）。"""
-    ctrl = _make()
     screen = FakeScreenBackend()
     ctrl2 = _make(screen=screen)
     res1 = ctrl2.call_tool(TOOL_SCREEN, {})
@@ -448,3 +447,146 @@ def test_windows_output_decoded_with_locale_encoding():
     assert res.success is True
     assert "中文输出测试" in (res.stdout or "")
     assert "\ufffd" not in (res.stdout or "")
+
+
+# ------------------------------------------------------------------ #
+# 12. 批次A（第四轮体检）：脱敏补漏 / 词元级黑名单 / override / 容错    #
+# ------------------------------------------------------------------ #
+
+
+def test_redact_covers_prefixed_env_style_keys():
+    """批次A：前缀型环境变量名（OPENAI_API_KEY / HF_TOKEN）纳入脱敏。
+
+    修复前 ``\\b`` 在 `_` 与词元间不成立，前缀型密钥名整体漏检。
+    """
+    from lite.computer_control import _redact
+
+    assert _redact("OPENAI_API_KEY=sk-abc123") == "OPENAI_API_KEY=***"
+    assert _redact("HF_TOKEN=xxx") == "HF_TOKEN=***"
+    assert _redact("AWS_SECRET_ACCESS_KEY=wJalr") == "AWS_SECRET_ACCESS_KEY=***"
+    assert "sk-abc123" not in _redact("OPENAI_API_KEY=sk-abc123")
+
+
+def test_redact_covers_json_style_keys():
+    """批次A：JSON 引号形态（"api_key": "sk-x"）纳入脱敏。"""
+    from lite.computer_control import _redact
+
+    out = _redact('"api_key": "sk-x"')
+    assert out == '"api_key": "***"'
+    assert "sk-x" not in out.replace('"api_key"', "")  # 键名保留、值被掩码
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "if exist x del x",
+        "for %i in (1) do del c:\\x",
+        "if exist x rd /s /q C:\\y",
+        "d^el dirty.tmp",
+        "for %i in (1) do r^mdir /s c:\\z",
+    ],
+)
+def test_control_flow_destructive_tokens_blocked(cmd):
+    """批次A：控制流包裹 / 转义形态下破坏词作为中间词元出现即整体 BLOCKED。
+
+    修复前三层护栏全空：首 token=if 不在包裹器名单、_is_destructive 查
+    delete 不查 del、黑名单段首前缀匹配不命中。
+    """
+    ctrl = _make()
+    assert ComputerControl._is_dangerous(cmd) is True
+    res = ctrl.run_command(cmd)
+    assert res.success is False
+    assert res.error_code == BLOCKED
+    assert "黑名单" in (res.error or "")
+
+
+def test_control_flow_wrappers_require_confirmation():
+    """批次A：if / for / do / while 控制流关键字补入包裹器确认闸名单。"""
+    assert ComputerControl._requires_confirmation("if exist file echo ok") is True
+    assert ComputerControl._requires_confirmation("for %i in (1) do echo ok") is True
+    assert ComputerControl._requires_confirmation("do something") is True
+    # 无破坏词、无包裹器的组合命令仍不误伤
+    assert ComputerControl._requires_confirmation("echo hi & echo bye") is False
+
+
+def test_authorized_override_allows_single_call_without_mutating_state():
+    """批次A：authorized_override=True 单次放行且不污染实例授权状态。"""
+    screen = FakeScreenBackend()
+    ctrl = _make(screen=screen, authorized=False)
+    res = ctrl.call_tool(TOOL_SCREEN, {}, authorized_override=True)
+    assert res.success is True
+    assert res.authorized is True
+    assert ctrl.authorized is False  # 实例状态未被读写污染
+    assert screen.regions == [None]
+
+
+def test_run_command_authorized_override_without_mutating_state():
+    """批次A：run_command 的 authorized_override 单次放行，实例状态不变。"""
+    ctrl = _make(authorized=False)
+    res = ctrl.run_command(f'"{PY}" -c "print(\'OVR_OK\')"', authorized_override=True)
+    assert res.success is True
+    assert "OVR_OK" in (res.result or "")
+    assert ctrl.authorized is False
+
+
+def test_authorized_override_false_denies_authorized_instance():
+    """批次A：authorized_override=False 对已授权实例单次拒绝（默认 None 走实例状态）。"""
+    ctrl = _make(authorized=True)
+    with pytest.raises(NotAuthorizedError):
+        ctrl.call_tool(TOOL_SCREEN, {}, authorized_override=False)
+    # 默认 None：沿用实例状态，正常放行
+    res = ctrl.call_tool(TOOL_SCREEN, {})
+    assert res.success is True
+
+
+def test_run_command_invalid_timeout_falls_back():
+    """批次A：timeout_s 非法（如 LLM 传入 "30s"）回退默认超时，不抛指令级异常。"""
+    ctrl = _make()
+    res = ctrl.run_command(f'"{PY}" -c "print(\'TIME_OK\')"', timeout_s="30s")
+    assert res.success is True
+    assert "TIME_OK" in (res.result or "")
+
+    res2 = ctrl.run_command(f'"{PY}" -c "print(\'TIME_OK2\')"', timeout_s=object())
+    assert res2.success is True
+    assert "TIME_OK2" in (res2.result or "")
+
+
+def test_timeout_second_communicate_fallback_force_close(monkeypatch):
+    """批次A：超时回收后二次 communicate 仍超时 -> 强制关闭管道并返回，不无限阻塞。"""
+    import subprocess as sp
+
+    from lite.computer_control import control as control_mod
+
+    closed = []
+
+    class _FakeStream:
+        def close(self):
+            closed.append(True)
+
+    class _FakePopen:
+        """二次 communicate 均超时的假进程：验证兜底分支强制关管道。"""
+
+        def __init__(self, *args, **kwargs):
+            self.pid = 424242
+            self.stdout = _FakeStream()
+            self.stderr = _FakeStream()
+            self.returncode = None
+
+        def communicate(self, timeout=None):
+            raise sp.TimeoutExpired(cmd="fake", timeout=timeout or 0)
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(control_mod.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(control_mod.subprocess, "run", lambda *a, **kw: None)
+
+    ctrl = _make()
+    exit_code, stdout, stderr, timed_out = ctrl._run_subprocess("echo hang", 0.1)
+    assert timed_out is True
+    assert exit_code is None
+    assert stdout == "" and stderr == ""
+    assert len(closed) == 2  # stdout / stderr 均被强制关闭

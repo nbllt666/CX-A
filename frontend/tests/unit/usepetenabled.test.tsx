@@ -17,13 +17,25 @@ describe('usePetEnabled', () => {
     expect(result.current.enabled).toBe(false);
   });
 
-  it('初始读取 localStorage：键值为 "true" 时读回 true', () => {
+  it('初始读取 localStorage：键值为 "1" 时读回 true（新约定，D7）', () => {
+    window.localStorage.setItem(PET_ENABLED_KEY, '1');
+    const { result } = renderHook(() => usePetEnabled());
+    expect(result.current.enabled).toBe(true);
+  });
+
+  it('初始读取 localStorage：旧值 "true" 兼容读取为 true（D7 迁移兼容）', () => {
     window.localStorage.setItem(PET_ENABLED_KEY, 'true');
     const { result } = renderHook(() => usePetEnabled());
     expect(result.current.enabled).toBe(true);
   });
 
-  it('setEnabled(true) 后状态翻转并写入 cx-a.petEnabled = "true"', () => {
+  it('旧值 "false" 兼容读取为 false（PetOverlay 关闭按钮写入路径）', () => {
+    window.localStorage.setItem(PET_ENABLED_KEY, 'false');
+    const { result } = renderHook(() => usePetEnabled());
+    expect(result.current.enabled).toBe(false);
+  });
+
+  it('setEnabled(true) 后状态翻转并写入 cx-a.petEnabled = "1"（新约定）', () => {
     const { result } = renderHook(() => usePetEnabled());
     expect(result.current.enabled).toBe(false);
 
@@ -32,17 +44,17 @@ describe('usePetEnabled', () => {
     });
 
     expect(result.current.enabled).toBe(true);
-    expect(window.localStorage.getItem(PET_ENABLED_KEY)).toBe('true');
+    expect(window.localStorage.getItem(PET_ENABLED_KEY)).toBe('1');
   });
 
-  it('setEnabled(false) 后写回 "false"（往返幂等）', () => {
-    window.localStorage.setItem(PET_ENABLED_KEY, 'true');
+  it('setEnabled(false) 后写回 "0"（往返幂等）', () => {
+    window.localStorage.setItem(PET_ENABLED_KEY, '1');
     const { result } = renderHook(() => usePetEnabled());
     act(() => {
       result.current.setEnabled(false);
     });
     expect(result.current.enabled).toBe(false);
-    expect(window.localStorage.getItem(PET_ENABLED_KEY)).toBe('false');
+    expect(window.localStorage.getItem(PET_ENABLED_KEY)).toBe('0');
   });
 
   it('挂载时 enabled=true 且 Electron 环境下主动调 openPetOverlay 恢复悬浮窗', () => {

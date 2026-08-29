@@ -16,7 +16,7 @@ from typing import Optional
 
 from .decay import DecayCalculator
 from .embedding import EmbeddingProvider
-from .manager import MemoryManager
+from .manager import MemoryManager, tokenize_text
 from .scoring import _get_weights, score_memories
 from .storage import MemoryStore
 from .vector_store import VectorStore
@@ -26,11 +26,6 @@ DEFAULT_VECTOR_WEIGHT = 0.6
 DEFAULT_KEYWORD_WEIGHT = 0.4
 # 检索候选数（未显式传入 top_k 时的默认分量）
 DEFAULT_CANDIDATE_COUNT = 20
-
-
-def _tokenize(text) -> set:
-    """粗粒度分词：小写并按空白切分。"""
-    return set(str(text or "").lower().split())
 
 
 def _keyword_overlap(query_tokens, content_tokens) -> float:
@@ -170,13 +165,16 @@ class MemoryRetrievalPipeline:
             query: 查询文本。
             agent_id: 限定记忆归属 agent。
             top_k: 向量检索候选数（None 用默认 20）；实际向量召回取 top_k×2。
+                低-7（第四轮体检批次B）：显式传入 0 按候选下限 1 处理（经
+                max(1, cand_n) 钳制），不再被误当缺省值。
 
         Returns:
             dict: {"memories": list[dict], "context_text": str}。
                 memories 按 final_score 降序，附加 score/vector_score/keyword_score/
                 component_scores/final_score 等字段。
         """
-        cand_n = int(top_k) if top_k else DEFAULT_CANDIDATE_COUNT
+        # 低-7：is not None 判定——显式 top_k=0 是有效取值（钳为候选 1），非缺省
+        cand_n = int(top_k) if top_k is not None else DEFAULT_CANDIDATE_COUNT
         cand_n = max(1, cand_n)
 
         # a) 向量检索
@@ -192,13 +190,15 @@ class MemoryRetrievalPipeline:
             except (TypeError, ValueError):
                 continue
 
-        # b) 关键字检索：对全量内存（含衰减所需状态字段）打分
+        # b) 关键字检索：对全量内存（含衰减所需状态字段）打分。
+        # 中-2（第四轮体检批次B）：分词统一走 manager.tokenize_text（中文 bigram +
+        # 拉丁整词），修复中文整句单 token 导致 keyword_score 恒 0。
         memories = self.store.list(agent_id=agent_id, include_deleted=False)
-        query_tokens = _tokenize(query)
+        query_tokens = tokenize_text(query)
         candidates = []
         for mem in memories:
             mem_id = mem.get("id")
-            content_tokens = _tokenize(mem.get("content", ""))
+            content_tokens = tokenize_text(mem.get("content", ""))
             vector_score = hit_by_id.get(mem_id, 0.0)
             keyword_score = _keyword_overlap(query_tokens, content_tokens)
             # c) 混合加权作为相关性 relevance
@@ -221,12 +221,13 @@ class MemoryRetrievalPipeline:
             relevance_weight=weights["relevance"],
             _decay_calculator=self.decay,
         )
-        # 复用 manager 去重策略（内容相似度阈值 0.85）
-        deduped = self.manager._dedup_retrieved(scored)
-        truncated = deduped[: self.max_memories]
+        # 中-1b（第四轮体检批次B）：先截断再去重——只对最终 top 候选两两比较，
+        # 去重后不足 max_memories 不再回捞（保持简单），不再对全量 N 条 O(N²) 比较
+        truncated = scored[: self.max_memories]
+        deduped = self.manager._dedup_retrieved(truncated)
 
         # e) 组装注入上下文
-        return {"memories": truncated, "context_text": _build_context(truncated)}
+        return {"memories": deduped, "context_text": _build_context(deduped)}
 
 
 def _build_context(memories) -> str:

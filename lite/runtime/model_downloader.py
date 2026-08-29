@@ -28,6 +28,7 @@ import re
 import shutil
 import time
 import urllib.request
+from urllib.parse import quote
 
 from pathlib import Path
 
@@ -154,7 +155,9 @@ class LlmDownloader:
         self._validate_repo(repo)
         self._validate_filename(filename)
         if src == "modelscope":
-            return f"https://modelscope.cn/api/v1/models/{repo}/repo?FilePath={filename}"
+            # 第四轮体检批次C：FilePath 为查询参数，文件名需 URL 编码——含空格/
+            # 特殊字符的文件名此前会构造出非法 URL（常规 .gguf 名编码后不变）
+            return f"https://modelscope.cn/api/v1/models/{repo}/repo?FilePath={quote(filename, safe='')}"
         return f"https://huggingface.co/{repo}/resolve/main/{filename}"
 
     # ------------------------------------------------------------------ #

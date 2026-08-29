@@ -34,7 +34,7 @@ export default function PetOverlay() {
   // 关闭按钮：优先经 IPC 桥让主进程关闭悬浮窗；localStorage 写入保留作状态记录
   const handleClose = () => {
     try {
-      window.localStorage.setItem(PET_ENABLED_KEY, 'false');
+      window.localStorage.setItem(PET_ENABLED_KEY, '0');
     } catch {
       /* no-op */
     }

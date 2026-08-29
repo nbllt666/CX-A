@@ -15,7 +15,12 @@ relevance 由外部（向量检索相似度）给出并通过候选 dict 的 ``s
 相关性计算（任务约定：relevance 由外部传入）。
 """
 
+import logging
+
 from .decay import DecayCalculator, age_seconds_from_created
+
+# 原生日志记录器（低-8：脏数据告警留痕）
+LOGGER = logging.getLogger(__name__)
 
 # 默认三维权重（对齐 CX-O RoutingConfig）
 DEFAULT_WEIGHTS = {"importance": 0.35, "time": 0.25, "relevance": 0.4}
@@ -122,17 +127,26 @@ def score_memories(
     decay = _decay_calculator if _decay_calculator is not None else DecayCalculator()
 
     for cand in candidates:
-        importance = _importance_of(cand)
-        time_score = decay.score(
-            importance=importance,
-            age_seconds=_age_seconds(cand, decay),
-            decay_type=cand.get("decay_type", "ebbinghaus_opt"),
-            params=cand.get("decay_params"),
-            reactivation_count=cand.get("reactivation_count", 0),
-            emotion_score=cand.get("emotion_score", 0.0),
-            permanent=cand.get("permanent", False),
-        )
-        relevance = cand.get("score", 0.5)
+        try:
+            importance = _importance_of(cand)
+            time_score = decay.score(
+                importance=importance,
+                age_seconds=_age_seconds(cand, decay),
+                decay_type=cand.get("decay_type", "ebbinghaus_opt"),
+                params=cand.get("decay_params"),
+                reactivation_count=cand.get("reactivation_count", 0),
+                emotion_score=cand.get("emotion_score", 0.0),
+                permanent=cand.get("permanent", False),
+            )
+            raw_relevance = cand.get("score", 0.5)
+            relevance = 0.5 if raw_relevance is None else float(raw_relevance)
+        except (TypeError, ValueError) as exc:
+            # 低-8：单条脏数据按 0 分跳过（保留在列表末位），不再使整链 500
+            LOGGER.warning("候选记忆 id=%r 打分失败，按 0 分跳过：%s", cand.get("id"), exc)
+            cand["time_score_on_retrieve"] = 0.0
+            cand["component_scores"] = {"importance": 0.0, "time": 0.0, "relevance": 0.0}
+            cand["final_score"] = 0.0
+            continue
         final = (
             importance * weights["importance"]
             + time_score * weights["time"]

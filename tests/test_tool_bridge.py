@@ -288,3 +288,61 @@ def test_execute_restores_computer_authorized_on_exception(tmp_path):
     with pytest.raises(Exception):
         bridge.execute(TOOL_SCREEN, {})
     assert computer.authorized is False
+
+
+# ------------------------------------------------------------------ #
+# 8. 批次A（第四轮体检）：authorized_override 单次放行，不触碰实例状态  #
+# ------------------------------------------------------------------ #
+
+
+def test_bridge_execute_never_toggles_instance_authorized(tmp_path):
+    """批次A：bridge 执行改传 authorized_override=True，全程不调用 set_authorized。
+
+    修复前 set_authorized(True)/finally 恢复存在 TOCTOU 与并发互覆——A 的
+    finally 会翻转 B 正在使用的授权，执行期 revoke 被临时提权覆盖。
+    """
+    authorizer = ControlAuthorizer(data_dir=str(tmp_path))
+    authorizer.authorize()
+
+    set_calls = []
+
+    class _RecordingComputer(ComputerControl):
+        """记录 set_authorized 调用的探针实例（初始实例级未授权）。"""
+
+        def set_authorized(self, flag):
+            set_calls.append(bool(flag))
+            super().set_authorized(flag)
+
+    computer = _RecordingComputer(
+        authorized=False,
+        screen_backend=FakeScreenBackend(),
+        keyboard_backend=FakeKeyboardBackend(),
+    )
+    bridge = ToolBridge(computer=computer, authorizer=authorizer)
+
+    payload = bridge.execute(TOOL_SCREEN, {})
+    assert payload["success"] is True
+    assert set_calls == []  # 全程未触碰实例授权状态（先改后还原已移除）
+    assert computer.authorized is False  # 实例闸门保持原值
+    # 绕过 bridge 的直接调用仍被实例闸门拒绝
+    with pytest.raises(NotAuthorizedError):
+        computer.call_tool(TOOL_SCREEN, {})
+
+
+def test_bridge_execute_command_via_override_without_mutation(tmp_path):
+    """批次A：指令工具经 authorized_override 放行执行，实例状态不变。"""
+    authorizer = ControlAuthorizer(data_dir=str(tmp_path))
+    authorizer.authorize()
+    computer = ComputerControl(
+        authorized=False,
+        screen_backend=FakeScreenBackend(),
+        keyboard_backend=FakeKeyboardBackend(),
+    )
+    bridge = ToolBridge(computer=computer, authorizer=authorizer)
+    payload = bridge.execute(
+        TOOL_COMMAND, {"command": f'"{PY}" -c "print(\'OVR_EXEC_OK\')"'}
+    )
+    assert payload["success"] is True
+    assert "OVR_EXEC_OK" in (payload.get("result") or "")
+    assert payload["authorized"] is True  # 有效授权状态如实反映单次放行
+    assert computer.authorized is False

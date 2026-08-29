@@ -15,6 +15,7 @@
 路径 / 导入规范：本项目一律使用包绝对导入（``from lite.config import ConfigManager``）。
 """
 
+import http.client
 import json
 import logging
 import urllib.error
@@ -260,7 +261,15 @@ class CloudAdapter:
                     yield content
         except CloudUnavailableError:
             raise
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            OSError,
+            ValueError,
+        ) as exc:
+            # 第四轮体检批次C：补捕 http.client.HTTPException——流式响应中途的
+            # IncompleteRead / BadStatusLine（API 网关 504/502 常见形态）此前会
+            # 穿透统一异常契约，导致 fallback 的 CloudUnavailableError 降级失效
             raise CloudUnavailableError(
                 f"云端流式调用失败（{self._provider} @ {self.base_url}）：{exc}"
             ) from exc
@@ -276,7 +285,10 @@ class CloudAdapter:
             return bool(self._transport_online(url, timeout))
         try:
             if _HAS_REQUESTS:  # pragma: no cover - 依赖探测分支
-                requests.get(url, timeout=timeout)
+                # 第四轮体检批次C：with 确定性关闭响应——探测用途无需读体，
+                # 修复前未关闭导致连接滞留池中
+                with requests.get(url, timeout=timeout) as resp:
+                    pass
             else:  # pragma: no cover - urllib 回退
                 try:
                     with urllib.request.urlopen(url, timeout=timeout):

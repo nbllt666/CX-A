@@ -597,3 +597,77 @@ def test_discovery_entries_capped_and_overflow_dropped(capsys):
     d.parse_packet(_beacon("overflow-node2"), ("10.0.0.9", 9998))
     output = capsys.readouterr().out
     assert output.count("已达上限") == 1
+
+
+# ------------------------------------------------------------------ #
+# 8. 第四轮体检批次C：固定窗口发现 / 端口归一化 / last_seen 时效        #
+# ------------------------------------------------------------------ #
+
+
+def test_discover_lan_fixed_window_collects_multi_nodes():
+    """第四轮体检批次C：窗口内命中首个信标后不再提前收窗——固定窗口跑满，
+    多节点发现结果完整收集。"""
+    node_a = ({"agent_id": "node-a", "host": "192.168.1.20", "port": 9000}, ("192.168.1.20", 9000))
+    node_b = ({"agent_id": "node-b", "host": "192.168.1.21", "port": 9001}, ("192.168.1.21", 9001))
+    stub = _StubDiscovery(prefill=[node_a, node_b])
+    acp = LiteACP(config=_config(lan_discovery=True))
+
+    started = time.monotonic()
+    agents = acp.discover_lan(timeout=0.15, discovery_factory=lambda: stub)
+    elapsed = time.monotonic() - started
+
+    # 旧实现 found_agents 非空即提前返回（elapsed≈0）；修复后固定窗口跑满
+    assert elapsed >= 0.14, f"发现窗口未跑满：elapsed={elapsed:.3f}s"
+    assert [a["agent_id"] for a in agents] == ["node-a", "node-b"]
+    assert stub.stopped
+
+
+@pytest.mark.parametrize("raw_port", ["not-a-port", 0, 70000, -1, 3.5, True, None])
+def test_discovery_invalid_port_normalized_to_zero(raw_port):
+    """第四轮体检批次C：非法 port（非 int / 越出 1-65535）归一化为 0，agent 保留。"""
+    d = LiteLanDiscovery()
+    raw = json.dumps({"type": "ACP_BEACON", "agent_id": "n1", "port": raw_port}).encode()
+    agent = d.parse_packet(raw, ("10.0.0.1", 7000))
+    assert agent["port"] == 0
+    assert len(d.found_agents) == 1
+
+
+def test_discovery_valid_port_boundaries_kept():
+    """合法端口边界值 1 / 65535 原样保留。"""
+    d = LiteLanDiscovery()
+    low = d.parse_packet(
+        json.dumps({"type": "ACP_BEACON", "agent_id": "n1", "port": 1}).encode(),
+        ("10.0.0.1", 7000),
+    )
+    assert low["port"] == 1
+    high = d.parse_packet(
+        json.dumps({"type": "ACP_BEACON", "agent_id": "n2", "port": 65535}).encode(),
+        ("10.0.0.2", 7001),
+    )
+    assert high["port"] == 65535
+
+
+def test_discovery_last_seen_refresh_and_prune_expired():
+    """第四轮体检批次C：记录带 last_seen；重复信标命中去重时刷新保鲜；
+    prune_expired 清理超时记录并允许同一节点重新登记。"""
+    d = LiteLanDiscovery()
+    d.parse_packet(_beacon("n1"), ("10.0.0.1", 7000))
+    record, _addr = d.found_agents[0]
+    assert record["last_seen"] > 0
+
+    # 重复信标：不重复登记，但刷新已登记记录的 last_seen 保鲜
+    record["last_seen"] = time.time() - 1000
+    d.parse_packet(_beacon("n1"), ("10.0.0.1", 7000))
+    assert len(d.found_agents) == 1
+    assert record["last_seen"] > time.time() - 60
+
+    # 未超时：全部保留
+    assert d.prune_expired(max_age_seconds=3600) == 0
+    assert len(d.found_agents) == 1
+
+    # 超时：清理并同步去重集合 → 同一节点可重新登记
+    record["last_seen"] = time.time() - 400
+    assert d.prune_expired(max_age_seconds=300) == 1
+    assert d.found_agents == []
+    d.parse_packet(_beacon("n1"), ("10.0.0.1", 7000))
+    assert len(d.found_agents) == 1

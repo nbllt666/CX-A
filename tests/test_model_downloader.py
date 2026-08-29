@@ -102,6 +102,16 @@ def test_build_url_modelscope():
     )
 
 
+def test_build_url_modelscope_filename_url_encoded():
+    """第四轮体检批次C：ModelScope FilePath 为查询参数，文件名需 URL 编码——
+    含空格/特殊字符的文件名不再产生非法 URL（常规 .gguf 名编码后不变）。"""
+    dl = LlmDownloader(dest_dir="/tmp")
+    url = dl.build_url("modelscope", MODELSCOPE_REPO, "qwen v2 part.gguf")
+    assert url == (
+        f"https://modelscope.cn/api/v1/models/{MODELSCOPE_REPO}/repo?FilePath=qwen%20v2%20part.gguf"
+    )
+
+
 def test_build_url_huggingface():
     """HuggingFace source → hf URL 模板。"""
     dl = LlmDownloader(dest_dir="/tmp")

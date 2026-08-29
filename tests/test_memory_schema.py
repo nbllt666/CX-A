@@ -11,6 +11,7 @@ import pytest
 
 from lite.memory.schema import (
     COLUMNS,
+    CREATE_INDEX_SQL,
     CREATE_TABLE_SQL,
     MEMORY_TYPES,
     SYNC_RESERVED_COLUMNS,
@@ -150,3 +151,24 @@ def test_memory_types_enum():
 def test_columns_contract_matches_schema_module(table_info):
     # 契约常量 COLUMNS 与建表实际列完全一致
     assert set(COLUMNS.keys()) == set(table_info.keys())
+
+
+def test_create_index_sql_targets_agent_and_deleted():
+    """中-1a：检索组合索引 DDL 覆盖 agent_id + is_deleted，且 IF NOT EXISTS 幂等。"""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(CREATE_TABLE_SQL)
+        conn.execute(CREATE_INDEX_SQL)
+        # 幂等：重复执行不抛异常
+        conn.execute(CREATE_INDEX_SQL)
+        idx = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_agent'"
+        ).fetchone()
+        assert idx is not None
+        # 索引可用：按 agent_id + is_deleted 过滤查询正常执行
+        rows = conn.execute(
+            "SELECT id FROM memories WHERE agent_id='a' AND is_deleted=0"
+        ).fetchall()
+        assert rows == []
+    finally:
+        conn.close()

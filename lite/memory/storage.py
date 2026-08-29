@@ -8,11 +8,15 @@ TEXT 结构字段（metadata/decay_params/tags）写读均有 JSON 序列化防�
 """
 
 import json
+import logging
 import os
 import sqlite3
 from datetime import datetime
 
-from .schema import COLUMNS, CREATE_TABLE_SQL, MEMORY_TYPES
+from .schema import COLUMNS, CREATE_INDEX_SQL, CREATE_TABLE_SQL, MEMORY_TYPES
+
+# 原生日志记录器（低-10：update 未知键告警留痕）
+LOGGER = logging.getLogger(__name__)
 
 # 解析路径：lite/memory/schema.py -> lite/memory -> lite -> 项目根目录
 _MEMORY_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -94,6 +98,8 @@ class MemoryStore:
         # 未显式提供 db_path 时，指向项目根目录下 data/memories.db（禁止相对路径）
         self.db_path = db_path or _default_db_path()
         self._conn = None
+        # 中-1a：检索索引就绪标记（连接级一次性补建，避免每次 _ensure_table 重复执行）
+        self._index_ready = False
 
     # ------------------------------------------------------------------ 连接管理
     def _connect(self) -> sqlite3.Connection:
@@ -125,14 +131,20 @@ class MemoryStore:
 
     # ------------------------------------------------------------------ 建表
     def create_table(self) -> bool:
-        """创建 memories 表。"""
+        """创建 memories 表，并确保检索组合索引存在（中-1a）。"""
         conn = self._connect()
         conn.execute(CREATE_TABLE_SQL)
+        conn.execute(CREATE_INDEX_SQL)
         conn.commit()
+        self._index_ready = True
         return True
 
     def _ensure_table(self):
-        """表不存在时自动建表（auto_init 规范）。"""
+        """表不存在时自动建表（auto_init 规范）。
+
+        中-1a：每次调用幂等确保检索索引存在——CREATE INDEX IF NOT EXISTS
+        既有库（无索引旧库）升级路径在此补建；连接级标记避免重复执行。
+        """
         conn = self._connect()
         row = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'"
@@ -140,6 +152,10 @@ class MemoryStore:
         if row is None:
             conn.execute(CREATE_TABLE_SQL)
             conn.commit()
+        if not self._index_ready:
+            conn.execute(CREATE_INDEX_SQL)
+            conn.commit()
+            self._index_ready = True
 
     # ------------------------------------------------------------------ 校验
     @staticmethod
@@ -188,6 +204,10 @@ class MemoryStore:
     def update(self, memory_id: int, fields: dict) -> int:
         """按 id 更新字段，自动刷新 updated_at。返回受影响行数。
 
+        未知键处理（低-10，第四轮体检批次B）：部分未知键时忽略并在日志告警
+        指明被忽略键名；全部为未知键时直接返回 0——不再空刷新 updated_at 并
+        以 rowcount 误导调用方"更新成功"。
+
         Raises:
             ValueError: fields 中 type 非法。
         """
@@ -195,14 +215,19 @@ class MemoryStore:
             return 0
         if "type" in fields:
             self._validate_type(fields["type"])
+        unknown_keys = [k for k in fields if k not in _INSERT_COLUMNS]
+        if unknown_keys:
+            LOGGER.warning("update 忽略未知字段 keys=%s（memory_id=%s）", unknown_keys, memory_id)
         updates = {
             k: (_serialize_json_text(v) if k in _JSON_TEXT_COLUMNS else v)
             for k, v in fields.items()
             if k in _INSERT_COLUMNS
         }
-        updates["updated_at"] = _now()
         if not updates:
+            # 全为未知键：无事可做，返回 0（低-10：不再空刷新 updated_at 误导调用方）
+            LOGGER.warning("update 仅收到未知字段，未做任何更新（memory_id=%s）", memory_id)
             return 0
+        updates["updated_at"] = _now()
         sets = ",".join(f"{k}=?" for k in updates)
         params = list(updates.values()) + [memory_id]
         self._ensure_table()
@@ -258,5 +283,32 @@ class MemoryStore:
         if limit is not None:
             sql += " LIMIT ?"
             params.append(int(limit))
+        rows = self._connect().execute(sql, params).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def list_recent(self, agent_id=None, limit=500, include_deleted=False) -> list:
+        """按 id 降序返回最近 limit 条记忆（有界查询，中-1c）。
+
+        供写入口相似判定（manager._find_similar）等只需近期样本的场景使用，
+        默认上限 500 条，避免每次写入对全 agent 全表扫描。过滤语义与
+        :meth:`list` 一致，仅排序方向与默认上限不同。
+
+        Args:
+            agent_id: 按 agent 归属过滤（None=全部）。
+            limit: 返回条数上限（默认 500）。
+            include_deleted: 是否包含已软删除记录，默认仅返回未删除。
+        Returns:
+            list[dict]: 最近写入的记忆记录，按 id 降序。
+        """
+        self._ensure_table()
+        conditions, params = [], []
+        if not include_deleted:
+            conditions.append("is_deleted=0")
+        if agent_id is not None:
+            conditions.append("agent_id=?")
+            params.append(agent_id)
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = f"SELECT * FROM memories{where} ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
         rows = self._connect().execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]

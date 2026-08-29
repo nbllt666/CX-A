@@ -111,15 +111,13 @@ class ToolBridge:
                 }
 
         # 3. 实际执行：委托 computer.call_tool 分派到真实后端
-        # M-1：执行期临时开启实例闸门，完成后恢复原值——不再永久污染
-        # ComputerControl 实例级授权状态（原实现 set_authorized(True) 从不
-        # 恢复，导致未授权实例经一次 bridge 调用后独立闸门被永久打开）
-        previous_authorized = self._computer.authorized
-        self._computer.set_authorized(True)
-        try:
-            result: ToolResult = self._computer.call_tool(tool, dict(arguments))
-        finally:
-            self._computer.set_authorized(previous_authorized)
+        # 批次A（第四轮体检，20260829_模块0_电脑控制安全与工具层修复）：改传
+        # authorized_override=True 显式单次放行——不再在共享实例状态上先改后
+        # 还原，消除原 set_authorized(True)/finally 恢复的 TOCTOU 与并发互覆
+        # （A 的 finally 会翻转 B 的授权；执行期 revoke 被临时提权覆盖）。
+        result: ToolResult = self._computer.call_tool(
+            tool, dict(arguments), authorized_override=True
+        )
 
         # 4. 操作审计 + 结果回填
         summary = self._result_summary(result)

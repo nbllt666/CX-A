@@ -90,3 +90,39 @@ def test_explicit_weights_override():
     # importance 权重为 1：a 胜
     ra = score_memories([dict(cands[0]), dict(cands[1])], query="q", importance_weight=1.0, time_weight=0.0, relevance_weight=0.0)
     assert ra[0]["id"] == "a"
+
+
+# ---------------------------------------------------------------- 脏数据容错（低-8，第四轮体检批次B）
+def test_dirty_importance_score_skipped_as_zero():
+    """单条脏 importance_score：按 0 分保留在末位，不再放大为整链异常。"""
+    cands = [
+        {"id": "bad", "content": "脏数据", "importance_score": "oops", "score": 0.8},
+        _cand(importance=0.7, relevance=0.8, cid="good"),
+    ]
+    result = score_memories(cands, query="q")
+    by_id = {c["id"]: c for c in result}
+    assert by_id["bad"]["final_score"] == 0.0
+    assert by_id["good"]["final_score"] > 0.0
+    # 脏数据排在末位
+    assert result[-1]["id"] == "bad"
+
+
+def test_dirty_relevance_score_skipped_as_zero():
+    """脏 score（相关性非数值）同样按 0 分跳过，不抛 TypeError。"""
+    cands = [{"id": "bad2", "content": "x", "importance_score": 0.5, "score": "not-a-number"}]
+    result = score_memories(cands, query="q")
+    assert result[0]["final_score"] == 0.0
+
+
+def test_dirty_decay_params_tolerated_in_scoring():
+    """脏 decay_params（参数值为非数值）经 decay 容错回退默认，打分正常完成。"""
+    cand = {
+        "id": "d",
+        "content": "x",
+        "importance_score": 0.5,
+        "score": 0.5,
+        "created_at": "2026-08-01 00:00:00.000000",
+        "decay_params": {"t50": "abc", "k": None},
+    }
+    result = score_memories([cand], query="q")
+    assert 0.0 <= result[0]["final_score"] <= 1.0

@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import locale
+import logging
 import os
 import re
 import signal
@@ -207,6 +208,14 @@ DANGEROUS_COMMANDS: List[str] = [
     "powershell -executionpolicy bypass -command remove",
 ]
 
+#: 破坏性指令词元集合（批次A，第四轮体检）：取 ``DANGEROUS_COMMANDS`` 中的单词项，
+#: 并补 ``erase`` / ``deltree`` 等词元形态。分段拆 token 后任一 token 命中即判高危，
+#: 覆盖 ``if exist x del x`` / ``for %i in (1) do del c:\x`` 等"破坏词藏在段中"形态
+#: ——段首前缀匹配对此全部穿透。
+DANGEROUS_TOKENS: frozenset = frozenset(
+    [d for d in DANGEROUS_COMMANDS if " " not in d] + ["erase", "deltree"]
+)
+
 #: 需强制二次确认的包裹器名单（N2，20260828_模块0_API鉴权与安全链路修复）：
 #: 命令首 token（含带引号绝对路径形态取 basename）命中此名单时，黑名单之外仍
 #: 强制进入高危确认闸——防止 ``cmd /c del ...`` / ``powershell -c ri ...`` /
@@ -231,13 +240,31 @@ CONFIRM_REQUIRED_WRAPPERS: List[str] = [
     "pythonw",
     "node",
     "start",
+    # 批次A（第四轮体检，20260829_模块0_电脑控制安全与工具层修复）：控制流包裹词。
+    # ``if exist x del x`` / ``for %i in (1) do del c:\x`` 等形态首 token 为控制流
+    # 关键字，黑名单前缀与原包裹器名单均不命中，三层护栏全空——补入确认闸名单。
+    "if",
+    "for",
+    "do",
+    "while",
 ]
+
+#: 原生日志记录器（timeout_s 非法回退 / 超时管道兜底等告警出口）
+LOGGER = logging.getLogger(__name__)
 
 
 # 密钥 / 密码类模式：api_key / apikey / password / passwd / token / secret
 # 后跟冒号或等号分隔的值，命中的值部分整体脱敏为 ***。
+# 批次A（第四轮体检）：相比旧版 ``\b`` 形态补三类漏配——
+# 1) 前缀型环境变量名（``OPENAI_API_KEY=sk-xxx`` / ``HF_TOKEN=xxx``）：
+#    ``\b`` 在 `_` 与词元间不成立，改用 ``[\w-]*`` 前缀组捕获完整键名；
+# 2) 关键词在变量名中部的形态（``AWS_SECRET_ACCESS_KEY=...``）：
+#    关键词后接 ``[\w-]*`` 名称续字符；
+# 3) JSON 形态（``"api_key": "sk-x"``）：分隔符两侧允许引号。
 _REDACT_PATTERN = re.compile(
-    r"(?i)\b(api[_-]?key|password|passwd|token|secret)(\s*[:=]\s*)([^\s,:;]+)"
+    r"(?i)([\w-]*(?:api[_-]?key|password|passwd|token|secret)[\w-]*)"
+    r"(\s*[\"']?\s*[:=]\s*[\"']?)"
+    r"([^\s,:;\"]+)"
 )
 
 # Bearer 令牌形态：``Authorization: Bearer sk-xxx`` 中的令牌值脱敏（M-4）
@@ -338,13 +365,29 @@ class ComputerControl:
         """
         self._authorized = bool(authorized)
 
-    def _ensure_authorized(self, tool: str) -> None:
+    def _effective_authorized(self, authorized_override: Optional[bool]) -> bool:
+        """计算本次调用的有效授权状态（批次A，第四轮体检）。
+
+        ``authorized_override`` 为 None 时沿用实例状态（原语义）；为 True/False
+        时**单次生效且不读写实例状态**——供 ToolBridge 等内部路径显式放行，
+        消除"set_authorized 先改后还原"的 TOCTOU 与并发互覆窗口。
+
+        :param authorized_override: 单次授权覆盖值（None=沿用实例状态）
+        :return: 本次调用的有效授权状态
+        """
+        return self._authorized if authorized_override is None else bool(authorized_override)
+
+    def _ensure_authorized(
+        self, tool: str, authorized_override: Optional[bool] = None
+    ) -> None:
         """授权闸门：未授权立即抛 NotAuthorizedError，不执行任何本机动作。
 
         :param tool: 待执行工具标识（仅用于日志）
+        :param authorized_override: 单次授权覆盖值（None=沿用实例状态，见
+            :meth:`_effective_authorized`）
         :raises NotAuthorizedError: 授权未开启
         """
-        if not self._authorized:
+        if not self._effective_authorized(authorized_override):
             self._log("deny", tool)
             raise NotAuthorizedError(
                 f"本地授权未开启，已拒绝电脑控制调用（{tool}），未执行任何本机动作。"
@@ -354,7 +397,12 @@ class ComputerControl:
     # 统一入口                                                           #
     # ------------------------------------------------------------------ #
 
-    def call_tool(self, tool: str, arguments: Dict[str, Any]) -> ToolResult:
+    def call_tool(
+        self,
+        tool: str,
+        arguments: Dict[str, Any],
+        authorized_override: Optional[bool] = None,
+    ) -> ToolResult:
         """统一调用入口：按 tool 分派到屏幕 / 键盘 / 指令。
 
         顺序约束（与 pyi 调用顺序对齐到本内置版本）：
@@ -364,22 +412,32 @@ class ComputerControl:
 
         :param tool: 工具稳定标识（TOOL_SCREEN / TOOL_KEYBOARD / TOOL_COMMAND）
         :param arguments: 结构化工具参数
+        :param authorized_override: 单次授权覆盖值（None=沿用实例状态）；
+            仅 ToolBridge 内部路径传入，不在共享实例状态上先改后还原（批次A）
         :return: ToolResult 或子类
         :raises NotAuthorizedError: 授权未开启
         :raises InvalidArgumentError: 未知工具或参数非法
         """
-        self._ensure_authorized(tool)
+        self._ensure_authorized(tool, authorized_override)
         arguments = arguments or {}
 
         if tool == TOOL_SCREEN:
-            return self.screenshot_action(arguments.get("region"))
+            return self.screenshot_action(
+                arguments.get("region"), authorized_override=authorized_override
+            )
 
         if tool == TOOL_KEYBOARD:
             action = (arguments.get("action") or "").lower()
             if action == "click":
-                return self.click_action(arguments.get("x"), arguments.get("y"))
+                return self.click_action(
+                    arguments.get("x"),
+                    arguments.get("y"),
+                    authorized_override=authorized_override,
+                )
             if action in ("type", "type_text") or "text" in arguments:
-                return self.type_action(arguments.get("text", ""))
+                return self.type_action(
+                    arguments.get("text", ""), authorized_override=authorized_override
+                )
             raise InvalidArgumentError(
                 f"键盘工具参数非法：需 action=click 或 type，收到 {action!r}"
             )
@@ -388,31 +446,43 @@ class ComputerControl:
             return self.run_command(
                 arguments.get("command", ""),
                 timeout_s=arguments.get("timeout_s"),
+                authorized_override=authorized_override,
             )
 
         self._log("unknown", tool)
         raise InvalidArgumentError(f"未知电脑控制工具：{tool!r}")
 
-    def execute(self, tool: str, arguments: Dict[str, Any]) -> ToolResult:
+    def execute(
+        self,
+        tool: str,
+        arguments: Dict[str, Any],
+        authorized_override: Optional[bool] = None,
+    ) -> ToolResult:
         """``call_tool`` 的同义别名，供内部 / 调用方语义化使用。
 
         :param tool: 工具稳定标识
         :param arguments: 结构化工具参数
+        :param authorized_override: 单次授权覆盖值（语义同 :meth:`call_tool`）
         :return: ToolResult 或子类
         """
-        return self.call_tool(tool, arguments)
+        return self.call_tool(tool, arguments, authorized_override)
 
     # ------------------------------------------------------------------ #
     # 屏幕控制                                                           #
     # ------------------------------------------------------------------ #
 
-    def screenshot_action(self, region: Optional[Dict[str, Any]] = None) -> ScreenResult:
+    def screenshot_action(
+        self,
+        region: Optional[Dict[str, Any]] = None,
+        authorized_override: Optional[bool] = None,
+    ) -> ScreenResult:
         """截取屏幕，委托 screen_backend.screenshot(region)。
 
         :param region: 可选裁剪区域（后端约定的 dict，如 {left, top, width, height}）
+        :param authorized_override: 单次授权覆盖值（None=沿用实例状态，批次A）
         :return: ScreenResult；result 为图像字节
         """
-        self._ensure_authorized(TOOL_SCREEN)
+        self._ensure_authorized(TOOL_SCREEN, authorized_override)
         self._log("action", TOOL_SCREEN, extra=f"region={region}")
         try:
             image = self._screen_backend.screenshot(region)
@@ -425,21 +495,27 @@ class ComputerControl:
             tool=TOOL_SCREEN,
             result=image,
             action="screenshot",
-            authorized=self._authorized,
+            authorized=self._effective_authorized(authorized_override),
         )
 
     # ------------------------------------------------------------------ #
     # 键盘控制                                                           #
     # ------------------------------------------------------------------ #
 
-    def click_action(self, x: int, y: int) -> KeyboardResult:
+    def click_action(
+        self,
+        x: int,
+        y: int,
+        authorized_override: Optional[bool] = None,
+    ) -> KeyboardResult:
         """在 (x, y) 处点击，委托 keyboard_backend.click(x, y)。
 
         :param x: 横坐标
         :param y: 纵坐标
+        :param authorized_override: 单次授权覆盖值（None=沿用实例状态，批次A）
         :return: KeyboardResult（action="click"）
         """
-        self._ensure_authorized(TOOL_KEYBOARD)
+        self._ensure_authorized(TOOL_KEYBOARD, authorized_override)
         self._log("action", TOOL_KEYBOARD, extra=f"click=({x},{y})")
         try:
             self._keyboard_backend.click(x, y)
@@ -452,16 +528,19 @@ class ComputerControl:
             tool=TOOL_KEYBOARD,
             result={"action": "click", "x": x, "y": y},
             action="click",
-            authorized=self._authorized,
+            authorized=self._effective_authorized(authorized_override),
         )
 
-    def type_action(self, text: str) -> KeyboardResult:
+    def type_action(
+        self, text: str, authorized_override: Optional[bool] = None
+    ) -> KeyboardResult:
         """输入文本，委托 keyboard_backend.type_text(text)。
 
         :param text: 要输入的文本
+        :param authorized_override: 单次授权覆盖值（None=沿用实例状态，批次A）
         :return: KeyboardResult（action="type"）
         """
-        self._ensure_authorized(TOOL_KEYBOARD)
+        self._ensure_authorized(TOOL_KEYBOARD, authorized_override)
         self._log("action", TOOL_KEYBOARD, extra="type")
         try:
             self._keyboard_backend.type_text(text)
@@ -474,7 +553,7 @@ class ComputerControl:
             tool=TOOL_KEYBOARD,
             result={"action": "type", "text": text},
             action="type",
-            authorized=self._authorized,
+            authorized=self._effective_authorized(authorized_override),
         )
 
     # ------------------------------------------------------------------ #
@@ -482,7 +561,10 @@ class ComputerControl:
     # ------------------------------------------------------------------ #
 
     def run_command(
-        self, command: str, timeout_s: Optional[int] = None
+        self,
+        command: str,
+        timeout_s: Optional[int] = None,
+        authorized_override: Optional[bool] = None,
     ) -> CommandResult:
         """运行指令，自带护栏：授权 / 黑名单 / 超时杀进程树 / 输出截断 / 脱敏。
 
@@ -490,11 +572,15 @@ class ComputerControl:
         仅授权未开启时抛 NotAuthorizedError。
 
         :param command: 要执行的指令字符串
-        :param timeout_s: 超时秒数；缺省用构造时的 timeout_s
+        :param timeout_s: 超时秒数；缺省用构造时的 timeout_s；非法值（如 LLM
+            传入 "30s"）告警后回退构造时的 timeout_s，不抛异常（批次A）
+        :param authorized_override: 单次授权覆盖值（None=沿用实例状态）；
+            仅 ToolBridge 内部路径传入，不在共享实例状态上先改后还原（批次A）
         :return: CommandResult
         :raises NotAuthorizedError: 授权未开启
         """
-        self._ensure_authorized(TOOL_COMMAND)
+        self._ensure_authorized(TOOL_COMMAND, authorized_override)
+        effective_authorized = self._effective_authorized(authorized_override)
         self._log("action", TOOL_COMMAND, extra=command[:80])
 
         if self._is_dangerous(command):
@@ -503,13 +589,21 @@ class ComputerControl:
                 tool=TOOL_COMMAND,
                 error="黑名单拦截：指令命中危险名单，已拒绝执行",
                 error_code=BLOCKED,
-                authorized=self._authorized,
+                authorized=effective_authorized,
                 exit_code=None,
                 stdout="",
                 stderr="",
             )
 
-        timeout = float(timeout_s) if timeout_s is not None else float(self.timeout_s)
+        # 批次A：timeout_s 非法（TypeError / ValueError）回退默认并告警，
+        # 不向 LLM 调用方抛指令级异常（对齐 docstring 契约）
+        try:
+            timeout = float(timeout_s) if timeout_s is not None else float(self.timeout_s)
+        except (TypeError, ValueError):
+            LOGGER.warning(
+                "电脑控制：timeout_s 非法（%r），已回退默认超时 %ss", timeout_s, self.timeout_s
+            )
+            timeout = float(self.timeout_s)
         # L-2：超时下界钳制，防止 timeout_s=0 / 负数对未瞬时结束进程立即误杀
         timeout = max(timeout, 1.0)
         try:
@@ -530,7 +624,7 @@ class ComputerControl:
                 tool=TOOL_COMMAND,
                 error=f"执行超时（>{timeout:g}s），已回收进程树",
                 error_code="TIMEOUT",
-                authorized=self._authorized,
+                authorized=effective_authorized,
                 exit_code=exit_code,
                 stdout=stdout,
                 stderr=stderr,
@@ -543,7 +637,7 @@ class ComputerControl:
                 success=True,
                 tool=TOOL_COMMAND,
                 result=stdout,
-                authorized=self._authorized,
+                authorized=effective_authorized,
                 exit_code=exit_code,
                 stdout=stdout,
                 stderr=stderr,
@@ -555,7 +649,7 @@ class ComputerControl:
             tool=TOOL_COMMAND,
             error=f"指令退出码非 0：{exit_code}",
             error_code="EXECUTION_FAILED",
-            authorized=self._authorized,
+            authorized=effective_authorized,
             exit_code=exit_code,
             stdout=stdout,
             stderr=stderr,
@@ -583,10 +677,15 @@ class ComputerControl:
         这类"首段无害、后段危险"的组合命令绕过黑名单与确认闸。
         括号统一视作段边界处理，防止 ``(rd /s /q x)`` 以 "(" 开头骗过首 token 判定。
 
+        批次A（第四轮体检）：预处理先剥离 cmd 转义符 ``^``，防止 ``d^el x``
+        之类转义形态骗过词元 / 前缀判定。
+
         :param command: 原始指令字符串
         :return: 拆分后的非空子命令段列表；整串无分隔符时为单段
         """
         cmd = command or ""
+        # cmd 转义符 ^ 先剥离（批次A），避免 d^el / r^mdir 之类形态绕过判定
+        cmd = cmd.replace("^", "")
         # 括号分组视作段边界（替换为分号强制分段）
         cmd = cmd.replace("(", "; ").replace(")", "; ")
         segments = [seg.strip() for seg in cls._COMMAND_SPLIT_PATTERN.split(cmd)]
@@ -597,8 +696,12 @@ class ComputerControl:
     def _is_dangerous(cls, command: str) -> bool:
         """判定命令是否命中危险黑名单（H-1：逐段判定，任一段命中即整体命中）。
 
-        对每个子命令段独立做前缀 + 边界匹配，组合命令中任何一段命中
-        危险名单即整体判定为危险，杜绝"首段无害掩护后段危险"的绕过。
+        对每个子命令段独立做两层判定（批次A，第四轮体检）：
+        1. **词元级扫描**：拆 token 后任一 token 命中 :data:`DANGEROUS_TOKENS`
+           即判高危——覆盖 ``if exist x del x`` 等"破坏词藏在段中"形态；
+        2. **前缀 + 边界匹配**：保留既有 ``DANGEROUS_COMMANDS`` 前缀判定
+           （覆盖 ``taskkill /f`` / ``reg delete`` 等多词形态）。
+        组合命令中任何一段命中即整体判定为危险，杜绝绕过。
 
         :param command: 指令字符串
         :return: True 表示危险
@@ -607,6 +710,10 @@ class ComputerControl:
             cmd = segment.lower()
             if not cmd:
                 continue
+            # 词元级扫描（批次A）：任一 token 命中破坏性词即整体高危
+            tokens = [tok.strip("\"'") for tok in cmd.split()]
+            if any(tok in DANGEROUS_TOKENS for tok in tokens):
+                return True
             for dangerous in DANGEROUS_COMMANDS:
                 d = dangerous.lower().strip()
                 if cmd == d:
@@ -697,8 +804,28 @@ class ComputerControl:
             return proc.returncode, stdout, stderr, False
         except subprocess.TimeoutExpired:
             self._kill_process_tree(proc)
-            stdout, stderr = proc.communicate()
-            return None, stdout, stderr, True
+            # 批次A（第四轮体检）：二次回收带 5s 超时兜底——修复前二次
+            # communicate() 无超时，管道被残留子进程握持时可无限阻塞。
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+                return None, stdout, stderr, True
+            except subprocess.TimeoutExpired:
+                # 仍超时：强制关闭管道避免无限阻塞，输出以空串兜底
+                LOGGER.warning(
+                    "电脑控制：超时回收后子进程管道仍阻塞，已强制关闭管道（pid=%s）",
+                    proc.pid,
+                )
+                for stream in (proc.stdout, proc.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:  # noqa: BLE001 - 关闭失败不阻断返回
+                            pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:  # noqa: BLE001 - 等待失败不阻断返回
+                    pass
+                return None, "", "", True
 
     @staticmethod
     def _kill_process_tree(proc: subprocess.Popen) -> None:
