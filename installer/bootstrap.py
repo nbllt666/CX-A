@@ -15,6 +15,7 @@ import datetime
 import json
 import os
 import shutil
+import subprocess
 import sys
 
 #: 本安装器目录（installer/），基于文件绝对位置推导，禁止相对路径。
@@ -35,6 +36,12 @@ if PROJECT_ROOT not in sys.path:
 
 from lite.config.config_manager import ConfigManager  # noqa: E402
 from lite.memory.storage import MemoryStore  # noqa: E402
+
+# Task H4：GPU 加速依赖检测与清单装配（失败不阻断主安装，故导入失败同样兜底）
+try:
+    from installer.gpu_detect import GpuDetector, default_runner as _gpu_default_runner  # noqa: E402
+except ImportError:  # pragma: no cover - CLI 直跑包上下文缺失时的兜底路径
+    from gpu_detect import GpuDetector, default_runner as _gpu_default_runner  # type: ignore[no-redef]  # noqa: E402
 
 
 #: 数据目录相对项目根的子目录（与工程文档 §4 及 manifest install_target 对齐）。
@@ -274,6 +281,131 @@ def init_workplace(root):
 
 
 # ------------------------------------------------------------------ #
+# GPU 加速依赖（Task H4）：检测 → 清单装配 → 引导式安装                  #
+# ------------------------------------------------------------------ #
+
+
+def build_gpu_dependency_commands(recommend, cuda_version=None):
+    """按 GPU 检测结论装配加速依赖命令清单。
+
+    清单条目均为可直接执行的命令字符串；以 ``# `` 开头的条目为说明性注释
+    （引导用户手动完成 llama.cpp 特殊构建等步骤），自动安装时会被跳过。
+
+    :param recommend: 检测结论 ``"cuda" | "rocm" | "cpu"``。
+    :param cuda_version: 驱动报告的 CUDA 版本（如 "12.4"），仅用于注释说明。
+    :return: list[str] 命令清单。
+    """
+    if recommend == "cuda":
+        commands = [
+            # 人工裁决（2026-09-12）：cuda 分支采用 cu128 新线（torch 最新构建线），
+            # 覆盖 CUDA 12.8+ 运行时，适配新驱动（如 CUDA 13.x UMD 报告）；
+            # cuda_version 写入注释而非硬编码进命令，保持命令可直接执行。
+            f"# 检测到驱动 CUDA 版本：{cuda_version or '未知'}；下列 cu128 轮子面向 CUDA 12.8+ 运行时",
+            "pip install torch --index-url https://download.pytorch.org/whl/cu128",
+            "pip install onnxruntime-gpu",
+            "pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu128 --force-reinstall --no-cache-dir",
+        ]
+    elif recommend == "rocm":
+        commands = [
+            "# PyTorch ROCm 官方轮子（Linux）；Windows 平台 AMD 建议改用 DirectML 后端",
+            "pip install torch --index-url https://download.pytorch.org/whl/rocm6.0",
+            "# Windows + AMD：onnxruntime 采用 DirectML 版本（替代 onnxruntime-gpu）",
+            "pip install onnxruntime-directml",
+            "# llama.cpp 建议使用 Vulkan 预编译构建（llama-*-bin-win-vulkan-x64.zip），解压至 data/local_llm/ 供本地推理调用",
+        ]
+    else:
+        commands = [
+            "pip install torch --index-url https://download.pytorch.org/whl/cpu",
+            "pip install onnxruntime",
+        ]
+    return commands
+
+
+def _default_install_runner(cmd):
+    """自动安装的默认命令执行器：``cmd -> (returncode, 合并输出)``。
+
+    与检测 runner 分离：安装型命令（pip 大包下载）耗时远长于检测命令，
+    超时放宽至 3600s；同样注入 CREATE_NO_WINDOW 且永不抛异常。
+    """
+    creationflags = 0x08000000 if sys.platform == "win32" else 0
+    try:
+        completed = subprocess.run(
+            cmd.split(),
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=3600,
+            creationflags=creationflags,
+        )
+        output = (completed.stdout or "") + (completed.stderr or "")
+        return completed.returncode, output
+    except Exception as exc:  # noqa: BLE001 - 安装失败不阻断主安装
+        return -1, f"{type(exc).__name__}: {exc}"
+
+
+def install_gpu_dependencies(report_path=None, auto_install=False, runner=None):
+    """GPU 加速依赖检测与引导式安装（失败不阻断主安装）。
+
+    流程：GpuDetector 检测 → :func:`build_gpu_dependency_commands` 装配清单 →
+    写报告 → 依 ``auto_install`` 决定仅打印引导命令或逐条真实执行。
+
+    :param report_path: 检测报告落盘绝对路径；缺省 ``<项目根>/data/install_report.json``。
+    :param auto_install: False（默认）仅报告 + 打印待执行命令（引导式）；
+        True 时逐条 subprocess 执行，单条失败仅 [WARN] 并记入 errors，不抛不阻断。
+    :param runner: 命令执行器注入（检测与自动安装共用；测试 mock 入口）。
+    :return: 报告 dict，字段：gpu_vendor / cuda_version / recommend /
+        pending_commands / installed / timestamp（自动安装时附 errors 列表）。
+    """
+    # 1. 检测（runner 注入点贯穿检测与安装）
+    detector = GpuDetector(runner=runner)
+    report = detector.detect()
+    _log_info(f"GPU 检测完成：{report['gpu_vendor']} → 推荐 {report['recommend']}（{report['details']}）")
+
+    # 2. 依检测结论装配依赖清单
+    commands = build_gpu_dependency_commands(report["recommend"], report.get("cuda_version"))
+    result = {
+        "gpu_vendor": report["gpu_vendor"],
+        "cuda_version": report.get("cuda_version"),
+        "recommend": report["recommend"],
+        "pending_commands": list(commands),
+        "installed": False,
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    # 3a. 引导式（默认）：仅打印待执行命令，不做真实安装
+    if not auto_install:
+        for cmd in commands:
+            _log_info(f"[GPU 引导] 待执行命令：{cmd}")
+        _log_info("[GPU 引导] 依赖安装为引导式：请手动执行上述命令，或启用自动安装后重跑。")
+    # 3b. 自动安装：逐条执行；说明性注释（# 开头）跳过；失败仅告警不阻断
+    else:
+        exec_runner = runner if runner is not None else _default_install_runner
+        errors = []
+        executed = 0
+        for cmd in commands:
+            if cmd.startswith("#"):
+                _log_info(f"[GPU 说明] {cmd.lstrip('# ')}")
+                continue
+            executed += 1
+            _log_info(f"[GPU 安装] 正在执行：{cmd}")
+            returncode, output = exec_runner(cmd)
+            if returncode != 0:
+                _log_warn(f"[GPU 安装] 命令执行失败（不阻断主安装）：{cmd}")
+                errors.append({"command": cmd, "returncode": returncode, "output": output[-500:]})
+        if executed > 0 and not errors:
+            result["installed"] = True
+        result["errors"] = errors
+
+    # 4. 报告落盘（路径基于 __file__ 推导项目根，禁止相对路径）
+    path = report_path or os.path.join(PROJECT_ROOT, "data", "install_report.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, ensure_ascii=False, indent=2)
+    _log_info(f"GPU 依赖检测报告已写入：{path}")
+    return result
+
+
+# ------------------------------------------------------------------ #
 # 一键安装编排                                                        #
 # ------------------------------------------------------------------ #
 
@@ -292,6 +424,12 @@ def install(root=None):
         _log_warn(p)
     builtin_warnings = install_builtin_assets(root)
     init_workplace(root)
+    # Task H4：GPU 加速依赖检测（引导式，auto_install=False 不做真实安装，
+    # 检测失败不阻断主安装）；报告随本次安装根落 data/install_report.json
+    try:
+        install_gpu_dependencies(report_path=os.path.join(root, "data", "install_report.json"))
+    except Exception as exc:  # noqa: BLE001 - GPU 步骤失败绝不阻断主安装
+        _log_warn(f"GPU 依赖检测步骤异常（已跳过，不阻断主安装）：{type(exc).__name__}: {exc}")
     # 批次E：安装后复查，保证返回报告反映安装后实况
     problems = verify_components(root)
     _log_info("一键安装流程完成。")

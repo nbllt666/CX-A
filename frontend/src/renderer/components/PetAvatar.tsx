@@ -1,6 +1,9 @@
 import React from 'react';
 
-export type PetMood = 'happy' | 'calm';
+/** 表情档位（Task H3 对齐 spec）：happy 开心 / calm 平静 / sad 悲伤 /
+ *  surprised 惊讶 / shy 害羞 / sleepy 困倦。后端情绪集另含 angry（CX-O 兼容），
+ *  前端未单列该档——调用方应将 angry 回落 calm（见 ChatPage extractMood）。 */
+export type PetMood = 'happy' | 'calm' | 'sad' | 'surprised' | 'shy' | 'sleepy';
 
 interface PetAvatarProps {
   mood: PetMood;
@@ -14,9 +17,12 @@ interface PetAvatarProps {
  * 简化二次元卡通桌宠形象 —— 纯 CSS 占位，无 VRM / Three.js 等重依赖。
  *
  * 形象构成：圆脸 + 刘海 + 耳朵 + 眼睛 + 腮红 + 嘴。
- *   - 呼吸：脸整体做轻微缩放起伏；
- *   - 口型：data-talking 时嘴在两档开合间循环（说话占位动画）；
- *   - 表情：data-mood 控制眼睛/嘴形态，happy（开心）与 calm（平静）两种。
+ *   - 呼吸：脸整体做轻微缩放起伏（sleepy 档呼吸节奏放慢）；
+ *   - 口型：data-talking 时嘴在两档开合间循环（说话占位动画，优先于 mood 嘴样式）；
+ *   - 表情：data-mood 控制眼睛/腮红/嘴形态，共 6 档（Task H3）：
+ *       happy 开心（弯弯笑脸眼 + 饱满笑嘴）、calm 平静（圆眼 + 小圆嘴）、
+ *       sad 悲伤（八字下垂眼 + 嘴角倒弧）、surprised 惊讶（圆睁大眼 + O 型嘴）、
+ *       shy 害羞（眯眼 + 腮红加深放大）、sleepy 困倦（半闭眼 + 小嘴 + 呼吸变慢）。
  *
  * PetPage（浏览器预览态）与 PetOverlay（Electron 悬浮窗）复用此组件。
  * 组件自带 scoped <style>，不依赖全局样式，可独立作为根节点渲染。
@@ -199,6 +205,117 @@ const PET_CSS = `
   border-radius: 0 0 50% 50%;
   background: linear-gradient(180deg, #f477a8, #d94a84);
 }
+
+/* ---- sad 悲伤：八字下垂眼 + 嘴角倒弧 ---- */
+.cx-pet[data-mood='sad'] .cx-pet-eye {
+  top: 43%;
+  height: 12%;
+  background: transparent;
+}
+.cx-pet[data-mood='sad'] .cx-pet-eye::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  border-bottom: 4.5px solid #56468c;
+  border-left: 4.5px solid #56468c;
+  border-radius: 0 0 0 60%;
+  box-sizing: border-box;
+}
+.cx-pet[data-mood='sad'] .cx-pet-eye-r::after {
+  transform: scaleX(-1);
+  border-radius: 0 0 60% 0;
+}
+.cx-pet[data-mood='sad'] .cx-pet-eye-iris,
+.cx-pet[data-mood='sad'] .cx-pet-eye-hi {
+  display: none;
+}
+.cx-pet[data-mood='sad'] .cx-pet-mouth {
+  width: 14%;
+  height: 7%;
+  bottom: 16%;
+  background: #c85a8a;
+  border-radius: 50% 50% 0 0;
+}
+
+/* ---- surprised 惊讶：圆睁大眼 + O 型嘴 ---- */
+.cx-pet[data-mood='surprised'] .cx-pet-eye {
+  top: 31%;
+  height: 30%;
+}
+.cx-pet[data-mood='surprised'] .cx-pet-eye-iris {
+  left: 16%;
+  top: 14%;
+  width: 68%;
+  height: 70%;
+}
+.cx-pet[data-mood='surprised'] .cx-pet-mouth {
+  width: 11%;
+  height: 11%;
+  bottom: 15%;
+  border-radius: 50%;
+  background: #c94a7e;
+}
+
+/* ---- shy 害羞：眯眼 + 腮红加深放大 + 小圆嘴 ---- */
+.cx-pet[data-mood='shy'] .cx-pet-eye {
+  top: 42%;
+  height: 9%;
+  background: transparent;
+}
+.cx-pet[data-mood='shy'] .cx-pet-eye::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  border-bottom: 4px solid #56468c;
+  border-radius: 0 0 50% 50%;
+  box-sizing: border-box;
+}
+.cx-pet[data-mood='shy'] .cx-pet-eye-iris,
+.cx-pet[data-mood='shy'] .cx-pet-eye-hi {
+  display: none;
+}
+.cx-pet[data-mood='shy'] .cx-pet-blush {
+  width: 18%;
+  height: 12%;
+  background: rgba(255, 100, 175, 0.75);
+}
+.cx-pet[data-mood='shy'] .cx-pet-mouth {
+  width: 10%;
+  height: 6%;
+  bottom: 22%;
+  border-radius: 50%;
+}
+
+/* ---- sleepy 困倦：半闭眼 + 小嘴 + 呼吸变慢 ---- */
+.cx-pet[data-mood='sleepy'] .cx-pet-eye {
+  top: 40%;
+  height: 12%;
+  overflow: hidden;
+  border-radius: 50% 50% 40% 40%;
+}
+.cx-pet[data-mood='sleepy'] .cx-pet-eye-iris {
+  left: 20%;
+  top: 55%;
+}
+.cx-pet[data-mood='sleepy'] .cx-pet-eye-hi {
+  display: none;
+}
+.cx-pet[data-mood='sleepy'] .cx-pet-mouth {
+  width: 9%;
+  height: 6%;
+  bottom: 22%;
+  border-radius: 50%;
+}
+.cx-pet[data-mood='sleepy'] .cx-pet-face {
+  animation-duration: 5.6s;
+}
+
 /* 说话：口型两档开合循环（说话占位动画） */
 .cx-pet[data-talking='true'] .cx-pet-mouth {
   animation: cx-pet-talk 0.52s ease-in-out infinite;

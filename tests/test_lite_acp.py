@@ -524,7 +524,13 @@ def test_new_config_sections_defaults():
         "cloud_relay": True,
         "cloud_relay_endpoint": "",
     }
-    assert DEFAULTS["cxfc"] == {"enabled": False, "embedded_only": True}
+    # Task H1：cxfc 段新增 relay 窗口默认值（relay_timeout_s / replay_window_s，秒）
+    assert DEFAULTS["cxfc"] == {
+        "enabled": False,
+        "embedded_only": True,
+        "relay_timeout_s": 10.0,
+        "replay_window_s": 60.0,
+    }
     assert DEFAULTS["tools"] == {
         "computer_control": False,
         "memory_tools": True,

@@ -18,8 +18,10 @@ export const IS_BACKEND_READY = true;
 
 export const API_ENDPOINTS = {
   chat: {
-    /** 发起聊天 */
+    /** 发起聊天（既有守卫端点，复数路径） */
     sendMessage: `${API_BASE}/chat/messages`,
+    /** 表情聊天（Task H3）：走云端流式拼接 + 标签解析，返回 {clean_text, mood, raw} */
+    message: `${API_BASE}/chat/message`,
   },
   memories: {
     /** 记忆列表 */
@@ -142,6 +144,39 @@ export interface ChatSendPayload {
  */
 export async function sendMessage(payload: ChatSendPayload): Promise<unknown> {
   return requestJson<unknown>(API_ENDPOINTS.chat.sendMessage, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** 表情聊天请求体（Task H3） */
+export interface ChatMessagePayload {
+  message: string;
+  /** 可选智能体 id：命中本地 Agent 时以其 persona 作为 system 人设 */
+  agent_id?: string;
+}
+
+/** 表情聊天响应：clean_text 为后端解析后的干净文本（已识别情绪标签已剥离，
+ *  未知/非法标签按 spec 口径原文保留）；mood 为表情档位（离线/无标签为 calm）；
+ *  raw 为云端原始带标签文本。 */
+export interface ChatMessageResult {
+  ok: boolean;
+  clean_text: string;
+  mood: string;
+  raw: string;
+  /** 离线兜底标记：后端无 api_key / 云端不可达时为 true（clean_text 为固定友好文案） */
+  offline?: boolean;
+}
+
+/**
+ * 发送一条表情聊天消息到后端 POST /api/chat/message（Task H3）。
+ * 后端走 CloudAdapter 流式拼接 + EmotionTagParser 解析；无 api_key / 云端
+ * 不可达时不抛 5xx，返回 ok:true + 固定友好文案 + mood=calm（offline:true），
+ * 前端把该文案作为伴侣气泡真实展示（后端真实回传，非本地伪造）。
+ */
+export async function sendChatMessage(payload: ChatMessagePayload): Promise<ChatMessageResult> {
+  return requestJson<ChatMessageResult>(API_ENDPOINTS.chat.message, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),

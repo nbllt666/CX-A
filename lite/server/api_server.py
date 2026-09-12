@@ -26,6 +26,22 @@
     POST   /api/voice/synthesize    文本合成语音（body {text, voice?}；后端异常 503）
     POST   /api/voice/transcribe    语音转文本（body {audio_base64, sample_rate?}；后端异常 503）
 
+CXFC relay 前端转接（Task H1，对齐 C:\\CX-O\\docs\\CXFC开发文档.md §2.2）：
+    GET    /api/cxfc/relay/pending  取走待执行 relay 调用（?plugin_id= 过滤 &limit= 上限；
+                                    at-most-once：取走即从队列移除，未回报最终 RELAY_TIMEOUT）
+    POST   /api/cxfc/relay/result   前端回报一次 relay 调用结果（body {request_id, plugin_id,
+                                    success, result|error}；命中 {"status":"ok"}；
+                                    未知/已超时 request_id 404）
+
+表情聊天（Task H3，对齐 spec「虚拟形象表情优化」）：
+    POST   /api/chat/message        表情聊天（body {message, agent_id?}）：走 CloudAdapter
+                                    流式调用拼接完整回复，经 EmotionTagParser 解析标签后
+                                    返回 {ok, clean_text, mood, raw}；无 api_key / 云端
+                                    不可达时返回固定友好文案 + mood=calm（offline:true），
+                                    不抛 5xx；agent_id 命中本地 Agent 时以其 persona
+                                    作为 system 人设。既有 /api/chat/messages（复数，
+                                    未启用守卫）保持不变。
+
 > 管理面已收敛为纯 API：前端不再路由 Agents/Remote/Status，管理能力以上述端点
 > + /api/agents、/api/remote/* 外露，供另一 Agent 或管理工具调用。
 
@@ -36,6 +52,8 @@
 线程安全说明：本服务使用单线程 HTTPServer（一次只处理一个连接/请求），
 MemoryStore 的 sqlite3 连接与 MemoryRetrievalPipeline 均在主处理线程内串行使用，
 不引入并发读写，故无需加锁。若要切换到并发服务器，需另行处理存储连接竞争。
+relay 两端点仅做「取走队列 / 回填等待者」轻量操作：relay 调用的阻塞等待由
+LiteCXFC 内部 Event 在调用方线程承载，不占用 HTTP 线程（Task H1）。
 """
 
 import argparse
@@ -54,6 +72,16 @@ LOGGER = logging.getLogger(__name__)
 
 # 聊天服务未启用守卫错误码（前端本期走 Mock 演示，端点存在但明确提示）
 CHAT_SERVICE_DISABLED = "chat_service_disabled"
+
+# 表情聊天离线兜底文案（Task H3）：无 api_key / 云端不可达时作为 clean_text 返回
+CHAT_OFFLINE_TEXT = "现在连不上云端…"
+
+# 表情聊天默认 system 提示（agent_id 未命中本地 Agent 时使用）：引导 LLM 以
+# [emotion:x] 标签表达情绪，情绪集与 lite/avatar/tags.SUPPORTED_EMOTIONS 一致
+_CHAT_DEFAULT_SYSTEM = (
+    "你是用户的虚拟伴侣，回复请自然、温暖；可在句中插入情绪标签表达当下心情，"
+    "格式为 [emotion:情绪]，支持：happy/calm/sad/surprised/angry/sleepy/shy。"
+)
 
 # ------------------------------------------------------------------ 启动令牌鉴权（N1）
 # 环境变量 CXA_API_TOKEN 非空时，除 OPTIONS 预检与 GET /api/health 外的所有请求
@@ -85,6 +113,9 @@ _MAX_AGENT_ID_CHARS = 100
 # 范围外的 id 直接入库会触发 sqlite OverflowError → 500，边界处显式 400
 _INT64_MIN = -(2 ** 63)
 _INT64_MAX = 2 ** 63 - 1
+
+# CXFC relay pending 单次默认取走条数（Task H1）：可用 ?limit= 覆盖（上限钳制）
+_RELAY_PENDING_DEFAULT_LIMIT = 50
 
 # 回环监听地址集合（中-4 启动安全闸判定口径，第四轮体检批次B）
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -175,10 +206,12 @@ from lite.computer_control.security import ControlAuthorizer  # noqa: E402
 from lite.computer_control.tool_bridge import ToolBridge  # noqa: E402
 from lite.config.config_manager import DEFAULTS, ConfigManager  # noqa: E402
 from lite.cloud.adapter import PROVIDER_BASE_URLS  # noqa: E402
-from lite.cloud.adapter import CloudAdapter, CloudConfigError  # noqa: E402
+from lite.cloud.adapter import CloudAdapter, CloudConfigError, CloudUnavailableError  # noqa: E402
+from lite.avatar import EmotionTagParser  # noqa: E402
 from lite.memory.distillation import DistillationPaused, MemoryDistiller  # noqa: E402
 from lite.tools.builtin_registry import BuiltinToolRegistry  # noqa: E402
 from lite.audio import LiteVoicePipeline, build_default_pipeline  # noqa: E402
+from lite.cxfc import LiteCXFC  # noqa: E402
 
 # 云端 provider 白名单（L-8：从 adapter.PROVIDER_BASE_URLS 派生，单一真相源，
 # 新增 provider 无需再同步本文件；置于 lite 包 import 之后——派生依赖其符号）
@@ -340,7 +373,7 @@ def build_runtime_deps(data_dir=None, config=None, store=None, pipeline=None, co
 def make_handler(
     store, pipeline, manager=None, remote=None,
     computer=None, authorizer=None, bridge=None, config=None,
-    registry=None, distiller=None, voice=None,
+    registry=None, distiller=None, voice=None, cxfc=None, chat_cloud=None,
 ):
     """基于指定依赖构建处理器类（闭包绑定 store / pipeline / manager / remote / computer，便于测试隔离）。
 
@@ -354,6 +387,13 @@ def make_handler(
             依赖回落默认构建（voice 默认构建经 build_default_pipeline 的 Mock
             兜底零失败；registry / distiller 默认构建复用下方已解析的
             computer / authorizer / bridge 与 config / store / pipeline 上下文）。
+        cxfc: 可选 LiteCXFC 实例（Task H1；供 /api/cxfc/relay/* 端点使用）。
+            缺省按 config 的 cxfc 段默认构建（enabled 由配置驱动，默认 False）；
+            测试可注入临时实例（enabled/embedded_only/relay_timeout_s 自定）。
+        chat_cloud: 可选云端适配器实例（Task H3；供 /api/chat/message 表情聊天
+            端点使用）。缺省按 config 构建默认 CloudAdapter（构造期零失败，
+            CloudConfigError / CloudUnavailableError 延迟到 chat 调用时抛出，
+            由端点兜底为离线文案）；测试注入内存 mock 以避免真实网络。
     """
     if manager is None:
         manager = AgentManager()
@@ -408,6 +448,15 @@ def make_handler(
             store=store,
             manager=getattr(pipeline, "manager", None),
         )
+    # Task H1（N8 语义延续）：仅对显式为 None 的 CXFC 实例回落默认构建——
+    # enabled / embedded_only / relay 窗口参数由 config 的 cxfc 段驱动（默认全关）。
+    if cxfc is None:
+        cxfc = LiteCXFC(config=config)
+    # Task H3（N8 语义延续）：仅对显式为 None 的表情聊天云端适配器回落默认构建。
+    # CloudAdapter 构造期零失败（CloudConfigError 延迟到 chat 调用时抛出），
+    # 无 api_key 的默认配置下端点自然兜底为离线文案。
+    if chat_cloud is None:
+        chat_cloud = CloudAdapter(config)
 
     class ApiHandler(BaseHTTPRequestHandler):
         """REST 请求处理器。单线程 HTTPServer 内串行执行，无共享状态竞争。"""
@@ -430,6 +479,8 @@ def make_handler(
         _registry = registry
         _distiller = distiller
         _voice = voice
+        _cxfc = cxfc
+        _chat_cloud = chat_cloud
 
         # ------------------------------------------------------------ 底层工具
         def log_message(self, fmt, *args):
@@ -552,7 +603,7 @@ def make_handler(
             """解析查询串为 dict[str, str|None]（首个值优先，空串归一为 None）。"""
             qs = parse_qs(urlparse(self.path).query)
             out = {}
-            for key in ("type", "agent_id", "limit", "q", "top_k", "enabled"):
+            for key in ("type", "agent_id", "limit", "q", "top_k", "enabled", "plugin_id"):
                 vals = qs.get(key)
                 if vals:
                     out[key] = vals[0] or None
@@ -701,6 +752,83 @@ def make_handler(
                 }
             )
 
+        # ------------------------------------------------------------ 表情聊天（Task H3）
+        def _build_chat_messages(self, message, agent_id):
+            """组装表情聊天的消息列表（system 人设 + user 输入）。
+
+            :param message: 用户输入文本（已 strip 非空）
+            :param agent_id: 归一化后的 agent_id；命中本地 Agent 时以其 persona
+                作为人设前缀，未命中（含 AgentNotFound）回落默认提示
+            :return: OpenAI 兼容消息列表 [{role, content}, ...]
+            """
+            persona = None
+            try:
+                persona = str(self._manager.get(agent_id).persona or "").strip()
+            except AgentNotFound:
+                persona = None
+            if persona:
+                system = f"你的角色设定：{persona}\n{_CHAT_DEFAULT_SYSTEM}"
+            else:
+                system = _CHAT_DEFAULT_SYSTEM
+            return [
+                {"role": "system", "content": system},
+                {"role": "user", "content": message},
+            ]
+
+        def _handle_chat_message(self):
+            """POST /api/chat/message：表情聊天端点（Task H3）。
+
+            body {message, agent_id?}：
+            - message 必填非空，否则 400；
+            - 走 CloudAdapter 流式调用拼接完整回复，经 EmotionTagParser 解析
+              [emotion:x] 标签后返回 {ok:true, clean_text, mood, raw}
+              （clean_text 已剥离已识别标签、未知标签原文保留；mood 为首个
+              已识别情绪，默认 calm；raw 为云端原始带标签文本）；
+            - 无 api_key（CloudConfigError）/ 云端不可达（CloudUnavailableError，
+              含流式中断）→ 返回 200 {ok:true, clean_text: 固定友好文案,
+              mood:'calm', offline:true}，不抛 5xx——前端把提示文案作为伴侣
+              气泡真实展示（后端真实回传，非前端伪造）。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            message = str(body.get("message") or "").strip()
+            if not message:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "message 为必填字段且不能为空"},
+                    400,
+                )
+                return
+            agent_id = self._sanitize_agent_id(body.get("agent_id"))
+            messages = self._build_chat_messages(message, agent_id)
+            try:
+                # 流式拼接完整回复（H3 务实落地：后端非流式下发，前端整段渲染）
+                full_text = "".join(self._chat_cloud.chat(messages))
+            except (CloudConfigError, CloudUnavailableError) as exc:
+                LOGGER.warning(
+                    "表情聊天云端不可用（%s）：%s", exc.__class__.__name__, exc
+                )
+                self._send_json(
+                    {
+                        "ok": True,
+                        "clean_text": CHAT_OFFLINE_TEXT,
+                        "mood": "calm",
+                        "raw": CHAT_OFFLINE_TEXT,
+                        "offline": True,
+                    }
+                )
+                return
+            parsed = EmotionTagParser().parse(full_text)
+            self._send_json(
+                {
+                    "ok": True,
+                    "clean_text": parsed["clean_text"],
+                    "mood": parsed["mood"],
+                    "raw": full_text,
+                }
+            )
+
         # ------------------------------------------------------------ 路由
         def do_GET(self):
             """处理 GET：health/status/settings/chat 守卫、记忆/Agent/远端/电脑状态、/api/tools。
@@ -757,13 +885,17 @@ def make_handler(
                     self._handle_tools_list()
                     return
 
+                if path == "/api/cxfc/relay/pending":
+                    self._handle_relay_pending(query)
+                    return
+
                 self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
             except Exception as exc:  # noqa: BLE001 - 兜底：任何畸形输入都得到结构化 500 而非连接中断
                 # SystemExit / KeyboardInterrupt 继承 BaseException，不会被此处捕获
                 self._guard_internal_error(exc)
 
         def do_POST(self):
-            """处理 POST：chat 守卫、Agent/远端/电脑控制、tools/call、memory/distill、voice/*。"""
+            """处理 POST：chat 守卫/表情聊天、Agent/远端/电脑控制、tools/call、memory/distill、voice/*。"""
             if not self._check_host():
                 self._deny_bad_host()
                 return
@@ -774,6 +906,9 @@ def make_handler(
                     return
                 if path == "/api/chat/messages":
                     self._handle_chat_send_guard()
+                    return
+                if path == "/api/chat/message":
+                    self._handle_chat_message()
                     return
                 if path == "/api/agents":
                     self._handle_agents_create()
@@ -801,6 +936,9 @@ def make_handler(
                     return
                 if path == "/api/voice/transcribe":
                     self._handle_voice_transcribe()
+                    return
+                if path == "/api/cxfc/relay/result":
+                    self._handle_relay_result()
                     return
                 self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
             except _BodyTooLarge:
@@ -1317,6 +1455,87 @@ def make_handler(
                 )
                 return
             self._send_json({"ok": True, "text": str(result.get("text", ""))})
+
+        # ------------------------------------------------------------ CXFC relay 前端转接（Task H1）
+        def _handle_relay_pending(self, query):
+            """GET /api/cxfc/relay/pending?plugin_id=&limit=：取走待执行的 relay 调用。
+
+            返回 {ok, calls, count, plugin_id}；calls 每项形如
+            {type:"cxfc_relay_call", plugin_id, tool, arguments, request_id}。
+            取走即从待执行队列移除（at-most-once，LiteCXFC 内部加锁）：前端取走
+            后未回报时，调用方在 relay 超时窗口后收到 RELAY_TIMEOUT。
+            """
+            if self._cxfc is None:
+                self._send_json(
+                    {"ok": False, "error": "cxfc_unavailable", "message": "CXFC 未装配"}, 503
+                )
+                return
+            plugin_id = query.get("plugin_id")
+            limit = _RELAY_PENDING_DEFAULT_LIMIT
+            if query.get("limit") is not None:
+                limit = self._parse_limit_param(query["limit"], "limit")
+                if limit is None:
+                    return
+            calls = self._cxfc.pending_relay_calls(limit=limit, plugin_id=plugin_id)
+            self._send_json(
+                {"ok": True, "calls": calls, "count": len(calls), "plugin_id": plugin_id}
+            )
+
+        def _handle_relay_result(self):
+            """POST /api/cxfc/relay/result：前端回报一次 relay 调用结果。
+
+            body {request_id, plugin_id, success, result|error}：request_id 与
+            success 必填（缺失 / 形态非法 400）；fulfill_relay 命中等待者返回
+            {"status":"ok"}；未知 request_id / 已超时清理 / 重复回报返回
+            404 语义 JSON（ok:false + not_found）。
+            """
+            if self._cxfc is None:
+                self._send_json(
+                    {"ok": False, "error": "cxfc_unavailable", "message": "CXFC 未装配"}, 503
+                )
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            request_id = str(body.get("request_id") or "").strip()
+            if not request_id:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "request_id 为必填字段"}, 400
+                )
+                return
+            success = body.get("success")
+            if not isinstance(success, bool):
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "success 必须为布尔值"}, 400
+                )
+                return
+            # plugin_id 为协议回报字段（CX-O §2.2），fulfill 以 request_id 定位等待者，
+            # 此处仅留痕日志供排查回报归属
+            plugin_id = body.get("plugin_id")
+            LOGGER.debug(
+                "relay 回报 plugin=%r request_id=%s success=%s", plugin_id, request_id, success
+            )
+            if success:
+                result_or_error = body.get("result")
+            else:
+                result_or_error = body.get("error", body.get("result"))
+            try:
+                fulfilled = self._cxfc.fulfill_relay(request_id, success, result_or_error)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
+                return
+            if not fulfilled:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "not_found",
+                        "message": "未知 request_id 或调用已超时/已被回报",
+                    },
+                    404,
+                )
+                return
+            self._send_json({"status": "ok"})
 
         # ------------------------------------------------------------ Agent 接口
         def _read_body_json(self):

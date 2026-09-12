@@ -75,10 +75,28 @@ DEFAULTS = {
         "cloud_relay": True,
         "cloud_relay_endpoint": "",
     },
-    #: 轻量版 CXFC（补充文档 §6.2）：极简 embedded-only 插件注册（默认关，用内置工具系统）
-    "cxfc": {"enabled": False, "embedded_only": True},
+    #: 轻量版 CXFC（补充文档 §6.2 + Task H1 relay）：embedded-only 默认关；
+    #: relay_timeout_s = relay 调用回报等待窗口（秒）；replay_window_s = 防重放时间窗（秒）
+    "cxfc": {
+        "enabled": False,
+        "embedded_only": True,
+        "relay_timeout_s": 10.0,
+        "replay_window_s": 60.0,
+    },
     #: 内置工具系统（补充文档 §6.3）：电脑控制 / 记忆读写 / 系统信息
     "tools": {"computer_control": False, "memory_tools": True, "system_tools": True},
+    #: 主动视觉（Task H2.5，对齐 spec「自适应频率主动视觉」）：默认关（隐私红线）。
+    #: enabled=False 时绝不进行屏幕采样；max_interval_s=最高频最短间隔（剧变态）；
+    #: min_interval_s=最低频最长间隔（静止态）；still_threshold_s=画面持续静止判定窗
+    #: （秒，预留契约键：静止超过该时长逐级降频——当前实现按逐采样变化率直接映射，
+    #: 该键保留供后续静止时长策略使用）；queue_size=视觉片段队列容量。
+    "vision": {
+        "enabled": False,
+        "max_interval_s": 2,
+        "min_interval_s": 30,
+        "still_threshold_s": 10,
+        "queue_size": 16,
+    },
 }
 
 #: 热更新段：切换后即时生效，无需重启（工程文档 §13.3）
@@ -95,6 +113,7 @@ HOT_RELOAD_SECTIONS = (
     "acp",
     "cxfc",
     "tools",
+    "vision",
 )
 
 #: 需重启段：变更后必须重启进程（工程文档 §13.3，向量库路径 / 运行时配置）
