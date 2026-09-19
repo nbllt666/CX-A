@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { GlassCard } from '../components/GlassCard';
 import Toggle from '../components/Toggle';
+import { useRouterOptional } from '../App';
 import {
   IS_BACKEND_READY,
   fetchComputerStatus,
@@ -68,6 +69,8 @@ function writeLsBool(key: string, value: boolean): void {
 }
 
 export default function SettingsPage() {
+  // 非抛错版路由读取：应用内可取到；组件级单测裸渲染时为 null（按钮静默不可跳转，不抛错）
+  const router = useRouterOptional();
   const [provider, setProvider] = useState(FALLBACK_PROVIDER);
   const [localMode, setLocalMode] = useState(FALLBACK_LOCAL_MODE);
   const [voice, setVoice] = useState(FALLBACK_VOICE);
@@ -321,6 +324,25 @@ export default function SettingsPage() {
               <option value="momo">默默（低沉）</option>
               {extraVoice && <option value={extraVoice}>{extraVoice}（当前值）</option>}
             </select>
+          </div>
+        </GlassCard>
+
+        {/* 新手引导入口：重新跑一遍向导（选云端大脑 / 下载线路 / 本地小模型，含下载） */}
+        <GlassCard>
+          <div className="flex items-center justify-between gap-4 p-4">
+            <div>
+              <p className="font-medium">新手引导</p>
+              <p className="text-xs text-[var(--text-tertiary)]">
+                想重新挑云端大脑、换条下载线路，或者下载本地小模型？点这里再跑一遍
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => router?.navigate('setup')}
+              className="shrink-0 rounded-full border border-[var(--glass-border)] px-4 py-1.5 text-sm text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
+            >
+              重新跑一遍新手引导
+            </button>
           </div>
         </GlassCard>
 

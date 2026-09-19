@@ -11,6 +11,7 @@
 本文件位于 ``<root>/installer/bootstrap.py``，上溯一级即项目根（c:\\CX-A）。
 """
 
+import argparse
 import datetime
 import json
 import os
@@ -35,6 +36,12 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from lite.config.config_manager import ConfigManager  # noqa: E402
+from lite.config.download_sources import (  # noqa: E402
+    CHANNELS,
+    DEFAULT_CHANNEL,
+    normalize_channel,
+    pip_index_url,
+)
 from lite.memory.storage import MemoryStore  # noqa: E402
 
 # Task H4：GPU 加速依赖检测与清单装配（失败不阻断主安装，故导入失败同样兜底）
@@ -285,14 +292,24 @@ def init_workplace(root):
 # ------------------------------------------------------------------ #
 
 
-def build_gpu_dependency_commands(recommend, cuda_version=None):
+def build_gpu_dependency_commands(recommend, cuda_version=None, channel=None):
     """按 GPU 检测结论装配加速依赖命令清单。
 
     清单条目均为可直接执行的命令字符串；以 ``# `` 开头的条目为说明性注释
     （引导用户手动完成 llama.cpp 特殊构建等步骤），自动安装时会被跳过。
 
+    Task 9（统一下载源）：``channel`` 为 ``"mirror"`` 时，仅对**普通 pip 包**
+    （``onnxruntime`` / ``onnxruntime-gpu`` / ``onnxruntime-directml``）在命令末尾
+    追加 ``-i <国内镜像索引>``（索引 URL 经
+    ``lite.config.download_sources.pip_index_url`` 派生，禁止硬编码）；
+    ``torch``（pytorch 官方轮子源）与 ``llama-cpp-python``（abetlen 专用源）
+    命令一字不改——镜像站不代理这两类 whl。``channel=None``（未指定）与
+    ``"official"`` 输出与历史版本逐字相同（不追加任何镜像参数）。
+
     :param recommend: 检测结论 ``"cuda" | "rocm" | "cpu"``。
     :param cuda_version: 驱动报告的 CUDA 版本（如 "12.4"），仅用于注释说明。
+    :param channel: 统一下载源通道（``"mirror"`` / ``"official"``）；
+        ``None`` 表示未指定，保持既有输出不变。
     :return: list[str] 命令清单。
     """
     if recommend == "cuda":
@@ -318,7 +335,35 @@ def build_gpu_dependency_commands(recommend, cuda_version=None):
             "pip install torch --index-url https://download.pytorch.org/whl/cpu",
             "pip install onnxruntime",
         ]
+    # channel 未指定（None）时不做任何改写；official 经 pip_index_url 派生为 None，
+    # 同样不追加——两种情形输出与历史版本逐字相同。
+    index_url = pip_index_url(channel) if channel is not None else None
+    if index_url:
+        commands = [_append_pip_index(cmd, index_url) for cmd in commands]
     return commands
+
+
+#: 镜像通道下追加 ``-i <国内索引>`` 的目标包（普通 pip 包）。torch 走 pytorch 官方
+#: 轮子源、llama-cpp-python 走 abetlen 专用源，镜像站不代理其 whl，故不在此列。
+_MIRROR_ELIGIBLE_PACKAGES = ("onnxruntime", "onnxruntime-gpu", "onnxruntime-directml")
+
+
+def _append_pip_index(command, index_url):
+    """对普通 pip 包安装命令追加 ``-i <index_url>``，其余命令原样返回。
+
+    仅改写形如 ``pip install <包名> ...`` 且包名属于
+    :data:`_MIRROR_ELIGIBLE_PACKAGES` 的命令；说明性注释（``#`` 开头）与
+    torch / llama-cpp-python 专用源命令保持不变。
+
+    :param command: 单条命令字符串。
+    :param index_url: 待追加的索引源 URL（如清华 PyPI 镜像）。
+    :return: 改写后的命令字符串（不满足条件时返回原字符串）。
+    """
+    parts = command.split()
+    if len(parts) >= 3 and parts[0] == "pip" and parts[1] == "install" \
+            and parts[2] in _MIRROR_ELIGIBLE_PACKAGES:
+        return f"{command} -i {index_url}"
+    return command
 
 
 def _default_install_runner(cmd):
@@ -343,7 +388,7 @@ def _default_install_runner(cmd):
         return -1, f"{type(exc).__name__}: {exc}"
 
 
-def install_gpu_dependencies(report_path=None, auto_install=False, runner=None):
+def install_gpu_dependencies(report_path=None, auto_install=False, runner=None, channel=None):
     """GPU 加速依赖检测与引导式安装（失败不阻断主安装）。
 
     流程：GpuDetector 检测 → :func:`build_gpu_dependency_commands` 装配清单 →
@@ -353,6 +398,8 @@ def install_gpu_dependencies(report_path=None, auto_install=False, runner=None):
     :param auto_install: False（默认）仅报告 + 打印待执行命令（引导式）；
         True 时逐条 subprocess 执行，单条失败仅 [WARN] 并记入 errors，不抛不阻断。
     :param runner: 命令执行器注入（检测与自动安装共用；测试 mock 入口）。
+    :param channel: 统一下载源通道（Task 9）；透传给命令装配。``None``（默认）
+        保持既有行为——不读配置、不追加镜像索引，输出与历史版本逐字相同。
     :return: 报告 dict，字段：gpu_vendor / cuda_version / recommend /
         pending_commands / installed / timestamp（自动安装时附 errors 列表）。
     """
@@ -361,8 +408,10 @@ def install_gpu_dependencies(report_path=None, auto_install=False, runner=None):
     report = detector.detect()
     _log_info(f"GPU 检测完成：{report['gpu_vendor']} → 推荐 {report['recommend']}（{report['details']}）")
 
-    # 2. 依检测结论装配依赖清单
-    commands = build_gpu_dependency_commands(report["recommend"], report.get("cuda_version"))
+    # 2. 依检测结论装配依赖清单（channel=None 时输出与既有版本逐字相同）
+    commands = build_gpu_dependency_commands(
+        report["recommend"], report.get("cuda_version"), channel=channel
+    )
     result = {
         "gpu_vendor": report["gpu_vendor"],
         "cuda_version": report.get("cuda_version"),
@@ -410,12 +459,58 @@ def install_gpu_dependencies(report_path=None, auto_install=False, runner=None):
 # ------------------------------------------------------------------ #
 
 
-def install(root=None):
-    """一键安装编排：目录初始化 → 组件校验 → 内置组件落位 → 数据目录初始化。
+def resolve_download_channel(root=None, channel=None, config_manager=None):
+    """解析本次安装使用的统一下载源通道（镜像 / 官方）。
+
+    优先级（Task 9「安装期判断镜像源 / 官方源」）：
+
+    1. 显式 ``channel`` 入参 → 经
+       :func:`lite.config.download_sources.normalize_channel` 归一后使用；
+    2. ``<root>/config.json`` 的 ``download.channel``（与前端首启向导、
+       ``/api/setup/status`` 读取同一配置键，不存在第二套真相）；
+    3. 仍读不到（文件不存在 / 解析失败 / 配置对象异常）→
+       :data:`DEFAULT_CHANNEL`（即 ``"mirror"``）。
+
+    任何读取异常均回落默认通道，绝不抛错——安装流程不得因配置问题中断。
+
+    :param root: 安装根目录；缺省用真实项目根 PROJECT_ROOT。
+    :param channel: 显式通道取值；``None`` 表示未显式指定。
+    :param config_manager: 已构造的 ConfigManager（如 init_workplace 的返回值）；
+        缺省按 ``root`` 新建。
+    :return: 归一化后的通道字符串（``"mirror"`` 或 ``"official"``）。
+    """
+    if channel is not None:
+        return normalize_channel(channel)
+    root = root or PROJECT_ROOT
+    try:
+        cfg = config_manager or ConfigManager(
+            config_path=os.path.join(root, "config.json"),
+            data_dir=os.path.join(root, "data"),
+        )
+        return normalize_channel(cfg.get("download", "channel", DEFAULT_CHANNEL))
+    except Exception as exc:  # noqa: BLE001 - 配置不可读一律回落默认通道
+        _log_warn(
+            f"下载通道配置读取失败（已回落默认通道 {DEFAULT_CHANNEL}）："
+            f"{type(exc).__name__}: {exc}"
+        )
+        return DEFAULT_CHANNEL
+
+
+def install(root=None, channel=None):
+    """一键安装编排：目录初始化 → 组件校验 → 内置组件落位 → 数据目录初始化 → GPU 依赖装配。
 
     全程中文 [INFO] 提示。返回 （problems, builtin_warnings），供调用方展示或落盘。
     批次E：problems 为安装完成后复查 verify_components 的终态结果——刚落位的
     组件不再被误报为"待装态"；安装前快照仅用于过程中的告警输出。
+
+    Task 9：``channel`` 为统一下载源通道（镜像 / 官方）。未显式给出时经
+    :func:`resolve_download_channel` 读 ``<root>/config.json`` 的
+    ``download.channel``，仍无则默认 ``mirror``；解析结果显式传给 GPU 依赖装配，
+    镜像通道下普通 pip 包追加国内索引（pytorch / llama-cpp-python 专用源不变）。
+
+    :param root: 安装根目录；缺省用真实项目根 PROJECT_ROOT。
+    :param channel: 统一下载源通道；``None``（默认）时按上述优先级解析。
+    :return: (problems, builtin_warnings) 二元组（既有契约不变）。
     """
     root = root or PROJECT_ROOT
     ensure_dirs(root)
@@ -423,11 +518,20 @@ def install(root=None):
     for p in verify_components(root):
         _log_warn(p)
     builtin_warnings = install_builtin_assets(root)
-    init_workplace(root)
+    cfg = init_workplace(root)
+    # Task 9：安装期解析统一下载源通道（显式入参 → root/config.json → 默认镜像）
+    resolved_channel = resolve_download_channel(root, channel, config_manager=cfg)
+    _log_info(
+        f"依赖安装使用下载通道：{resolved_channel}"
+        f"（mirror=国内镜像加速 / official=官方直连，取自 {'命令行参数' if channel is not None else 'config.json'}）"
+    )
     # Task H4：GPU 加速依赖检测（引导式，auto_install=False 不做真实安装，
     # 检测失败不阻断主安装）；报告随本次安装根落 data/install_report.json
     try:
-        install_gpu_dependencies(report_path=os.path.join(root, "data", "install_report.json"))
+        install_gpu_dependencies(
+            report_path=os.path.join(root, "data", "install_report.json"),
+            channel=resolved_channel,
+        )
     except Exception as exc:  # noqa: BLE001 - GPU 步骤失败绝不阻断主安装
         _log_warn(f"GPU 依赖检测步骤异常（已跳过，不阻断主安装）：{type(exc).__name__}: {exc}")
     # 批次E：安装后复查，保证返回报告反映安装后实况
@@ -436,5 +540,27 @@ def install(root=None):
     return problems, builtin_warnings
 
 
+def main(argv=None):
+    """CLI 入口：``python installer/bootstrap.py [--channel mirror|official]``。
+
+    ``--channel`` 缺省为 ``None``，交由 :func:`install` 按 ``config.json`` 的
+    ``download.channel`` 解析（仍无则默认镜像通道）。
+
+    :param argv: 命令行参数列表；缺省取 ``sys.argv[1:]``。
+    :return: :func:`install` 的 ``(problems, builtin_warnings)`` 二元组。
+    """
+    parser = argparse.ArgumentParser(
+        description="CX-A 一键安装引导（目录初始化 / 组件校验 / 内置组件落位 / 依赖装配）"
+    )
+    parser.add_argument(
+        "--channel",
+        choices=list(CHANNELS),
+        default=None,
+        help="统一下载源通道：mirror=国内镜像加速（默认），official=官方直连；缺省读 config.json",
+    )
+    args = parser.parse_args(argv)
+    return install(channel=args.channel)
+
+
 if __name__ == "__main__":  # pragma: no cover - CLI 直跑入口
-    install()
+    main()

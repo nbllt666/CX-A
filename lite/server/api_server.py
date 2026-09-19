@@ -42,6 +42,16 @@ CXFC relay 前端转接（Task H1，对齐 C:\\CX-O\\docs\\CXFC开发文档.md �
                                     作为 system 人设。既有 /api/chat/messages（复数，
                                     未启用守卫）保持不变。
 
+首启向导接口族（Task 6 / Task 7，对齐 spec「首启向导后端接口」「向导内下载」）：
+    GET    /api/setup/status            向导门控（completed / wizard_required / 当前通道与模型仓库；不含 api_key）
+    GET    /api/setup/recommend         硬件画像 + 推荐配置补丁 + 候选档位 + 建议仓库（探测异常不 5xx）
+    POST   /api/setup/complete          应用向导选择（白名单 + applied/ignored 回显）并置 setup.completed；
+                                        ``local_llm.source`` 由 ``download.channel`` 派生（不一致的显式值入 ignored）
+    POST   /api/setup/model/download    启动本地小 LLM 后台下载（幂等：进行中返回 already_running）
+    GET    /api/setup/model/progress    即时返回下载进度（后台线程执行，不阻塞服务）
+    POST   /api/setup/model/cancel      取消下载（保留 .tmp 供断点续传）
+    以上端点沿用既有 Host / 令牌校验，**不新增豁免端点**。
+
 > 管理面已收敛为纯 API：前端不再路由 Agents/Remote/Status，管理能力以上述端点
 > + /api/agents、/api/remote/* 外露，供另一 Agent 或管理工具调用。
 
@@ -63,6 +73,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -119,6 +130,14 @@ _RELAY_PENDING_DEFAULT_LIMIT = 50
 
 # 回环监听地址集合（中-4 启动安全闸判定口径，第四轮体检批次B）
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+# ------------------------------------------------------------------ 配置写入锁
+# 配置落盘串行化（Task 7「并发配置写入串行化」）：本进程内**所有** ``config.save()``
+# 调用点（请求线程的 /api/settings、/api/setup/complete，以及下载线程的
+# local_llm.model_path 写回）必须共用这一把模块级写锁。归属声明：本模块持有锁对象，
+# 下载管理器经 ``ModelDownloadManager(write_lock=_CONFIG_WRITE_LOCK)`` 注入**同一把**
+# ——请求线程与下载线程共用，防止并发落盘导致 config.json 字段丢失 / 截断。
+_CONFIG_WRITE_LOCK = threading.Lock()
 
 
 def _is_loopback_host(host) -> bool:
@@ -205,10 +224,20 @@ from lite.computer_control.control import (  # noqa: E402
 from lite.computer_control.security import ControlAuthorizer  # noqa: E402
 from lite.computer_control.tool_bridge import ToolBridge  # noqa: E402
 from lite.config.config_manager import DEFAULTS, ConfigManager  # noqa: E402
+from lite.config.download_sources import (  # noqa: E402
+    CHANNELS,
+    DEFAULT_CHANNEL,
+    MODEL_REPOS,
+    model_repo_for_channel,
+    normalize_channel,
+)
 from lite.cloud.adapter import PROVIDER_BASE_URLS  # noqa: E402
 from lite.cloud.adapter import CloudAdapter, CloudConfigError, CloudUnavailableError  # noqa: E402
 from lite.avatar import EmotionTagParser  # noqa: E402
 from lite.memory.distillation import DistillationPaused, MemoryDistiller  # noqa: E402
+from lite.runtime.download_manager import ModelDownloadManager  # noqa: E402
+from lite.runtime.hardware_profile import detect_profile, recommend_for  # noqa: E402
+from lite.runtime.model_downloader import MODEL_TIERS, DEFAULT_TIER  # noqa: E402
 from lite.tools.builtin_registry import BuiltinToolRegistry  # noqa: E402
 from lite.audio import LiteVoicePipeline, build_default_pipeline  # noqa: E402
 from lite.cxfc import LiteCXFC  # noqa: E402
@@ -374,6 +403,7 @@ def make_handler(
     store, pipeline, manager=None, remote=None,
     computer=None, authorizer=None, bridge=None, config=None,
     registry=None, distiller=None, voice=None, cxfc=None, chat_cloud=None,
+    download_manager=None,
 ):
     """基于指定依赖构建处理器类（闭包绑定 store / pipeline / manager / remote / computer，便于测试隔离）。
 
@@ -394,6 +424,11 @@ def make_handler(
             端点使用）。缺省按 config 构建默认 CloudAdapter（构造期零失败，
             CloudConfigError / CloudUnavailableError 延迟到 chat 调用时抛出，
             由端点兜底为离线文案）；测试注入内存 mock 以避免真实网络。
+        download_manager: 可选本地模型后台下载管理器（Task 6；供
+            /api/setup/model/* 三端点使用）。缺省按 config 构建
+            ``ModelDownloadManager``，并注入**本模块的模块级写锁**
+            ``_CONFIG_WRITE_LOCK``（与请求线程共用，串行化 config.save()）；
+            测试可注入替身（``downloader_factory`` 为假下载器，绝不触网）。
     """
     if manager is None:
         manager = AgentManager()
@@ -457,6 +492,12 @@ def make_handler(
     # 无 api_key 的默认配置下端点自然兜底为离线文案。
     if chat_cloud is None:
         chat_cloud = CloudAdapter(config)
+    # Task 6（N8 语义延续）：仅对显式为 None 的下载管理器回落默认构建。写锁显式传入
+    # 本模块的 _CONFIG_WRITE_LOCK——请求线程与下载线程共用同一把，串行化 config.save()。
+    if download_manager is None:
+        download_manager = ModelDownloadManager(
+            config_manager=config, write_lock=_CONFIG_WRITE_LOCK
+        )
 
     class ApiHandler(BaseHTTPRequestHandler):
         """REST 请求处理器。单线程 HTTPServer 内串行执行，无共享状态竞争。"""
@@ -481,6 +522,7 @@ def make_handler(
         _voice = voice
         _cxfc = cxfc
         _chat_cloud = chat_cloud
+        _download_manager = download_manager
 
         # ------------------------------------------------------------ 底层工具
         def log_message(self, fmt, *args):
@@ -720,7 +762,9 @@ def make_handler(
 
             if applied:
                 try:
-                    self._config.save()
+                    # Task 7：与下载线程共用同一把模块级写锁（配置落盘串行化）
+                    with _CONFIG_WRITE_LOCK:
+                        self._config.save()
                 except OSError as exc:  # noqa: BLE001 - 落盘失败不影响内存生效
                     self._send_json(
                         {"ok": False, "error": "config_save_failed", "message": str(exc),
@@ -730,6 +774,316 @@ def make_handler(
                     return
 
             self._send_json({"ok": True, "applied": applied, "ignored": ignored, "config": self._settings_view()})
+
+        # ------------------------------------------------------------ 首启向导接口族（Task 6 / Task 7）
+        def _handle_setup_status(self):
+            """GET /api/setup/status：向导门控与当前下载源取值（**不含 api_key**）。
+
+            返回 ``{completed, wizard_required, download:{channel}, local_llm_source}``：
+            - ``completed`` 读 ``setup.completed``（老 config 无 setup 段时
+              ConfigManager 已按升级兼容补 ``True``）；
+            - ``wizard_required = not completed``，供前端首帧决定是否覆盖主界面；
+            - ``channel`` 经 ``normalize_channel`` 归一（写坏的配置不导致前端空白）；
+            - ``local_llm_source`` 直接读配置 ``local_llm.source`` 真相（可能被手工
+              改过，读取真实值而非重新派生）；缺失或非法时回落
+              ``model_repo_for_channel(channel)``，保证与通道语义一致。
+            """
+            completed = bool(self._config.get("setup", "completed", False))
+            channel = normalize_channel(self._config.get("download", "channel", DEFAULT_CHANNEL))
+            source = str(self._config.get("local_llm", "source", "") or "").strip().lower()
+            if source not in MODEL_REPOS:
+                source = model_repo_for_channel(channel)
+            self._send_json(
+                {
+                    "completed": completed,
+                    "wizard_required": not completed,
+                    "download": {"channel": channel},
+                    "local_llm_source": source,
+                }
+            )
+
+        def _degraded_profile(self, exc):
+            """硬件探测异常时的降级画像（保守走云，不返回 5xx）。"""
+            return {
+                "cpu_cores": None,
+                "ram_gb": None,
+                "gpu_vendor": "cpu",
+                "vram_gb": None,
+                "cuda_version": None,
+                "disk_free_gb": None,
+                "probe_notes": [f"硬件探测失败，已按最保守结论（建议走云端）处理：{exc.__class__.__name__}"],
+            }
+
+        def _degraded_recommendation(self, exc):
+            """推荐推导异常时的降级结论（``local_llm.enabled=False`` 走云）。"""
+            note = f"硬件推荐推导失败，已降级为「先走云端」：{exc.__class__.__name__}"
+            return {
+                "use_local": False,
+                "device": "cpu",
+                "tier": DEFAULT_TIER,
+                "config_patch": {"local_llm": {"enabled": False, "device": "cpu"}},
+                "model": None,
+                "reasons": [note],
+                "probe_notes": [note],
+            }
+
+        def _handle_setup_recommend(self):
+            """GET /api/setup/recommend：硬件画像 + 推荐配置 + 候选档位 + 建议仓库。
+
+            - ``profile``：``detect_profile()`` 产出（其内部已对探测失败降级，此处
+              仍再兜一层 try/except——探测能力缺失时**绝不返回 5xx**）；
+            - ``recommendation``：``recommend_for(profile)`` 产出（异常同样降级为走云）；
+            - ``tiers``：``MODEL_TIERS`` 转列表，每项补 ``tier`` 键；
+            - ``suggested_source``：由当前通道经 ``model_repo_for_channel`` 唯一派生
+              （镜像通道 → 魔塔 ``modelscope``，官方通道 → ``huggingface``）。
+            """
+            try:
+                profile = detect_profile()
+            except Exception as exc:  # noqa: BLE001 - 探测异常必须降级而非 5xx
+                LOGGER.warning("硬件画像探测异常，已降级：%s", exc)
+                profile = self._degraded_profile(exc)
+            try:
+                recommendation = recommend_for(profile)
+            except Exception as exc:  # noqa: BLE001 - 推荐推导异常同样降级
+                LOGGER.warning("硬件推荐推导异常，已降级：%s", exc)
+                recommendation = self._degraded_recommendation(exc)
+            tiers = [dict(entry, tier=name) for name, entry in MODEL_TIERS.items()]
+            channel = normalize_channel(self._config.get("download", "channel", DEFAULT_CHANNEL))
+            self._send_json(
+                {
+                    "profile": profile,
+                    "recommendation": recommendation,
+                    "tiers": tiers,
+                    "suggested_source": model_repo_for_channel(channel),
+                }
+            )
+
+        def _collect_setup_patch(self, body, applied, ignored):
+            """收集向导提交的白名单键（非法取值入 ``ignored`` 显式回显，不静默丢弃）。
+
+            ``download.channel`` 是面向用户的唯一选择（下载路线），``local_llm.source``
+            随之**由通道派生**（经 ``model_repo_for_channel`` 唯一映射）：
+
+            - 通道合法时，服务端派生并写入 ``local_llm.source``，``applied`` 登记
+              ``download.channel`` 与 ``local_llm.source`` 各一次；
+            - 请求同时显式给出 ``local_llm.source``：与派生值一致则不重复登记（照常
+              applied），不一致则**不生效**并列入 ``ignored``（说明由下载路线决定）；
+            - 请求未给通道（或通道非法）时保留既有手工配置能力：显式且合法的
+              ``local_llm.source`` 照常 applied；
+            - 取值不在白名单（通道 / 仓库）一律列入 ``ignored``，不静默丢弃。
+
+            :return: ``dict[(section, key), value]``——显式传入且合法的配置补丁。
+            """
+            pending = {}
+            cloud = body.get("cloud") or {}
+            download = body.get("download") or {}
+            local = body.get("local_llm") or {}
+
+            provider = cloud.get("provider")
+            if provider is not None:
+                if provider in CLOUD_PROVIDER_ALLOWLIST:
+                    pending[("cloud", "provider")] = provider
+                    applied.append("cloud.provider")
+                else:
+                    ignored.append(f"cloud.provider={provider!r}（不在白名单 {CLOUD_PROVIDER_ALLOWLIST}）")
+
+            api_key = cloud.get("api_key")
+            if api_key is not None:
+                if isinstance(api_key, str) and api_key.strip():
+                    # 走 ConfigManager 既有 Fernet 加密链路（save 时统一加密）
+                    pending[("cloud", "api_key")] = api_key.strip()
+                    applied.append("cloud.api_key")
+                else:
+                    ignored.append("cloud.api_key（必须为非空字符串）")
+
+            # 通道（唯一用户选择）：合法则派生模型仓库，作为 local_llm.source 的唯一来源
+            derived_source = None
+            channel = download.get("channel")
+            if channel is not None:
+                normalized = channel.strip().lower() if isinstance(channel, str) else ""
+                if normalized in CHANNELS:
+                    pending[("download", "channel")] = normalized
+                    applied.append("download.channel")
+                    derived_source = model_repo_for_channel(normalized)
+                    pending[("local_llm", "source")] = derived_source
+                    applied.append("local_llm.source")
+                else:
+                    ignored.append(f"download.channel={channel!r}（不在白名单 {list(CHANNELS)}）")
+
+            source = local.get("source")
+            if source is not None:
+                normalized_source = source.strip().lower() if isinstance(source, str) else ""
+                if normalized_source not in MODEL_REPOS:
+                    ignored.append(f"local_llm.source={source!r}（不在白名单 {list(MODEL_REPOS)}）")
+                elif derived_source is not None and normalized_source != derived_source:
+                    # 与派生值冲突：不生效（派生值已写入并 applied，不重复登记）
+                    ignored.append(
+                        f"local_llm.source={normalized_source!r}"
+                        "（由 download.channel 决定，未单独生效）"
+                    )
+                elif derived_source is None:
+                    # 未给通道：保留手工配置能力，显式且合法的仓库照常生效
+                    pending[("local_llm", "source")] = normalized_source
+                    applied.append("local_llm.source")
+
+            enabled = local.get("enabled")
+            if enabled is not None:
+                if isinstance(enabled, bool):
+                    pending[("local_llm", "enabled")] = enabled
+                    applied.append("local_llm.enabled")
+                else:
+                    ignored.append("local_llm.enabled（必须为布尔）")
+
+            return pending
+
+        def _apply_recommended_patch(self, body, pending, applied, ignored):
+            """``apply_recommended=true`` 时把推荐 ``config_patch`` 并入补丁（低优先级）。
+
+            **显式传入的键优先于推荐补丁**：已在 ``pending`` 中的 (section, key)
+            不被推荐值覆盖（用户手改覆盖推荐）。
+            """
+            apply_recommended = body.get("apply_recommended")
+            if apply_recommended is None:
+                return
+            if not isinstance(apply_recommended, bool):
+                ignored.append("apply_recommended（必须为布尔）")
+                return
+            if not apply_recommended:
+                return
+            try:
+                recommendation = recommend_for(detect_profile())
+            except Exception as exc:  # noqa: BLE001 - 探测失败不阻断向导完成
+                LOGGER.warning("采纳推荐配置时硬件探测异常，已跳过推荐补丁：%s", exc)
+                ignored.append("apply_recommended（硬件探测失败，未应用推荐配置）")
+                return
+            patch = recommendation.get("config_patch") or {}
+            for section, keys in patch.items():
+                if not isinstance(keys, dict):
+                    continue
+                for key, value in keys.items():
+                    if (section, key) in pending:
+                        continue  # 显式传入优先
+                    pending[(section, key)] = value
+                    applied.append(f"config_patch.{section}.{key}")
+
+        def _handle_setup_complete(self):
+            """POST /api/setup/complete：应用向导选择并置 ``setup.completed = true``。
+
+            口径与既有 ``/api/settings`` 对齐：
+            - malformed / 非 dict JSON body → 400 ``bad_json``；
+            - 空 body（``{}``）→ 400 ``empty_body``；
+            - ``cloud`` / ``download`` / ``local_llm`` 段存在但非 dict → 400；
+            - 非法取值（provider / channel / source 白名单外、api_key 非字符串、
+              enabled 非布尔）**不生效**但列入 ``ignored`` 显式回显；
+            - ``local_llm.source`` 由 ``download.channel`` 派生（``model_repo_for_channel``
+              唯一映射）：显式给出且与派生值不一致时不生效并入 ``ignored``；
+              未给通道时保留手工配置能力（显式且合法照常生效）；
+            - ``apply_recommended=true`` 合并推荐 ``config_patch``（显式键优先）；
+            - ``api_key`` 可省略（稍后补填），省略时向导仍可完成。
+
+            配置写入（补丁 + setup 段 + save）在同一把模块级写锁内完成，
+            与下载线程的 ``local_llm.model_path`` 写回串行。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            if not body:
+                self._send_json(
+                    {"ok": False, "error": "empty_body", "message": "POST /api/setup/complete 要求非空配置"},
+                    400,
+                )
+                return
+            invalid_sections = [
+                name for name in ("cloud", "download", "local_llm")
+                if name in body and not isinstance(body[name], dict)
+            ]
+            if invalid_sections:
+                self._send_json(
+                    {"ok": False, "error": f"invalid section type: {', '.join(invalid_sections)}"}, 400
+                )
+                return
+
+            applied = []
+            ignored = []
+            pending = self._collect_setup_patch(body, applied, ignored)
+            self._apply_recommended_patch(body, pending, applied, ignored)
+
+            completed_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            try:
+                # 配置落盘串行化：与下载线程共用同一把模块级写锁
+                with _CONFIG_WRITE_LOCK:
+                    for (section, key), value in pending.items():
+                        self._config.set(section, key, value)
+                    self._config.set("setup", "completed", True)
+                    self._config.set("setup", "completed_at", completed_at)
+                    self._config.save()
+            except OSError as exc:  # noqa: BLE001 - 落盘失败：明确回错，不谎报完成
+                self._send_json(
+                    {"ok": False, "error": "config_save_failed", "message": str(exc),
+                     "applied": applied, "ignored": ignored, "config": self._settings_view()},
+                    status=500,
+                )
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    "applied": applied,
+                    "ignored": ignored,
+                    "setup": {"completed": True, "completed_at": completed_at},
+                    "config": self._settings_view(),
+                }
+            )
+
+        def _handle_setup_model_download(self):
+            """POST /api/setup/model/download：启动本地小 LLM 后台下载（幂等）。
+
+            body（可选）``{source, tier}``；缺省取配置 ``local_llm.source`` 与默认档
+            ``1.7B``。显式 ``source`` 须在 ``MODEL_REPOS`` 白名单内，否则 400（中文
+            错误，不静默改换下载来源）。下载在后台 daemon 线程执行，本端点**立即
+            返回**；进行中重复调用返回 ``already_running: true`` 且不启动第二个线程。
+            未知档位 400（中文错误），不静默下载错误文件。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            source = body.get("source")
+            if source is not None:
+                normalized = source.strip().lower() if isinstance(source, str) else ""
+                if normalized not in MODEL_REPOS:
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": "bad_request",
+                            "message": f"未知模型仓库：{source!r}，仅支持 {list(MODEL_REPOS)}",
+                        },
+                        400,
+                    )
+                    return
+                source = normalized
+            try:
+                result = self._download_manager.start(source=source, tier=body.get("tier"))
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
+                return
+            self._send_json(result)
+
+        def _handle_setup_model_progress(self):
+            """GET /api/setup/model/progress：即时返回下载进度（不阻塞服务）。
+
+            快照由下载管理器加锁读取，绝不等待下载线程——单线程 HTTPServer 在
+            1.7GB 下载期间仍可正常响应其他端点。
+            """
+            self._send_json(self._download_manager.snapshot())
+
+        def _handle_setup_model_cancel(self):
+            """POST /api/setup/model/cancel：取消进行中的下载（保留 ``.tmp`` 供续传）。
+
+            置取消标记后立即返回；下载线程在下一次进度回调处中断，临时文件由
+            ``LlmDownloader`` 的异常路径保留。
+            """
+            self._send_json(self._download_manager.cancel())
 
         def _handle_chat_send_guard(self):
             """POST /api/chat/messages：聊天服务未启用守卫（避免直连误 404）。"""
@@ -857,6 +1211,18 @@ def make_handler(
                     self._handle_settings_get()
                     return
 
+                if path == "/api/setup/status":
+                    self._handle_setup_status()
+                    return
+
+                if path == "/api/setup/recommend":
+                    self._handle_setup_recommend()
+                    return
+
+                if path == "/api/setup/model/progress":
+                    self._handle_setup_model_progress()
+                    return
+
                 if path == "/api/chat/history":
                     self._handle_chat_history_guard()
                     return
@@ -906,6 +1272,15 @@ def make_handler(
                     return
                 if path == "/api/chat/messages":
                     self._handle_chat_send_guard()
+                    return
+                if path == "/api/setup/complete":
+                    self._handle_setup_complete()
+                    return
+                if path == "/api/setup/model/download":
+                    self._handle_setup_model_download()
+                    return
+                if path == "/api/setup/model/cancel":
+                    self._handle_setup_model_cancel()
                     return
                 if path == "/api/chat/message":
                     self._handle_chat_message()

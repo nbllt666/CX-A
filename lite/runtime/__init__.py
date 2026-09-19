@@ -7,9 +7,11 @@
 - LlamaNotReady：模型未就绪异常。
 - LlmDownloader：本地小 LLM 可选下载引导（HF / 魔塔双源，GGUF）。
 - get_local_llm_info：扫描本地已下载 GGUF 模型。
+- ModelDownloadManager：本地小 LLM 后台下载管理器（后台线程 + 进度 + 取消）。
 """
 
 from .llama_runtime import LlamaEmbeddingProvider, LlamaNotReady, LlamaRuntime
+from .download_manager import ModelDownloadManager
 from .model_downloader import LlmDownloader, get_local_llm_info
 
 __all__ = [
@@ -18,4 +20,5 @@ __all__ = [
     "LlamaNotReady",
     "LlmDownloader",
     "get_local_llm_info",
+    "ModelDownloadManager",
 ]

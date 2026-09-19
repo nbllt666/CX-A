@@ -43,6 +43,20 @@ export const API_ENDPOINTS = {
     /** 执行一次工具调用（屏幕 / 键盘 / 指令） */
     call: `${API_BASE}/computer/call`,
   },
+  setup: {
+    /** 首启向导是否需要（门控）与当前下载线路取值（模型仓库由线路派生） */
+    status: `${API_BASE}/setup/status`,
+    /** 硬件体检结论与推荐（含候选档位） */
+    recommend: `${API_BASE}/setup/recommend`,
+    /** 提交向导选择并置「已完成初始化」 */
+    complete: `${API_BASE}/setup/complete`,
+    /** 启动本地小模型下载（后台执行，幂等） */
+    modelDownload: `${API_BASE}/setup/model/download`,
+    /** 查询下载进度（即时返回，不等待下载结束） */
+    modelProgress: `${API_BASE}/setup/model/progress`,
+    /** 取消进行中的下载（保留临时文件供续传） */
+    modelCancel: `${API_BASE}/setup/model/cancel`,
+  },
 };
 
 /** 一条记忆的后端原始记录（对应 lite/memory SQLite memories 表字段） */
@@ -281,5 +295,180 @@ export async function callComputerTool(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tool, arguments: arguments_ }),
+  });
+}
+
+/* ==========================================================================
+ * 首启向导（Task 8）：接口契约见 spec「首启向导后端接口」（路径 / 字段名已冻结）
+ * ========================================================================== */
+
+/** 下载线路：mirror = 国内（魔塔），official = 海外（HuggingFace） */
+export type DownloadChannel = 'mirror' | 'official';
+/** 本地模型仓库：modelscope = 魔塔（国内），huggingface = HuggingFace（海外）；由线路派生 */
+export type LocalModelSource = 'modelscope' | 'huggingface';
+
+/** 首启状态（GET /api/setup/status）：门控 + 当前选择取值 */
+export interface SetupStatusView {
+  completed: boolean;
+  /** 是否需要在首帧展示向导 */
+  wizard_required: boolean;
+  /** 用户选择来源：前端只以它为准（唯一真相） */
+  download: { channel: DownloadChannel };
+  /**
+   * 模型仓库（与 download.channel 语义一致：mirror↔modelscope、official↔huggingface）。
+   * 仅作状态回显，前端不作为选择来源，也不据此覆盖 channel。
+   */
+  local_llm_source: LocalModelSource;
+}
+
+/** 硬件画像：探测能力缺失时对应字段为空（探测失败只降级，不抛错） */
+export interface HardwareProfile {
+  cpu_cores: number | null;
+  ram_gb: number | null;
+  gpu_vendor: string | null;
+  vram_gb: number | null;
+  cuda_version: string | null;
+  disk_free_gb: number | null;
+  probe_notes: string[];
+}
+
+/** 一个候选模型档位（含体积与适用条件，用于「我自己挑」） */
+export interface ModelTierInfo {
+  tier: string;
+  repo: string;
+  filename: string;
+  approximate_size_gb: number;
+  ram_requirement_gb: number;
+  vram_requirement_gb: number;
+  description: string;
+}
+
+/** 推荐结论：走云端还是本地、设备与档位、中文理由 */
+export interface HardwareRecommendation {
+  use_local: boolean;
+  device: 'cpu' | 'gpu';
+  tier: string;
+  config_patch: Record<string, unknown>;
+  model: {
+    tier: string;
+    repo: string;
+    filename: string;
+    approximate_size_gb: number;
+  } | null;
+  reasons: string[];
+  probe_notes: string[];
+}
+
+/** 硬件体检响应（GET /api/setup/recommend） */
+export interface SetupRecommendResult {
+  profile: HardwareProfile;
+  recommendation: HardwareRecommendation;
+  tiers: ModelTierInfo[];
+  /** 当前线路对应的模型仓库（恒等于线路派生值，前端无需自行推导） */
+  suggested_source: string;
+}
+
+/** 下载进度（GET /api/setup/model/progress） */
+export interface ModelProgress {
+  state: 'idle' | 'downloading' | 'done' | 'failed' | 'canceled';
+  downloaded: number;
+  total: number;
+  percent: number;
+  file: string;
+  error: string | null;
+  model: Record<string, unknown> | null;
+}
+
+/** 启动下载的响应（POST /api/setup/model/download，幂等） */
+export interface ModelDownloadResult {
+  ok: boolean;
+  state: string;
+  /** 已有下载在跑时为 true（不会启动第二个下载） */
+  already_running: boolean;
+  model: Record<string, unknown> | null;
+}
+
+/** 向导提交请求体（POST /api/setup/complete） */
+export interface SetupCompletePayload {
+  cloud: { provider: string; api_key?: string };
+  /** 用户唯一选择：线路 */
+  download: { channel: DownloadChannel };
+  /** 模型仓库由下载线路在服务端派生，前端不再提交 source */
+  local_llm: { enabled: boolean };
+  /** 是否采纳硬件体检给出的推荐 */
+  apply_recommended: boolean;
+}
+
+/** 向导提交响应：回显已应用 / 被忽略的键（非法取值不静默丢弃） */
+export interface SetupCompleteResult {
+  ok: boolean;
+  applied: string[];
+  ignored: string[];
+  setup: { completed: boolean; completed_at: string };
+  config: Record<string, unknown>;
+}
+
+/**
+ * 启动下载的可选入参（缺省时后端取当前线路对应的仓库 / 推荐档位）。
+ * 不再传 source：模型仓库由下载线路在服务端派生。
+ */
+export interface ModelDownloadPayload {
+  tier?: string;
+}
+
+/** 查询首启状态（GET /api/setup/status）：App 首帧门控的唯一依据。 */
+export async function fetchSetupStatus(): Promise<SetupStatusView> {
+  return requestJson<SetupStatusView>(API_ENDPOINTS.setup.status);
+}
+
+/** 拉取硬件体检结论与推荐（GET /api/setup/recommend）。 */
+export async function fetchSetupRecommend(): Promise<SetupRecommendResult> {
+  return requestJson<SetupRecommendResult>(API_ENDPOINTS.setup.recommend);
+}
+
+/** 提交向导选择（POST /api/setup/complete），成功后后端置「已完成初始化」。 */
+export async function completeSetup(payload: SetupCompletePayload): Promise<SetupCompleteResult> {
+  return requestJson<SetupCompleteResult>(API_ENDPOINTS.setup.complete, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** 启动本地小模型下载（POST /api/setup/model/download），进行中重复调用幂等。 */
+export async function startModelDownload(
+  payload?: ModelDownloadPayload,
+): Promise<ModelDownloadResult> {
+  return requestJson<ModelDownloadResult>(API_ENDPOINTS.setup.modelDownload, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload ?? {}),
+  });
+}
+
+/**
+ * 进度查询的专用超时（毫秒）。
+ *
+ * 进度轮询必须「立刻拿到当前快照」，而 requestJson 默认超时 300s（对齐后端
+ * api_timeout 契约，服务长任务）——用于轮询会让失败的后端把每 1s 一次的轮询
+ * 挂成长达 5 分钟的悬空请求，堆积并拖慢界面。故这里显式传 10s 短超时。
+ */
+const PROGRESS_TIMEOUT_MS = 10_000;
+
+/** 查询下载进度（GET /api/setup/model/progress）：短超时，失败由调用方保留上次进度。 */
+export async function fetchModelProgress(): Promise<ModelProgress> {
+  return requestJson<ModelProgress>(
+    API_ENDPOINTS.setup.modelProgress,
+    undefined,
+    PROGRESS_TIMEOUT_MS,
+  );
+}
+
+/** 取消进行中的下载（POST /api/setup/model/cancel），保留临时文件供续传。 */
+export async function cancelModelDownload(): Promise<{ ok: boolean; state: string }> {
+  return requestJson<{ ok: boolean; state: string }>(API_ENDPOINTS.setup.modelCancel, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
   });
 }

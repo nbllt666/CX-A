@@ -3,6 +3,8 @@
 
 对齐工程文档 §4.4「可选组件下载（本地小 LLM）」：
 - **下载源**：HuggingFace / 魔塔（ModelScope）双源，国内优先魔塔（modelscope 默认）；
+  HuggingFace 恒用官方端点 ``https://huggingface.co``（国内路线下载魔塔，不经
+  ``hf-mirror.com``，端点不再随配置派生）；
 - **格式**：GGUF（供 llama.cpp / LlamaRuntime 消费）；
 - **尺寸建议**：~1.7B（判定够快 + 断网兜底够用）；
 - **存储**：``data/local_llm/``。
@@ -32,6 +34,10 @@ from urllib.parse import quote
 
 from pathlib import Path
 
+# HuggingFace 官方端点唯一真相源：统一下载源真相源模块（纯常量模块，无导入期耦合），
+# 本模块不再自建同值常量，避免出现两份不同来源的同名常量。
+from lite.config.download_sources import HF_OFFICIAL
+
 #: 工程根目录推导：model_downloader.py 位于 lite/runtime/ 下，上溯两层 dirname 即工程根
 _LITE_RUNTIME_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_LITE_RUNTIME_DIR))
@@ -48,10 +54,91 @@ _SOURCE_ALIASES = {
     "HF": "huggingface",
 }
 
+#: 默认模型档位（缺省 tier=None 时的回落档，保持既有 1.7B 基线行为不变）
+DEFAULT_TIER = "1.7B"
+
+#: 模型档位表（Task 5 冻结口径，Task 12 按联网实测校正）：档位标识 -> 仓库 / 文件名 / 体积 / 适用门槛。
+#:
+#: ✅ 【已联网验证 2026-09-19】四个档位的 ``repo`` 与 ``filename`` 均经两侧站点逐档核实：
+#: HuggingFace ``/api/models/<repo>/tree/main`` 与魔塔 ``/repo/files`` 文件清单命中，
+#: 并以 ``Range: bytes=0-0`` 试探真实下载 URL 得到 206 与实际字节数；
+#: ``approximate_size_gb`` 为实测字节数折算（非参数量粗估——该值同时作为下载后
+#: 大小校验基准，粗估会导致校验失败）。
+#:
+#: 核实要点（易错处，改动本表前请重新核实）：
+#: - 各系列命名并不统一：Qwen1.5 用下划线（``qwen1_5-1_8b``）、Qwen3 用大写连字符
+#:   （``Qwen3-4B-Q4_K_M``）、Qwen2.5 小尺寸用全小写点号（``qwen2.5-0.5b``）；
+#: - 必须避开**分片文件**（如 Qwen2.5-7B 的 q4_k_m 为 ``-00001-of-00002`` 两片），
+#:   本下载器按单文件下载，无法拼装分片；顶层档因此选用官方 8B 单文件仓库。
+#:
+#: 字段说明：
+#: - ``repo``：``org/name`` 双段 GGUF 仓库（须通过 ``_validate_repo``）；
+#: - ``filename``：强制 ``.gguf`` 后缀（须通过 ``_validate_filename``）；
+#: - ``approximate_size_gb``：Q4_K_M 量化下的**实测**体积（供磁盘预检 / 下载后校验 / 展示）；
+#: - ``ram_requirement_gb``：建议系统内存门槛（GB），供推荐逻辑读取；
+#: - ``vram_requirement_gb``：建议显存门槛（GB），0 表示纯 CPU 也可跑；
+#: - ``description``：面向用户的口语化「适用机器」中文说明。
+MODEL_TIERS = {
+    "0.5B": {
+        "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "filename": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        "approximate_size_gb": 0.458,
+        "ram_requirement_gb": 4,
+        "vram_requirement_gb": 0,
+        "description": "约 0.5GB，内存 4GB 起的轻量机器也能跑，响应最快，适合兜底与低配设备。",
+    },
+    "1.7B": {
+        "repo": "Qwen/Qwen1.5-1.8B-Chat-GGUF",
+        "filename": "qwen1_5-1_8b-chat-q4_k_m.gguf",
+        "approximate_size_gb": 1.134,
+        "ram_requirement_gb": 8,
+        "vram_requirement_gb": 0,
+        "description": "约 1.1GB，内存 8GB 起的普通家用机器即可流畅运行，速度与质量均衡（推荐默认档）。",
+    },
+    "4B": {
+        "repo": "Qwen/Qwen3-4B-GGUF",
+        "filename": "Qwen3-4B-Q4_K_M.gguf",
+        "approximate_size_gb": 2.326,
+        "ram_requirement_gb": 16,
+        "vram_requirement_gb": 4,
+        "description": "约 2.3GB，建议内存 16GB（或 4GB 以上显存）的机器，回答质量更好，适合日常主力使用。",
+    },
+    "8B": {
+        "repo": "Qwen/Qwen3-8B-GGUF",
+        "filename": "Qwen3-8B-Q4_K_M.gguf",
+        "approximate_size_gb": 4.682,
+        "ram_requirement_gb": 16,
+        "vram_requirement_gb": 8,
+        "description": "约 4.7GB，建议内存 16GB 且带 8GB 以上显存的高配机器，效果最好但占用与耗时更高。",
+    },
+}
+
+#: 各档位的推荐理由文案（仅 1.7B 沿用既有基线原文，其余按档位说明自动生成）
+_TIER_REASONS = {
+    "1.7B": "1.7B 判定够快 + 断网兜底够用（工程文档 §4.4）",
+}
+
+#: 从 GGUF 文件名中提取量化标识（如 q4_k_m），用于推导 quant 字段
+_QUANT_RE = re.compile(r"q\d+(?:_[a-z0-9]+)+", re.IGNORECASE)
+
 
 def _now_str():
     """返回形如 2026-08-26 12:00:00 的本地时间戳字符串。"""
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def _family_from_repo(repo):
+    """从仓库名推导模型家族展示名（去掉末尾 ``-GGUF`` 后缀）。"""
+    name = str(repo).split("/")[-1]
+    if name.endswith("-GGUF"):
+        name = name[: -len("-GGUF")]
+    return name
+
+
+def _quant_from_filename(filename):
+    """从文件名推导量化标识（如 ``q4_k_m`` -> ``Q4_K_M``），推导失败返回空串。"""
+    match = _QUANT_RE.search(str(filename or ""))
+    return match.group(0).upper() if match else ""
 
 
 class LlmDownloader:
@@ -158,7 +245,8 @@ class LlmDownloader:
             # 第四轮体检批次C：FilePath 为查询参数，文件名需 URL 编码——含空格/
             # 特殊字符的文件名此前会构造出非法 URL（常规 .gguf 名编码后不变）
             return f"https://modelscope.cn/api/v1/models/{repo}/repo?FilePath={quote(filename, safe='')}"
-        return f"https://huggingface.co/{repo}/resolve/main/{filename}"
+        # HuggingFace 恒用官方端点：国内路线下载魔塔（非 HF 镜像），端点不再派生
+        return f"{HF_OFFICIAL.rstrip('/')}/{repo}/resolve/main/{filename}"
 
     # ------------------------------------------------------------------ #
     # 大小校验                                                           #
@@ -342,7 +430,9 @@ class LlmDownloader:
             )
             return downloaded, total
 
-    def download(self, repo, filename, source=None, progress_cb=None, verify_size_gb=None) -> Path:
+    def download(
+        self, repo, filename, source=None, progress_cb=None, verify_size_gb=None
+    ) -> Path:
         """流式下载 GGUF 模型到存储目录（临时文件 + 原子改名 + 断点续传）。
 
         Args:
@@ -369,6 +459,7 @@ class LlmDownloader:
         src = (source or self.source).lower()
         if src not in _SOURCE_ALIASES:
             raise ValueError(f"未知下载源：{source!r}，仅支持 modelscope / huggingface。")
+        # HuggingFace 恒用官方端点，modelscope 恒用魔塔站点——URL 不随配置派生
         url = self.build_url(src, repo, filename)
 
         # L10：预期大小可由 verify_size_gb 推算时，先做磁盘预检再创建目录/写文件
@@ -458,41 +549,81 @@ class LlmDownloader:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def suggest_model(source="modelscope") -> dict:
-        """返回指定下载源的推荐小 LLM 信息（~1.7B GGUF，Qwen 系）。
+    def _normalize_tier(tier):
+        """把档位标识归一化为 ``MODEL_TIERS`` 的规范键（strip + 大小写归一）。
+
+        Args:
+            tier: 档位标识（如 ``"1.7B"`` / ``"1.7b"`` / ``" 1.7B "``）；
+                ``None`` 时回落 ``DEFAULT_TIER``。
+        Returns:
+            str: ``MODEL_TIERS`` 中的规范档位键。
+        Raises:
+            ValueError: 归一后仍不在 ``MODEL_TIERS`` 中时抛出（中文，列出可用档位）。
+        """
+        if tier is None:
+            return DEFAULT_TIER
+        key = tier.strip().lower() if isinstance(tier, str) else ""
+        for tkey in MODEL_TIERS:
+            if tkey.lower() == key:
+                return tkey
+        available = " / ".join(sorted(MODEL_TIERS))
+        raise ValueError(
+            f"未知模型档位：{tier!r}。可用档位：{available}（例如 \"1.7B\"）。"
+            "请传入上述档位之一，不会静默下载错误的模型文件。"
+        )
+
+    @staticmethod
+    def suggest_model(source="modelscope", tier=None) -> dict:
+        """返回指定下载源与档位的推荐小 LLM 信息（Qwen 系 GGUF）。
 
         Args:
             source: 下载源（modelscope / huggingface）。
+            tier: 模型档位标识（``"0.5B"`` / ``"1.7B"`` / ``"4B"`` / ``"8B"``）。
+                接受 strip + 大小写归一后的宽容解析（如 ``" 1.7b "``）；``None``
+                时回落默认档 ``"1.7B"``（保持既有默认行为与既有测试通过）。
         Returns:
-            dict: 含 source、repo、filename、approximate_size_gb、disclaimer 等。
-                大小为近似估算，实际以仓库为准。
+            dict: 含 source、repo、filename、approximate_size_gb、disclaimer、
+                url_hint、note 等字段。大小为近似估算，实际以仓库为准。
+        Raises:
+            ValueError: tier 归一后不在 MODEL_TIERS 中时抛出（中文错误，列出可用档位）。
         """
         src = (source or "modelscope").lower()
         if src not in _SOURCE_ALIASES:
             src = "modelscope"
         src = _SOURCE_ALIASES[src]
-        baseline = {
-            "repo": "Qwen/Qwen1.5-1.8B-Chat-GGUF",
-            "filename": "qwen1.5-1_8b-chat-q4_k_m.gguf",
-            "family": "Qwen1.5-1.8B-Chat",
-            "quant": "Q4_K_M",
-            "approximate_size_gb": 1.7,
-            "reason": "1.7B 判定够快 + 断网兜底够用（工程文档 §4.4）",
-            "disclaimer": "approximate_size_gb 为近似估算，实际大小以下载仓库对应文件为准。",
+
+        tier_key = LlmDownloader._normalize_tier(tier)
+        entry = MODEL_TIERS[tier_key]
+        repo = entry["repo"]
+        filename = entry["filename"]
+        family = _family_from_repo(repo)
+        quant = _quant_from_filename(filename) or "Q4_K_M"
+        reason = _TIER_REASONS.get(tier_key, f"{tier_key} 档位，Qwen 系 {filename}")
+        info = {
+            "repo": repo,
+            "filename": filename,
+            "family": family,
+            "quant": quant,
+            "approximate_size_gb": entry["approximate_size_gb"],
+            "reason": reason,
+            "tier": tier_key,
+            "description": entry["description"],
+            "disclaimer": "approximate_size_gb 为按仓库实测字节数折算的参考值，实际以仓库当前文件为准；"
+                          "四档 repo / 文件名已于 2026-09-19 经 HuggingFace 与魔塔两侧站点核实可下载。",
         }
         if src == "modelscope":
-            baseline.update(
+            info.update(
                 source="modelscope",
-                url_hint="https://modelscope.cn/models/Qwen/Qwen1.5-1.8B-Chat-GGUF",
+                url_hint=f"https://modelscope.cn/models/{repo}",
                 note="国内优先建议使用魔塔（ModelScope）下载。",
             )
         else:
-            baseline.update(
+            info.update(
                 source="huggingface",
-                url_hint="https://huggingface.co/Qwen/Qwen1.5-1.8B-Chat-GGUF",
+                url_hint=f"https://huggingface.co/{repo}",
                 note="HuggingFace 源备选；国内网络若受限建议切回 modelscope。",
             )
-        return baseline
+        return info
 
 
 def get_local_llm_info(dest_dir) -> dict:

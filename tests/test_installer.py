@@ -19,6 +19,7 @@ import pytest
 from installer import bootstrap
 from installer.first_run import FirstRunDriver
 from lite.config.config_manager import ConfigManager
+from lite.config.download_sources import model_repo_for_channel
 
 
 # ------------------------------------------------------------------ #
@@ -669,3 +670,445 @@ def test_build_skip_electron_rejects_incomplete_artifacts(tmp_path, monkeypatch)
     ])
     assert os.path.isfile(os.path.join(alt_out, "portable", build_mod.ELECTRON_SHELL_EXE))
     assert os.path.isfile(os.path.join(alt_out, "portable", "runtime", "backend", "backend.exe"))
+
+
+# ------------------------------------------------------------------ #
+# Task 9：安装器 CLI 向导与统一下载源（追加用例；既有断言一字不改）        #
+# ------------------------------------------------------------------ #
+
+#: 镜像通道下的清华 PyPI 索引（与 lite/config/download_sources.PIP_MIRROR_INDEX 同源）
+_T9_MIRROR_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
+#: 恒定 CPU 结论的检测报告（避免依赖宿主机真实硬件）
+_T9_CPU_REPORT = {
+    "gpu_vendor": "cpu",
+    "cuda_version": None,
+    "recommend": "cpu",
+    "details": "测试替身：未检测到可用的独立 GPU",
+}
+
+
+def _t9_fake_detector(report):
+    """构造 bootstrap.GpuDetector 替身：detect() 恒返回固定报告，不触碰真实硬件。"""
+    return lambda runner=None: type(
+        "_T9FakeDetector", (), {"detect": lambda self, runner=None: dict(report)}
+    )()
+
+
+def _t9_install_report(root):
+    """读取 install() 落盘的 GPU 依赖报告 dict。"""
+    path = os.path.join(root, "data", "install_report.json")
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _t9_driver(root, responses, downloader=None):
+    """构造注入固定输入序列的 FirstRunDriver，返回 ``(driver, 输出行列表)``。"""
+    outputs = []
+    seq = iter(list(responses))
+    driver = FirstRunDriver(
+        root,
+        input_fn=lambda _p: next(seq),
+        output_fn=outputs.append,
+        downloader=downloader,
+    )
+    return driver, outputs
+
+
+def _t9_stub_hardware(monkeypatch, use_local=True, tier="1.7B", device="cpu"):
+    """把 first_run 的硬件探测替换为确定性替身（不触碰真实硬件与外部命令）。"""
+    from installer import first_run as first_run_mod
+
+    profile = {
+        "cpu_cores": 8,
+        "ram_gb": 16.0,
+        "gpu_vendor": "cpu",
+        "vram_gb": None,
+        "cuda_version": None,
+        "disk_free_gb": 200.0,
+        "probe_notes": [],
+    }
+    monkeypatch.setattr(first_run_mod, "detect_profile", lambda root=None, runner=None: dict(profile))
+    monkeypatch.setattr(
+        first_run_mod,
+        "recommend_for",
+        lambda profile, disk_free_gb=None: {
+            "use_local": use_local,
+            "device": device,
+            "tier": tier,
+            "config_patch": {"local_llm": {"enabled": use_local, "device": device}},
+            "model": {
+                "tier": tier,
+                "repo": "Qwen/Qwen1.5-1.8B-Chat-GGUF",
+                "filename": "qwen1_5-1_8b-chat-q4_k_m.gguf",
+                "approximate_size_gb": 1.134,
+            },
+            "reasons": ["测试替身：内存满足本地推理阈值（≥ 8 GB）"],
+            "probe_notes": [],
+        },
+    )
+
+
+class _T9FakeDownloader:
+    """替身下载器：仅记录调用与回调，绝不触网。"""
+
+    def __init__(self, fail=False):
+        self.calls = []
+        self.fail = fail
+
+    def download(self, repo, filename, source=None, progress_cb=None, verify_size_gb=None):
+        """记录调用参数并按需回调进度；``fail=True`` 时抛出模拟异常。"""
+        self.calls.append(
+            {
+                "repo": repo,
+                "filename": filename,
+                "source": source,
+                "verify_size_gb": verify_size_gb,
+            }
+        )
+        if progress_cb is not None:
+            progress_cb(1024, 2048)
+            progress_cb(2048, 2048)
+        if self.fail:
+            raise RuntimeError("模拟下载失败")
+        return os.path.join("fake", filename)
+
+
+# ---- build_gpu_dependency_commands：通道对命令清单的影响 ---- #
+
+@pytest.mark.parametrize("recommend", ["cpu", "cuda", "rocm"])
+def test_t9_build_commands_none_and_official_keep_legacy_output(recommend):
+    """channel=None（未指定）与 channel="official" 输出与历史版本逐字相同。"""
+    legacy = bootstrap.build_gpu_dependency_commands(recommend, "12.4")
+
+    assert bootstrap.build_gpu_dependency_commands(recommend, "12.4") == legacy
+    assert bootstrap.build_gpu_dependency_commands(recommend, "12.4", None) == legacy
+    assert bootstrap.build_gpu_dependency_commands(recommend, "12.4", "official") == legacy
+    assert not any(_T9_MIRROR_INDEX in cmd for cmd in legacy)
+
+
+@pytest.mark.parametrize("recommend", ["cpu", "cuda", "rocm"])
+def test_t9_build_commands_mirror_only_touches_plain_pip_packages(recommend):
+    """mirror 通道：仅普通 pip 包追加镜像索引；torch / llama-cpp-python 逐字不变。"""
+    legacy = bootstrap.build_gpu_dependency_commands(recommend, "12.4")
+    mirrored = bootstrap.build_gpu_dependency_commands(recommend, "12.4", "mirror")
+
+    assert len(mirrored) == len(legacy)
+    plain = ("onnxruntime", "onnxruntime-gpu", "onnxruntime-directml")
+    touched = 0
+    for old, new in zip(legacy, mirrored):
+        if old.startswith("#"):
+            assert new == old  # 说明性注释不改写
+        elif old.split()[2] in plain:
+            assert new == f"{old} -i {_T9_MIRROR_INDEX}"
+            touched += 1
+        else:
+            # torch（pytorch 官方轮子源）/ llama-cpp-python（abetlen 专用源）一字不改
+            assert new == old
+    assert touched >= 1
+    assert any(cmd.startswith("pip install torch") for cmd in mirrored)
+
+
+# ---- install()：安装期通道解析（显式 / config.json / 默认） ---- #
+
+def test_t9_install_explicit_official_has_no_mirror_index(tmp_path, monkeypatch, capsys):
+    """显式 official：生成的 pip 依赖命令不含国内镜像索引参数。"""
+    root = str(tmp_path / "officialroot")
+    os.makedirs(root)
+    monkeypatch.setattr(bootstrap, "GpuDetector", _t9_fake_detector(_T9_CPU_REPORT))
+
+    bootstrap.install(root, channel="official")
+
+    report = _t9_install_report(root)
+    assert report["pending_commands"] == [
+        "pip install torch --index-url https://download.pytorch.org/whl/cpu",
+        "pip install onnxruntime",
+    ]
+    assert not any(_T9_MIRROR_INDEX in cmd for cmd in report["pending_commands"])
+    assert "official" in capsys.readouterr().out
+
+
+def test_t9_install_explicit_mirror_appends_index(tmp_path, monkeypatch):
+    """显式 mirror：普通 pip 包追加国内镜像索引，torch 专用源命令保持不变。"""
+    root = str(tmp_path / "mirrorroot")
+    os.makedirs(root)
+    monkeypatch.setattr(bootstrap, "GpuDetector", _t9_fake_detector(_T9_CPU_REPORT))
+
+    bootstrap.install(root, channel="mirror")
+
+    report = _t9_install_report(root)
+    assert report["pending_commands"] == [
+        "pip install torch --index-url https://download.pytorch.org/whl/cpu",
+        f"pip install onnxruntime -i {_T9_MIRROR_INDEX}",
+    ]
+
+
+def test_t9_install_reads_channel_from_root_config(tmp_path, monkeypatch):
+    """未显式指定通道：读 root/config.json 的 download.channel（official → 不含镜像索引）。"""
+    root = str(tmp_path / "cfgroot")
+    os.makedirs(root)
+    bootstrap.ensure_dirs(root)
+    cm = ConfigManager(
+        config_path=os.path.join(root, "config.json"),
+        data_dir=os.path.join(root, "data"),
+    )
+    cm.set("download", "channel", "official")
+    cm.save()
+    monkeypatch.setattr(bootstrap, "GpuDetector", _t9_fake_detector(_T9_CPU_REPORT))
+
+    bootstrap.install(root)
+
+    report = _t9_install_report(root)
+    assert not any(_T9_MIRROR_INDEX in cmd for cmd in report["pending_commands"])
+
+
+def test_t9_install_default_channel_falls_back_to_mirror(tmp_path, monkeypatch):
+    """既无显式通道也无配置取值：回落默认 mirror（普通 pip 包带镜像索引）。"""
+    root = str(tmp_path / "defaultroot")
+    os.makedirs(root)
+    monkeypatch.setattr(bootstrap, "GpuDetector", _t9_fake_detector(_T9_CPU_REPORT))
+
+    bootstrap.install(root)
+
+    report = _t9_install_report(root)
+    assert any(_T9_MIRROR_INDEX in cmd for cmd in report["pending_commands"])
+
+
+def test_t9_resolve_channel_defaults_normalizes_and_survives_corrupt_config(tmp_path):
+    """resolve_download_channel：显式归一 / 无配置默认镜像 / 坏配置降级不抛。"""
+    root = str(tmp_path / "resolve")
+    os.makedirs(root)
+    assert bootstrap.resolve_download_channel(root) == "mirror"  # 无 config.json → 默认镜像
+    assert bootstrap.resolve_download_channel(root, " OFFICIAL ") == "official"
+    assert bootstrap.resolve_download_channel(root, "bogus") == "mirror"
+
+    corrupt_root = str(tmp_path / "corrupt")
+    os.makedirs(corrupt_root)
+    with open(os.path.join(corrupt_root, "config.json"), "w", encoding="utf-8") as fh:
+        fh.write("{不是合法 JSON")
+    assert bootstrap.resolve_download_channel(corrupt_root) == "mirror"
+
+
+def test_t9_bootstrap_cli_channel_flag(tmp_path, monkeypatch):
+    """CLI 入口支持 --channel；非法取值由 argparse 拒绝。"""
+    root = str(tmp_path / "cliroot")
+    os.makedirs(root)
+    monkeypatch.setattr(bootstrap, "PROJECT_ROOT", root)
+    monkeypatch.setattr(bootstrap, "GpuDetector", _t9_fake_detector(_T9_CPU_REPORT))
+
+    bootstrap.main(["--channel", "official"])
+
+    report = _t9_install_report(root)
+    assert not any(_T9_MIRROR_INDEX in cmd for cmd in report["pending_commands"])
+
+    with pytest.raises(SystemExit):
+        bootstrap.main(["--channel", "bogus"])
+
+
+# ---- FirstRunDriver：新增步骤与同源配置键 ---- #
+
+def test_t9_first_run_full_flow_writes_shared_config_keys(tmp_path, monkeypatch):
+    """注入完整输入序列驱动全流程：新步骤写入与前端同源的配置键，来源由线路派生。"""
+    root = str(tmp_path)
+    bootstrap.ensure_dirs(root)
+    _t9_stub_hardware(monkeypatch)
+    # 输入：provider 留空→默认；api_key；线路选 mirror→派生 modelscope；本地小 LLM 不下载
+    driver, outputs = _t9_driver(root, ["", "sk-t9-secret", "mirror", "n"])
+
+    result = driver.run()
+
+    assert result["download_channel"] == "mirror"
+    assert result["model_repo"] == "modelscope"
+    assert result["local_llm_source"] == "modelscope"
+    assert result["setup_completed"] is True
+    assert driver.cm.get("download", "channel") == "mirror"
+    assert driver.cm.get("local_llm", "source") == "modelscope"
+    assert driver.cm.get("setup", "completed") is True
+    assert driver.cm.get("setup", "completed_at")
+
+    joined = "\n".join(outputs)
+    assert "硬件体检结果" in joined
+    assert "推荐档位与体积" in joined
+    assert "下载线路：国内（魔塔）" in joined
+    # 线路镜像 → 模型来源 modelscope（映射关系）
+    assert driver.cm.get("local_llm", "source") == model_repo_for_channel("mirror") == "modelscope"
+
+    # 落盘：前端 /api/setup/status 读同一 config.json 的同一批键
+    on_disk = json.loads(open(os.path.join(root, "config.json"), encoding="utf-8").read())
+    assert on_disk["download"]["channel"] == "mirror"
+    assert on_disk["local_llm"]["source"] == "modelscope"
+    assert on_disk["setup"]["completed"] is True
+
+
+def test_t9_first_run_official_derives_huggingface(tmp_path, monkeypatch):
+    """选海外（official）→ local_llm.source 派生为 huggingface。"""
+    root = str(tmp_path)
+    bootstrap.ensure_dirs(root)
+    _t9_stub_hardware(monkeypatch)
+    driver, _outputs = _t9_driver(root, ["", "", "official"])
+
+    result = driver.run()
+
+    assert result["download_channel"] == "official"
+    assert result["model_repo"] == "huggingface"
+    assert driver.cm.get("local_llm", "source") == model_repo_for_channel("official") == "huggingface"
+    assert driver.cm.get("setup", "completed") is True
+
+
+def test_t9_first_run_domestic_default_derives_modelscope(tmp_path, monkeypatch):
+    """国内（mirror）/ 留空 → local_llm.source 派生为 modelscope。"""
+    root = str(tmp_path)
+    bootstrap.ensure_dirs(root)
+    _t9_stub_hardware(monkeypatch)
+    # 线路留空 → 默认国内
+    driver, _outputs = _t9_driver(root, ["", "", ""])
+
+    result = driver.run()
+
+    assert result["download_channel"] == "mirror"
+    assert driver.cm.get("local_llm", "source") == model_repo_for_channel("mirror") == "modelscope"
+    assert result["setup_completed"] is True
+
+
+def test_t9_first_run_short_input_sequence_uses_defaults(tmp_path, monkeypatch):
+    """输入序列很短（模拟既有测试）：新步骤自动取默认值且流程不抛。"""
+    root = str(tmp_path)
+    bootstrap.ensure_dirs(root)
+    _t9_stub_hardware(monkeypatch)
+    driver, outputs = _t9_driver(root, ["", "sk-t9-short"])
+
+    result = driver.run()
+
+    assert result["api_key"] == "sk-t9-short"
+    assert result["download_channel"] == "mirror"
+    assert result["model_repo"] == "modelscope"
+    assert driver.cm.get("download", "channel") == "mirror"
+    assert driver.cm.get("local_llm", "source") == "modelscope"
+    assert driver.cm.get("setup", "completed") is True
+    joined = "\n".join(outputs)
+    assert "本地小 LLM" in joined and "1.7B" in joined and "data/local_llm/" in joined
+
+
+def test_t9_first_run_hardware_probe_failure_degrades(tmp_path, monkeypatch):
+    """硬件探测抛异常：降级为「跳过推荐」并继续完成向导。"""
+    root = str(tmp_path)
+    bootstrap.ensure_dirs(root)
+    from installer import first_run as first_run_mod
+
+    def _boom(root=None, runner=None):
+        """模拟探测失败。"""
+        raise RuntimeError("模拟探测失败")
+
+    monkeypatch.setattr(first_run_mod, "detect_profile", _boom)
+    driver, outputs = _t9_driver(root, ["", "", "official", "n"])
+
+    result = driver.run()
+
+    joined = "\n".join(outputs)
+    assert "硬件体检不可用" in joined
+    assert "已跳过推荐" in joined
+    assert result["download_channel"] == "official"
+    assert result["model_repo"] == "huggingface"
+    assert result["setup_completed"] is True
+
+
+def test_t9_first_run_downloader_injected_and_called(tmp_path, monkeypatch):
+    """注入替身下载器并选择下载：download 被调用（repo / 文件名 / 体积来自档位表），不触网。"""
+    root = str(tmp_path)
+    bootstrap.ensure_dirs(root)
+    _t9_stub_hardware(monkeypatch)
+    fake = _T9FakeDownloader()
+    driver, outputs = _t9_driver(root, ["", "", "mirror", "y"], downloader=fake)
+
+    result = driver.run()
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["source"] == "modelscope"
+    assert fake.calls[0]["repo"].count("/") == 1
+    assert fake.calls[0]["filename"].endswith(".gguf")
+    assert fake.calls[0]["verify_size_gb"] == 1.134  # 推荐档位 1.7B 的实测体积（2026-09-19 联网核实）
+    joined = "\n".join(outputs)
+    assert "下载进度：50%" in joined
+    assert "下载完成" in joined
+    assert result["local_llm_source"] == "modelscope"
+
+
+def test_t9_first_run_downloader_declined_not_called(tmp_path, monkeypatch):
+    """注入下载器但选择不下载：download 不被调用，流程正常完成。"""
+    root = str(tmp_path)
+    bootstrap.ensure_dirs(root)
+    _t9_stub_hardware(monkeypatch)
+    fake = _T9FakeDownloader()
+    driver, outputs = _t9_driver(root, ["", "", "mirror", "n"], downloader=fake)
+
+    driver.run()
+
+    assert fake.calls == []
+    assert "已跳过下载" in "\n".join(outputs)
+
+
+def test_t9_first_run_downloader_failure_does_not_break_flow(tmp_path, monkeypatch):
+    """下载失败只告警不中断：向导仍完成并置 setup.completed=True。"""
+    root = str(tmp_path)
+    bootstrap.ensure_dirs(root)
+    _t9_stub_hardware(monkeypatch)
+    fake = _T9FakeDownloader(fail=True)
+    driver, outputs = _t9_driver(root, ["", "", "mirror", "y"], downloader=fake)
+
+    result = driver.run()
+
+    assert len(fake.calls) == 1
+    assert "下载失败" in "\n".join(outputs)
+    assert result["setup_completed"] is True
+
+
+def test_t9_cli_wizard_and_frontend_share_same_config_keys(tmp_path, monkeypatch):
+    """CLI 向导选「国内线路」后，前端 GET /api/setup/status 读到同一配置键与派生来源。"""
+    import threading
+    import urllib.request
+    from http.server import HTTPServer
+
+    from lite.server.api_server import create_app
+
+    root = str(tmp_path / "shared")
+    os.makedirs(root)
+    bootstrap.ensure_dirs(root)
+    _t9_stub_hardware(monkeypatch)
+    driver, _outputs = _t9_driver(root, ["", "", "mirror"])
+    driver.run()
+
+    _store, _pipeline, handler = create_app(
+        data_dir=os.path.join(root, "data"),
+        config_path=os.path.join(root, "config.json"),
+    )
+    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/api/setup/status"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+    assert payload["download"]["channel"] == "mirror"
+    assert payload["local_llm_source"] == "modelscope"
+    # 前端读到的来源与通道派生值一致（CLI 侧由同一映射函数派生）
+    assert payload["local_llm_source"] == model_repo_for_channel(payload["download"]["channel"])
+    assert payload["completed"] is True
+    assert payload["wizard_required"] is False
+
+
+def test_t9_model_repo_step_removed_and_no_legacy_endpoint_names():
+    """步骤合并：``step_model_repo`` 已删除，且安装器源码不再残留旧端点字样。"""
+    from installer import first_run as first_run_mod
+
+    assert not hasattr(FirstRunDriver, "step_model_repo")
+    assert not hasattr(first_run_mod, "_REPO_OPTIONS")
+
+    source = open(first_run_mod.__file__, encoding="utf-8").read()
+    assert "hf-mirror" not in source
+    assert "HF_MIRROR" not in source
+    assert "hf_endpoint" not in source
+    assert "魔搭" not in source

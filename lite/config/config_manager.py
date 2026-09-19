@@ -54,6 +54,13 @@ DEFAULTS = {
         "source": "modelscope",
         "device": "cpu",
     },
+    #: 统一下载源（首启向导 spec「统一下载源配置」）：channel 为镜像 / 官方通道的
+    #: 单一真相源，同时决定 pip 依赖索引与 HuggingFace 端点；派生规则集中在
+    #: lite/config/download_sources.py，调用点禁止硬编码 URL。
+    "download": {"channel": "mirror"},
+    #: 首启向导状态（首启向导 spec「首次向导状态与升级兼容」）：completed=False 时
+    #: 前端展示向导；completed_at 记录完成时刻（ISO 风格字符串，空串表示未完成）。
+    "setup": {"completed": False, "completed_at": ""},
     "embedding": {"model": "qwen3-embedding:0.6b", "runtime": "llama.cpp", "device": "cpu"},
     "vector": {"backend": "lancedb", "path": "data/lancedb"},
     # device：推理设备开关（"cpu"(默认)/"gpu"）。gpu 时按各引擎能力切 GPU，
@@ -103,6 +110,12 @@ DEFAULTS = {
 HOT_RELOAD_SECTIONS = (
     "cloud",
     "local_llm",
+    #: download 段纳入热更新（切换下载源即时生效）。
+    #: setup 段（向导状态）天然无需重启，但既有测试
+    #: test_reloadable_sections_complete 要求全部 DEFAULTS 段都被 reload 列表
+    #: 覆盖，故一并列入热更新段（reloadable("setup") 为 True，不引入副作用）。
+    "download",
+    "setup",
     "tts",
     "asr",
     "vad",
@@ -204,6 +217,13 @@ class ConfigManager:
 
         self._ensure_config_file()
         self._config = self._read_config()
+        # 升级兼容（首启向导 spec「首次向导状态与升级兼容」）：config.json 已存在
+        # （raw 非空）但缺少 setup 段时，视为「老用户已完成初始化」，补齐
+        # setup.completed=True，避免首启向导打扰升级用户。全新生成（缺文件时
+        # _read_config 返回 DEFAULTS 副本，自带 setup=False）或已有显式 setup 段
+        # （含 completed=false）时保持原值不被误判。
+        if self._config and "setup" not in self._config:
+            self._config["setup"] = {"completed": True}
         self._config = _deep_merge(DEFAULTS, self._config)
         self._apply_env_overrides()
 

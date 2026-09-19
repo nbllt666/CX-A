@@ -8,17 +8,23 @@ health、空列表、add 后列表可查、search 可返回、delete 后列表�
 
 import base64
 import json
+import os
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from http.server import HTTPServer
+from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
 
 from lite.computer_control import ComputerControl, ToolBridge
 from lite.computer_control.security import ControlAuthorizer
+from lite.config.config_manager import ConfigManager
+from lite.runtime.download_manager import ModelDownloadManager
 import lite.server.api_server as api_server_module
 from lite.server.api_server import build_deps, create_app, make_handler
 
@@ -1128,3 +1134,575 @@ def test_build_deps_lancedb_degrade_warning(tmp_path, monkeypatch, caplog):
     assert any("已降级为内存向量库" in rec.getMessage() for rec in caplog.records)
     # 兜底不变：装配仍为内存向量库
     assert isinstance(pipeline.vector_store, InMemoryVectorStore)
+
+
+# ---------------------------------------------------------------- 首启向导接口族（Task 6 / Task 7）
+class _FakeDownloader:
+    """假下载器替身（**绝不触网**）：用 Event 阻塞模拟长下载，可断言构造次数与入参。
+
+    三种模式：
+    - ``block``：阻塞至 :attr:`release` 置位后经 ``progress_cb`` 触发取消检查
+      （取消标记命中时内部哨兵从 ``progress_cb`` 抛出，中断本次「下载」）；
+    - ``fail``：直接抛异常（模拟网络中断）；
+    - ``success``：写一个 ``.tmp`` 后返回落位路径（模拟原子改名完成）。
+    """
+
+    def __init__(self, dest_dir=None, source=None, mode="success"):
+        self.dest_dir = dest_dir or os.getcwd()
+        self.source = source
+        self.mode = mode
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = []
+
+    def download(self, repo, filename, source=None, progress_cb=None, verify_size_gb=None):
+        """模拟下载（签名与 ``LlmDownloader.download`` 一致，无端点参数）。"""
+        self.calls.append(
+            {"repo": repo, "filename": filename, "source": source}
+        )
+        os.makedirs(self.dest_dir, exist_ok=True)
+        tmp_path = os.path.join(self.dest_dir, filename + ".tmp")
+        with open(tmp_path, "wb") as fh:
+            fh.write(b"partial-model-bytes")
+        self.started.set()
+        if progress_cb is not None:
+            progress_cb(0, 100)
+        if self.mode == "block":
+            self.release.wait(timeout=10)
+            if progress_cb is not None:
+                progress_cb(50, 100)  # 取消标记在此命中 → 抛内部哨兵中断下载
+            return Path(os.path.join(self.dest_dir, filename))
+        if self.mode == "fail":
+            raise RuntimeError("connection reset by peer")
+        if progress_cb is not None:
+            progress_cb(100, 100)
+        return Path(os.path.join(self.dest_dir, filename))
+
+
+@contextmanager
+def setup_server(tmp_path, config=None, download_manager=None):
+    """起一个绑定临时端口的 setup 测试服务，产出 ``(base, config, handler)``。"""
+    store, pipeline, manager, _remote = build_deps(data_dir=str(tmp_path))
+    if config is None:
+        config = ConfigManager(config_path=str(tmp_path / "config.json"), data_dir=str(tmp_path))
+    authorizer = ControlAuthorizer(data_dir=str(tmp_path))
+    computer = ComputerControl(authorized=authorizer.is_authorized())
+    bridge = ToolBridge(computer=computer, authorizer=authorizer)
+    handler = make_handler(
+        store, pipeline, manager,
+        computer=computer, authorizer=authorizer, bridge=bridge, config=config,
+        download_manager=download_manager,
+    )
+    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}", config, handler
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def _wait_for_state(base, expected, timeout=5.0):
+    """轮询下载进度直至状态命中（超时抛断言错误并附带最后一次快照）。"""
+    deadline = time.monotonic() + timeout
+    body = None
+    while time.monotonic() < deadline:
+        _status, body, _raw = http_get(f"{base}/api/setup/model/progress")
+        if body["state"] == expected:
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"下载状态未在 {timeout}s 内变为 {expected}，最后快照：{body}")
+
+
+# ---------------------------------------------------------------- Task 7：状态端
+def test_setup_status_new_config_requires_wizard(tmp_path):
+    """新 config（setup.completed=False）→ wizard_required=True 且响应不含 api_key。"""
+    with setup_server(tmp_path) as (base, _config, _handler):
+        status, body, raw = http_get(f"{base}/api/setup/status")
+    assert status == 200
+    assert body["completed"] is False
+    assert body["wizard_required"] is True
+    assert body["download"]["channel"] == "mirror"
+    assert body["local_llm_source"] == "modelscope"
+    assert "api_key" not in raw.lower()
+
+
+def test_setup_status_legacy_config_without_setup_section(tmp_path):
+    """老 config（无 setup 段）→ 视为已完成初始化，向导不再出现。"""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"cloud": {"provider": "deepseek"}}), encoding="utf-8"
+    )
+    with setup_server(tmp_path) as (base, config, _handler):
+        _status, body, raw = http_get(f"{base}/api/setup/status")
+    assert config.get("setup", "completed") is True
+    assert body["completed"] is True
+    assert body["wizard_required"] is False
+    assert "api_key" not in raw.lower()
+
+
+def test_setup_status_never_exposes_api_key(tmp_path):
+    """即便已配置 api_key，status 响应序列化文本中也不得出现密钥值。"""
+    config = ConfigManager(config_path=str(tmp_path / "config.json"), data_dir=str(tmp_path))
+    config.set("cloud", "api_key", "sk-secret-must-not-leak")
+    with setup_server(tmp_path, config=config) as (base, _config, _handler):
+        _status, _body, raw = http_get(f"{base}/api/setup/status")
+    assert "sk-secret-must-not-leak" not in raw
+    assert "api_key" not in raw.lower()
+
+
+def test_setup_status_source_falls_back_to_channel(tmp_path):
+    """配置 source 非法时，``local_llm_source`` 回落 ``model_repo_for_channel(channel)``。"""
+    # mirror + 非法 source → modelscope（国内路线派生）
+    (tmp_path / "mirror.json").write_text(
+        json.dumps({"download": {"channel": "mirror"}, "local_llm": {"source": "bogus"}}),
+        encoding="utf-8",
+    )
+    cfg = ConfigManager(config_path=str(tmp_path / "mirror.json"), data_dir=str(tmp_path))
+    with setup_server(tmp_path, config=cfg) as (base, _cfg, _h):
+        _status, body, _raw = http_get(f"{base}/api/setup/status")
+    assert body["download"]["channel"] == "mirror"
+    assert body["local_llm_source"] == "modelscope"
+
+    # official + 非法 source → huggingface（海外路线派生）
+    (tmp_path / "official.json").write_text(
+        json.dumps({"download": {"channel": "official"}, "local_llm": {"source": "bogus"}}),
+        encoding="utf-8",
+    )
+    cfg2 = ConfigManager(config_path=str(tmp_path / "official.json"), data_dir=str(tmp_path))
+    with setup_server(tmp_path, config=cfg2) as (base2, _cfg2, _h2):
+        _status2, body2, _raw2 = http_get(f"{base2}/api/setup/status")
+    assert body2["download"]["channel"] == "official"
+    assert body2["local_llm_source"] == "huggingface"
+
+
+def test_setup_status_reads_configured_source_truth(tmp_path):
+    """配置里手工改过的合法 source 直接回显真相（不在 status 重新派生覆盖）。"""
+    (tmp_path / "manual.json").write_text(
+        json.dumps({"download": {"channel": "official"}, "local_llm": {"source": "modelscope"}}),
+        encoding="utf-8",
+    )
+    cfg = ConfigManager(config_path=str(tmp_path / "manual.json"), data_dir=str(tmp_path))
+    with setup_server(tmp_path, config=cfg) as (base, _cfg, _h):
+        _status, body, _raw = http_get(f"{base}/api/setup/status")
+    assert body["download"]["channel"] == "official"
+    assert body["local_llm_source"] == "modelscope"
+
+
+# ---------------------------------------------------------------- Task 7：推荐端
+def test_setup_recommend_structure_and_suggested_source(tmp_path):
+    """推荐端结构完整；镜像通道建议魔塔、官方通道建议 HuggingFace。"""
+    with setup_server(tmp_path) as (base, _config, _handler):
+        status, body, _raw = http_get(f"{base}/api/setup/recommend")
+    assert status == 200
+    assert {"profile", "recommendation", "tiers", "suggested_source"} <= set(body)
+    assert body["suggested_source"] == "modelscope"
+    assert any(tier["tier"] == "1.7B" for tier in body["tiers"])
+    assert all("tier" in tier and "repo" in tier for tier in body["tiers"])
+    assert {"use_local", "device", "tier", "config_patch", "model"} <= set(body["recommendation"])
+    assert "probe_notes" in body["profile"]
+
+    (tmp_path / "official.json").write_text(
+        json.dumps({"download": {"channel": "official"}}), encoding="utf-8"
+    )
+    official_cfg = ConfigManager(
+        config_path=str(tmp_path / "official.json"), data_dir=str(tmp_path)
+    )
+    with setup_server(tmp_path, config=official_cfg) as (base2, _cfg2, _h2):
+        _status2, body2, _raw2 = http_get(f"{base2}/api/setup/recommend")
+    assert body2["suggested_source"] == "huggingface"
+
+
+def test_setup_recommend_degrades_on_probe_failure(tmp_path, monkeypatch):
+    """硬件探测抛异常时仍返回 200 且结构完整（降级为走云，不返回 5xx）。"""
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(api_server_module, "detect_profile", _boom)
+    with setup_server(tmp_path) as (base, _config, _handler):
+        status, body, _raw = http_get(f"{base}/api/setup/recommend")
+    assert status == 200
+    assert {"profile", "recommendation", "tiers", "suggested_source"} <= set(body)
+    assert body["recommendation"]["use_local"] is False
+    assert body["recommendation"]["config_patch"]["local_llm"]["enabled"] is False
+    assert any("硬件探测失败" in note for note in body["profile"]["probe_notes"])
+
+
+# ---------------------------------------------------------------- Task 7：complete 端
+def test_setup_complete_applies_whitelist_and_encrypts_key(tmp_path):
+    """合法提交：白名单键全部生效、setup 置完成、密钥以 Fernet 密文落盘且可还原。"""
+    with setup_server(tmp_path) as (base, config, _handler):
+        status, body = http_post(
+            f"{base}/api/setup/complete",
+            {
+                "cloud": {"provider": "tongyi", "api_key": "sk-unit-test-key"},
+                "download": {"channel": "official"},
+                "local_llm": {"source": "huggingface", "enabled": False},
+            },
+        )
+        assert status == 200
+        assert body["ok"] is True
+        assert body["setup"]["completed"] is True
+        assert body["setup"]["completed_at"]
+        for key in ("cloud.provider", "cloud.api_key", "download.channel",
+                    "local_llm.source", "local_llm.enabled"):
+            assert key in body["applied"], f"{key} 应在 applied 中"
+        assert body["ignored"] == []
+        assert body["config"]["cloud"]["provider"] == "tongyi"
+        # 状态端点随之放行（向导完成后不再出现）
+        _status, sbody, _raw = http_get(f"{base}/api/setup/status")
+        assert sbody["wizard_required"] is False
+        assert sbody["download"]["channel"] == "official"
+        assert sbody["local_llm_source"] == "huggingface"
+
+    assert config.get("setup", "completed") is True
+    assert config.get("download", "channel") == "official"
+    # 落盘为密文（明文密钥不出现在 config.json），重载可还原
+    on_disk = (tmp_path / "config.json").read_text(encoding="utf-8")
+    assert "sk-unit-test-key" not in on_disk
+    assert "cxa_enc:" in on_disk
+    reloaded = ConfigManager(config_path=str(tmp_path / "config.json"), data_dir=str(tmp_path))
+    assert reloaded.get("cloud", "api_key") == "sk-unit-test-key"
+
+
+def test_setup_complete_ignores_invalid_channel_and_source(tmp_path):
+    """非法 download.channel / local_llm.source → 不生效但进 ignored 显式回显。"""
+    with setup_server(tmp_path) as (base, config, _handler):
+        status, body = http_post(
+            f"{base}/api/setup/complete",
+            {"download": {"channel": "xx"}, "local_llm": {"source": "yy"}},
+        )
+    assert status == 200
+    assert body["ok"] is True
+    assert body["applied"] == []
+    ignored_text = "\n".join(body["ignored"])
+    assert "download.channel" in ignored_text and "xx" in ignored_text
+    assert "local_llm.source" in ignored_text and "yy" in ignored_text
+    assert config.get("download", "channel") == "mirror"
+    assert config.get("local_llm", "source") == "modelscope"
+    assert body["setup"]["completed"] is True  # 非法值不阻断向导完成
+
+
+def test_setup_complete_derives_source_from_channel(tmp_path):
+    """通道派生模型仓库：mirror→modelscope / official→huggingface，且 applied 各登记一次。"""
+    for channel, expected in (("mirror", "modelscope"), ("official", "huggingface")):
+        case_dir = tmp_path / channel
+        case_dir.mkdir()
+        config = ConfigManager(
+            config_path=str(case_dir / "config.json"), data_dir=str(case_dir)
+        )
+        with setup_server(case_dir, config=config) as (base, cfg, _handler):
+            status, body = http_post(
+                f"{base}/api/setup/complete", {"download": {"channel": channel}}
+            )
+        assert status == 200
+        assert "download.channel" in body["applied"]
+        # 派生键只登记一次（不因显式/派生双路径重复）
+        assert body["applied"].count("local_llm.source") == 1
+        assert body["ignored"] == []
+        assert cfg.get("download", "channel") == channel
+        assert cfg.get("local_llm", "source") == expected
+        # 落盘真相与派生值一致
+        on_disk = json.loads((case_dir / "config.json").read_text(encoding="utf-8"))
+        assert on_disk["local_llm"]["source"] == expected
+
+
+def test_setup_complete_conflicting_source_ignored(tmp_path):
+    """显式 source 与通道派生值冲突：不生效并入 ignored（配置以通道派生为准）。"""
+    with setup_server(tmp_path) as (base, config, _handler):
+        status, body = http_post(
+            f"{base}/api/setup/complete",
+            {"download": {"channel": "mirror"}, "local_llm": {"source": "huggingface"}},
+        )
+    assert status == 200
+    assert body["applied"].count("local_llm.source") == 1
+    assert config.get("local_llm", "source") == "modelscope"
+    ignored_text = "\n".join(body["ignored"])
+    assert "local_llm.source" in ignored_text
+    assert "huggingface" in ignored_text
+    assert "download.channel" in ignored_text  # 说明由下载路线决定
+
+
+def test_setup_complete_consistent_source_applied_once(tmp_path):
+    """通道与显式 source 一致：照常 applied 且不重复登记，ignored 为空。"""
+    with setup_server(tmp_path) as (base, config, _handler):
+        status, body = http_post(
+            f"{base}/api/setup/complete",
+            {"download": {"channel": "official"}, "local_llm": {"source": "huggingface"}},
+        )
+    assert status == 200
+    assert body["applied"].count("local_llm.source") == 1
+    assert body["ignored"] == []
+    assert config.get("local_llm", "source") == "huggingface"
+
+
+def test_setup_complete_source_without_channel_still_applies(tmp_path):
+    """未给通道时保留手工配置能力：显式且合法的 source 照常 applied。"""
+    with setup_server(tmp_path) as (base, config, _handler):
+        status, body = http_post(
+            f"{base}/api/setup/complete", {"local_llm": {"source": "huggingface"}}
+        )
+    assert status == 200
+    assert "local_llm.source" in body["applied"]
+    assert body["ignored"] == []
+    assert config.get("local_llm", "source") == "huggingface"
+    assert config.get("download", "channel") == "mirror"  # 未给通道 → 保持默认
+
+
+def test_setup_complete_without_api_key_still_completes(tmp_path):
+    """省略 api_key（稍后补填）仍可完成向导，cloud.api_key 保持空值。"""
+    with setup_server(tmp_path) as (base, config, _handler):
+        status, body = http_post(
+            f"{base}/api/setup/complete", {"cloud": {"provider": "deepseek"}}
+        )
+    assert status == 200
+    assert body["setup"]["completed"] is True
+    assert "cloud.api_key" not in body["applied"]
+    assert config.get("cloud", "api_key") == ""
+
+
+def test_setup_complete_empty_body_and_bad_json(tmp_path):
+    """空 body 与非法 JSON 分别返回可区分的错误码，且不产生部分写入。"""
+    with setup_server(tmp_path) as (base, config, _handler):
+        status, body = http_post(f"{base}/api/setup/complete", {})
+        assert status == 400
+        assert body["error"] == "empty_body"
+
+        status2, body2 = http_raw_body(f"{base}/api/setup/complete", b"{not-valid-json")
+        assert status2 == 400
+        assert body2["error"] == "bad_json"
+    # 两次坏请求均未改动配置（无部分写入）
+    assert config.get("setup", "completed") is False
+
+
+def test_setup_complete_invalid_section_type_400(tmp_path):
+    """段存在但非 dict（{"cloud": "x"}）→ 400 段类型错误（与既有 /api/settings 口径一致）。"""
+    with setup_server(tmp_path) as (base, config, _handler):
+        status, body = http_post(f"{base}/api/setup/complete", {"cloud": "x"})
+        assert status == 400
+        assert body["error"] == "invalid section type: cloud"
+        status2, body2 = http_post(f"{base}/api/setup/complete", {"download": [1, 2]})
+        assert status2 == 400
+        assert body2["error"] == "invalid section type: download"
+    assert config.get("setup", "completed") is False
+
+
+def test_setup_complete_apply_recommended_with_explicit_override(tmp_path, monkeypatch):
+    """apply_recommended=true 应用推荐补丁，且显式传入的键优先（用户手改覆盖推荐）。"""
+    profile = {
+        "cpu_cores": 8,
+        "ram_gb": 16.0,
+        "gpu_vendor": "nvidia",
+        "vram_gb": 8.0,
+        "cuda_version": "12.4",
+        "disk_free_gb": 200.0,
+        "probe_notes": [],
+    }
+    monkeypatch.setattr(api_server_module, "detect_profile", lambda *a, **k: profile)
+    with setup_server(tmp_path) as (base, config, _handler):
+        status, body = http_post(
+            f"{base}/api/setup/complete",
+            {"apply_recommended": True, "local_llm": {"enabled": False}},
+        )
+    assert status == 200
+    # 推荐补丁生效：device=gpu（nvidia 显存 8GB 分档），embedding 同步切 gpu
+    assert config.get("local_llm", "device") == "gpu"
+    assert config.get("embedding", "device") == "gpu"
+    # 显式传入的 enabled=False 覆盖推荐值 True
+    assert config.get("local_llm", "enabled") is False
+    assert "config_patch.local_llm.device" in body["applied"]
+    assert "config_patch.embedding.device" in body["applied"]
+    assert "config_patch.local_llm.enabled" not in body["applied"]
+
+
+def test_setup_config_write_lock_shared_with_download_manager(tmp_path):
+    """Task 7：默认构建的下载管理器与请求线程共用同一把模块级写锁。"""
+    with setup_server(tmp_path) as (_base, _config, handler):
+        assert handler._download_manager._write_lock is api_server_module._CONFIG_WRITE_LOCK
+
+
+# ---------------------------------------------------------------- Task 6：下载端（进度 / 幂等 / 取消 / 失败 / 完成）
+def _build_download_env(tmp_path, mode):
+    """构造「临时配置 + 假下载器管理器」组合，返回 (config, manager, fake, constructions)。"""
+    config = ConfigManager(config_path=str(tmp_path / "config.json"), data_dir=str(tmp_path))
+    fake = _FakeDownloader(dest_dir=str(tmp_path / "models"), mode=mode)
+    constructions = []
+
+    def _factory(**kwargs):
+        constructions.append(kwargs)
+        return fake
+
+    manager = ModelDownloadManager(
+        dest_dir=str(tmp_path / "models"),
+        config_manager=config,
+        downloader_factory=_factory,
+        write_lock=api_server_module._CONFIG_WRITE_LOCK,
+    )
+    return config, manager, fake, constructions
+
+
+def test_setup_model_download_progress_immediate_and_idempotent(tmp_path):
+    """阻塞下载期间：进度与状态端点即时返回（不阻塞服务）；重复触发幂等。"""
+    config, manager, fake, constructions = _build_download_env(tmp_path, "block")
+    with setup_server(tmp_path, config=config, download_manager=manager) as (base, _cfg, _handler):
+        status, body = http_post(f"{base}/api/setup/model/download", {"tier": "1.7B"})
+        assert status == 200
+        assert body["ok"] is True
+        assert body["state"] == "downloading"
+        assert body["already_running"] is False
+        assert body["model"]["tier"] == "1.7B"
+        assert fake.started.wait(timeout=5)
+
+        # 下载被替身阻塞：进度端点必须即时返回（单次请求 < 2s）
+        started = time.monotonic()
+        _status, progress, _raw = http_get(f"{base}/api/setup/model/progress")
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, f"进度端点被下载阻塞（耗时 {elapsed:.2f}s）"
+        assert progress["state"] == "downloading"
+        assert set(progress) >= {"state", "downloaded", "total", "percent", "file", "error", "model"}
+
+        # 下载进行中：其余端点仍即时响应（证明后台线程不阻塞服务）
+        started = time.monotonic()
+        status2, sbody, _raw2 = http_get(f"{base}/api/setup/status")
+        elapsed2 = time.monotonic() - started
+        assert status2 == 200 and elapsed2 < 2.0, f"status 被下载阻塞（耗时 {elapsed2:.2f}s）"
+        assert sbody["wizard_required"] is True
+
+        # 重复触发：幂等，不启动第二个线程 / 不二次构造下载器
+        _status3, again = http_post(f"{base}/api/setup/model/download", {})
+        assert again["already_running"] is True
+        assert again["state"] == "downloading"
+        assert len(constructions) == 1
+
+        # 收尾：先取消再放行替身，避免下载线程在测试结束后继续写配置
+        http_post(f"{base}/api/setup/model/cancel", {})
+        fake.release.set()
+
+
+def test_setup_model_cancel_interrupts_and_keeps_tmp(tmp_path):
+    """取消：状态置 canceled、取消标记被传递、.tmp 保留供断点续传。"""
+    config, manager, fake, _constructions = _build_download_env(tmp_path, "block")
+    with setup_server(tmp_path, config=config, download_manager=manager) as (base, _cfg, _handler):
+        http_post(f"{base}/api/setup/model/download", {})
+        assert fake.started.wait(timeout=5)
+
+        status, body = http_post(f"{base}/api/setup/model/cancel", {})
+        assert status == 200
+        assert body == {"ok": True, "state": "canceled"}
+        assert manager.cancel_event.is_set()
+
+        # 放行阻塞的替身：下一次 progress_cb 命中取消标记并中断下载
+        fake.release.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and manager._thread.is_alive():
+            time.sleep(0.05)
+        assert not manager._thread.is_alive(), "取消后下载线程未退出"
+
+        _status2, progress, _raw = http_get(f"{base}/api/setup/model/progress")
+        assert progress["state"] == "canceled"
+        # 临时文件保留（LlmDownloader 异常路径保留 .tmp 供续传的替身等价语义）
+        tmp_files = list((tmp_path / "models").glob("*.tmp"))
+        assert tmp_files, "取消后应保留 .tmp 供断点续传"
+        assert config.get("local_llm", "model_path") == ""  # 取消不写回模型路径
+
+
+def test_setup_model_download_failure_reports_channel_and_endpoint(tmp_path):
+    """失败：state=failed，error 为中文且含通道 / 端点字样与「切换」提示（不静默换源）。"""
+    config, manager, fake, _constructions = _build_download_env(tmp_path, "fail")
+    with setup_server(tmp_path, config=config, download_manager=manager) as (base, _cfg, _handler):
+        http_post(f"{base}/api/setup/model/download", {"source": "huggingface"})
+        progress = _wait_for_state(base, "failed")
+    assert progress["error"]
+    assert "下载失败" in progress["error"]
+    assert "通道" in progress["error"]
+    assert "端点" in progress["error"]
+    assert "切换" in progress["error"]
+    # 默认镜像通道 + huggingface 仓库：端点恒为官方站点（国内路线不再经 hf-mirror）
+    assert "mirror" in progress["error"]
+    assert "https://huggingface.co" in progress["error"]
+    assert "hf-mirror.com" not in progress["error"]
+    assert config.get("local_llm", "model_path") == ""
+
+
+def test_setup_model_download_success_writes_model_path(tmp_path):
+    """成功：state=done，local_llm.model_path 已写入配置并落盘。"""
+    config, manager, fake, _constructions = _build_download_env(tmp_path, "success")
+    with setup_server(tmp_path, config=config, download_manager=manager) as (base, _cfg, _handler):
+        status, body = http_post(f"{base}/api/setup/model/download", {"source": "modelscope"})
+        assert status == 200
+        progress = _wait_for_state(base, "done")
+    expected = str(tmp_path / "models" / body["model"]["filename"])
+    assert progress["state"] == "done"
+    assert progress["downloaded"] == 100 and progress["percent"] == 100.0
+    assert progress["error"] is None
+    assert config.get("local_llm", "model_path") == expected
+    on_disk = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert on_disk["local_llm"]["model_path"] == expected
+
+
+def test_setup_model_download_unknown_tier_400(tmp_path):
+    """未知档位 → 400（中文错误），不启动下载、不静默换档。"""
+    config, manager, fake, constructions = _build_download_env(tmp_path, "success")
+    with setup_server(tmp_path, config=config, download_manager=manager) as (base, _cfg, _handler):
+        status, body = http_post(f"{base}/api/setup/model/download", {"tier": "99B"})
+        assert status == 400
+        assert body["error"] == "bad_request"
+        assert "未知模型档位" in body["message"]
+        _status2, progress, _raw = http_get(f"{base}/api/setup/model/progress")
+    assert progress["state"] == "idle"
+    assert constructions == []
+    assert fake.calls == []
+
+
+def test_setup_model_download_unknown_source_400(tmp_path):
+    """显式 source 不在 MODEL_REPOS 白名单 → 400（中文错误），不启动下载、不静默换源。"""
+    config, manager, fake, constructions = _build_download_env(tmp_path, "success")
+    with setup_server(tmp_path, config=config, download_manager=manager) as (base, _cfg, _handler):
+        status, body = http_post(f"{base}/api/setup/model/download", {"source": "bogus"})
+        assert status == 400
+        assert body["error"] == "bad_request"
+        assert "bogus" in body["message"]
+        _status2, progress, _raw = http_get(f"{base}/api/setup/model/progress")
+    assert progress["state"] == "idle"
+    assert constructions == []
+    assert fake.calls == []
+
+
+def test_setup_model_progress_idle_before_any_download(tmp_path):
+    """未触发下载时进度端点返回 idle 空快照（字段齐备）。"""
+    with setup_server(tmp_path) as (base, _config, _handler):
+        status, body, _raw = http_get(f"{base}/api/setup/model/progress")
+    assert status == 200
+    assert body == {
+        "state": "idle",
+        "downloaded": 0,
+        "total": 0,
+        "percent": 0.0,
+        "file": "",
+        "error": None,
+        "model": None,
+    }
+
+
+# ---------------------------------------------------------------- Task 6 / Task 7：setup 端点鉴权
+def test_setup_endpoints_require_token_in_token_mode(api_server, monkeypatch):
+    """令牌模式下 setup 六个端点无令牌一律 403（不新增豁免端点）。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
+    _store, _pipeline, base = api_server
+    for path in ("/api/setup/status", "/api/setup/recommend", "/api/setup/model/progress"):
+        status, body = http_get_json(f"{base}{path}")
+        assert status == 403, f"{path} 无令牌应 403"
+        assert body["error"] == "unauthorized_client"
+    for path, payload in (
+        ("/api/setup/complete", {"download": {"channel": "official"}}),
+        ("/api/setup/model/download", {}),
+        ("/api/setup/model/cancel", {}),
+    ):
+        status, body = http_post(f"{base}{path}", payload)
+        assert status == 403, f"{path} 无令牌应 403"
+        assert body["error"] == "unauthorized_client"
+
+
+

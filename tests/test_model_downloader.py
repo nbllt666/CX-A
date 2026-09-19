@@ -2,15 +2,17 @@
 """Task C2 本地小 LLM 下载引导单元测试（全 mock 网络，不真实下载）。
 
 覆盖：
-- build_url：modelscope / huggingface 两源 URL 模板正确；
+- build_url：modelscope / huggingface 两源 URL 模板正确（HuggingFace 恒用官方端点）；
 - build_url / download：非法 repo（单段）、非法文件名（无 .gguf、含 ../、含 / 与 \\）
   均抛 ValueError；
+- 签名防回归：LlmDownloader.__init__ / build_url / download 均不含 hf_endpoint 参数；
 - download（注入 fake requests 或 mock urllib.urlopen）：
   写入成功、目标路径正确、verify_size 通过、偏差超 20% 报错、已存在跳过、进度回调；
 - suggest_model：返回含 source 与 approximate_size_gb；
 - get_local_llm_info：tmp_path 放 .gguf 假文件扫描正确；空/不存在目录返回 None。
 """
 
+import inspect
 import os
 import shutil
 import types
@@ -24,7 +26,7 @@ from lite.runtime.model_downloader import (
 )
 
 MODELSCOPE_REPO = "Qwen/Qwen1.5-1.8B-Chat-GGUF"
-MODELSCOPE_FILE = "qwen1.5-1_8b-chat-q4_k_m.gguf"
+MODELSCOPE_FILE = "qwen1_5-1_8b-chat-q4_k_m.gguf"
 
 
 class _FakeResponse:
@@ -515,12 +517,12 @@ def test_download_urllib_fallback(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("source", ["modelscope", "huggingface"])
 def test_suggest_model_contains_source_and_size(source):
-    """suggest_model 返回含 source 与 approximate_size_gb，且为建议 ~1.7B。"""
+    """suggest_model 返回含 source 与 approximate_size_gb，且为默认档（1.7B 档，实测约 1.13GB）。"""
     info = LlmDownloader.suggest_model(source=source)
     assert isinstance(info, dict)
     assert info["source"] == source
     assert "approximate_size_gb" in info
-    assert abs(float(info["approximate_size_gb"]) - 1.7) < 0.5  # 建议 ~1.7B
+    assert abs(float(info["approximate_size_gb"]) - 1.134) < 0.05  # 实测字节数折算
     assert "repo" in info and "filename" in info
     assert "disclaimer" in info
 
@@ -553,3 +555,172 @@ def test_get_local_llm_info_none_when_missing(tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
     assert get_local_llm_info(str(empty)) is None
+
+
+# ------------------------------------------------------------------ #
+# 7. Task 5：MODEL_TIERS 模型档位表                                  #
+# ------------------------------------------------------------------ #
+
+from lite.config.download_sources import HF_OFFICIAL  # noqa: E402
+from lite.runtime.model_downloader import MODEL_TIERS  # noqa: E402
+
+ALL_TIERS = ["0.5B", "1.7B", "4B", "8B"]
+
+#: 2026-09-19 联网实测（HF tree/main + 魔塔 repo/files + Range 试探）锁定的档位表口径。
+#: 改动 MODEL_TIERS 前必须重新核实，避免再次出现「文件名 404」或「体积校验失败」。
+VERIFIED_TIERS = {
+    "0.5B": ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q4_k_m.gguf", 0.458),
+    "1.7B": ("Qwen/Qwen1.5-1.8B-Chat-GGUF", "qwen1_5-1_8b-chat-q4_k_m.gguf", 1.134),
+    "4B": ("Qwen/Qwen3-4B-GGUF", "Qwen3-4B-Q4_K_M.gguf", 2.326),
+    "8B": ("Qwen/Qwen3-8B-GGUF", "Qwen3-8B-Q4_K_M.gguf", 4.682),
+}
+
+
+def test_model_tiers_match_verified_entries():
+    """四档 repo / filename / 体积与联网实测结果一致（防回归：曾出现 404 与体积偏差 33%）。"""
+    assert set(MODEL_TIERS) == set(VERIFIED_TIERS)
+    for tier, (repo, filename, size_gb) in VERIFIED_TIERS.items():
+        spec = MODEL_TIERS[tier]
+        assert spec["repo"] == repo, f"{tier} 档 repo 与实测不符"
+        assert spec["filename"] == filename, f"{tier} 档文件名与实测不符"
+        assert abs(float(spec["approximate_size_gb"]) - size_gb) < 1e-6, f"{tier} 档体积与实测不符"
+
+
+def test_model_tiers_no_sharded_filenames():
+    """档位表不得含分片文件（``-00001-of-00002``）：本下载器按单文件下载，无法拼装分片。"""
+    for tier, spec in MODEL_TIERS.items():
+        assert "-of-0000" not in spec["filename"], f"{tier} 档指向分片文件，单文件下载不可用"
+
+
+def test_model_tiers_has_four_frozen_tiers():
+    """MODEL_TIERS 冻结四档，且每档含 repo / filename / 体积 / 内存 / 显存 / 说明。"""
+    assert set(MODEL_TIERS) == set(ALL_TIERS)
+    for tier, spec in MODEL_TIERS.items():
+        for key in (
+            "repo",
+            "filename",
+            "approximate_size_gb",
+            "ram_requirement_gb",
+            "vram_requirement_gb",
+            "description",
+        ):
+            assert key in spec, f"档位 {tier} 缺少字段 {key}"
+        assert spec["description"], f"档位 {tier} 的适用说明不能为空"
+
+
+@pytest.mark.parametrize("tier", ALL_TIERS)
+def test_model_tiers_pass_repo_and_filename_validation(tier):
+    """四档 repo / filename 全部通过既有 _validate_repo / _validate_filename 校验。"""
+    spec = MODEL_TIERS[tier]
+    LlmDownloader._validate_repo(spec["repo"])
+    LlmDownloader._validate_filename(spec["filename"])
+    assert spec["filename"].endswith(".gguf")
+    assert spec["repo"].count("/") >= 1
+
+
+@pytest.mark.parametrize("source", ["modelscope", "huggingface"])
+@pytest.mark.parametrize("tier", ALL_TIERS)
+def test_suggest_model_by_tier_returns_tier_spec(source, tier):
+    """按档位返回对应 repo / filename / 体积，并保留 source 相关字段。"""
+    info = LlmDownloader.suggest_model(source, tier)
+    spec = MODEL_TIERS[tier]
+    assert info["source"] == source
+    assert info["repo"] == spec["repo"]
+    assert info["filename"] == spec["filename"]
+    assert float(info["approximate_size_gb"]) == float(spec["approximate_size_gb"])
+    assert info["tier"] == tier
+    for key in ("family", "quant", "reason", "disclaimer", "url_hint", "note"):
+        assert key in info, f"档位 {tier} 缺少字段 {key}"
+
+
+def test_suggest_model_default_tier_keeps_1_7b_baseline():
+    """不传 tier → 回落既有 1.7B 基线档（repo 不变，文件名 / 体积为联网实测值）。"""
+    info = LlmDownloader.suggest_model("modelscope")
+    assert info["tier"] == "1.7B"
+    assert info["repo"] == "Qwen/Qwen1.5-1.8B-Chat-GGUF"
+    assert info["filename"] == "qwen1_5-1_8b-chat-q4_k_m.gguf"
+    assert abs(float(info["approximate_size_gb"]) - 1.134) < 1e-9
+    assert info["family"] == "Qwen1.5-1.8B-Chat"
+    assert info["quant"] == "Q4_K_M"
+
+
+def test_suggest_model_unknown_tier_raises_chinese_error_with_available():
+    """未知档位 → ValueError，中文错误消息列出全部可用档位。"""
+    with pytest.raises(ValueError) as excinfo:
+        LlmDownloader.suggest_model("modelscope", "9B")
+    msg = str(excinfo.value)
+    for tier in ALL_TIERS:
+        assert tier in msg, f"错误消息未列出可用档位 {tier}：{msg}"
+    assert "未知模型档位" in msg
+
+
+@pytest.mark.parametrize("raw", [" 1.7b ", "1.7B", "1.7b", " 1.7B "])
+def test_suggest_model_tier_parsing_is_tolerant(raw):
+    """档位标识宽容解析：前后空格 + 大小写归一后仍命中 1.7B。"""
+    info = LlmDownloader.suggest_model("modelscope", raw)
+    assert info["tier"] == "1.7B"
+    assert info["repo"] == "Qwen/Qwen1.5-1.8B-Chat-GGUF"
+
+
+# ------------------------------------------------------------------ #
+# 8. HuggingFace 恒用官方端点（端点不再派生，hf-mirror 已移除）       #
+# ------------------------------------------------------------------ #
+
+def test_build_url_huggingface_always_official_endpoint():
+    """huggingface 源恒以官方端点开头，路径为 /{repo}/resolve/main/{filename}。"""
+    dl = LlmDownloader(dest_dir="/tmp")
+    repo = "Qwen/Qwen1.5-1.8B-Chat-GGUF"
+    filename = "qwen1.5-1_8b.gguf"
+    url = dl.build_url("huggingface", repo, filename)
+    assert url.startswith("https://huggingface.co/")
+    assert url == f"{HF_OFFICIAL}/{repo}/resolve/main/{filename}"
+    assert "hf-mirror" not in url
+
+
+def test_build_url_huggingface_always_official_endpoint():
+    """HuggingFace 恒用官方端点：通道不再影响 URL（国内路线下载魔塔，不涉及 HF 端点）。"""
+    dl = LlmDownloader(dest_dir="/tmp", source="huggingface")
+    assert dl.build_url("huggingface", "Qwen/Qwen1.5-1.8B-Chat-GGUF", "qwen1.5-1_8b.gguf") == (
+        f"{HF_OFFICIAL}/Qwen/Qwen1.5-1.8B-Chat-GGUF/resolve/main/qwen1.5-1_8b.gguf"
+    )
+
+
+def test_build_url_modelscope_unchanged():
+    """modelscope 分支 URL 不变（魔塔 API + URL 编码 FilePath）。"""
+    dl = LlmDownloader(dest_dir="/tmp")
+    assert dl.build_url("modelscope", MODELSCOPE_REPO, MODELSCOPE_FILE) == (
+        f"https://modelscope.cn/api/v1/models/{MODELSCOPE_REPO}/repo?FilePath={MODELSCOPE_FILE}"
+    )
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        LlmDownloader.__init__,
+        LlmDownloader.build_url,
+        LlmDownloader.download,
+    ],
+)
+def test_signatures_have_no_hf_endpoint_param(func):
+    """签名防回归：hf_endpoint 参数已从构造器与全部 URL / 下载入口移除。"""
+    assert "hf_endpoint" not in inspect.signature(func).parameters
+
+
+def test_download_huggingface_uses_official_endpoint(tmp_path):
+    """download 走 huggingface 源时请求官方端点（已无端点参数可传）。"""
+    data = b"\x00" * 64
+    dl = LlmDownloader(dest_dir=str(tmp_path), source="huggingface")
+    dl._requests = _FakeRequests(data=data)
+    dl._using_requests = True
+    dl.download("Qwen/Qwen1.5-1.8B-Chat-GGUF", "qwen1.5-1_8b.gguf")
+    assert dl._requests.calls[0] == (
+        f"{HF_OFFICIAL}/Qwen/Qwen1.5-1.8B-Chat-GGUF/resolve/main/qwen1.5-1_8b.gguf"
+    )
+
+
+def test_download_modelscope_url_unaffected_by_endpoint_removal(tmp_path):
+    """modelscope 源下载 URL 与端点无关（仍为魔塔 API）。"""
+    data = b"\x00" * 64
+    dl = make_loader(tmp_path, data=data)
+    dl.download(MODELSCOPE_REPO, MODELSCOPE_FILE, source="modelscope")
+    assert dl._requests.calls[0].startswith("https://modelscope.cn/api/v1/models/")

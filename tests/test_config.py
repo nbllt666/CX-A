@@ -315,3 +315,66 @@ def test_corrupt_config_renamed_and_defaults_applied(tmp_path):
     cfg.save()
     cfg2 = _make_manager(tmp_path)
     assert cfg2.get("tts", "voice") == "after-corrupt"
+
+
+# ------------------------------------------------------------------ #
+# 9. 首启向导：download / setup 段与升级兼容                          #
+# ------------------------------------------------------------------ #
+
+def test_download_and_setup_defaults(tmp_path):
+    """全新生成 config.json：download.channel 默认 mirror，setup.completed 为 False。"""
+    cfg = _make_manager(tmp_path)
+    assert cfg.get("download", "channel") == "mirror"
+    assert cfg.get("setup", "completed") is False
+    assert cfg.get("setup", "completed_at") == ""
+    # 段内容与 DEFAULTS 一致（配置契约承载于 DEFAULTS）
+    assert DEFAULTS["download"] == {"channel": "mirror"}
+    assert DEFAULTS["setup"] == {"completed": False, "completed_at": ""}
+
+
+def test_setup_upgrade_compat_existing_config_without_setup(tmp_path):
+    """升级兼容：既有 config.json 无 setup 段 -> 视为老用户已完成初始化（True）。"""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"cloud": {"provider": "deepseek"}}), encoding="utf-8"
+    )
+    cfg = _make_manager(tmp_path)
+    assert cfg.get("setup", "completed") is True
+    # 既有键保留，download 段仍按默认补齐
+    assert cfg.get("cloud", "provider") == "deepseek"
+    assert cfg.get("download", "channel") == "mirror"
+
+
+def test_setup_explicit_false_not_treated_as_legacy(tmp_path):
+    """既有 config.json 显式含 setup.completed=false -> 保持 False（不误判为老用户）。"""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"cloud": {"provider": "deepseek"}, "setup": {"completed": False}}),
+        encoding="utf-8",
+    )
+    cfg = _make_manager(tmp_path)
+    assert cfg.get("setup", "completed") is False
+    # 缺失键（completed_at）自动补齐
+    assert cfg.get("setup", "completed_at") == ""
+
+
+def test_env_override_download_channel(monkeypatch, tmp_path):
+    """CXA_DOWNLOAD_CHANNEL 覆盖 download.channel（单词段名自动可用）。"""
+    monkeypatch.setenv("CXA_DOWNLOAD_CHANNEL", "official")
+    cfg = _make_manager(tmp_path)
+    assert cfg.get("download", "channel") == "official"
+
+
+def test_env_override_setup_completed(monkeypatch, tmp_path):
+    """CXA_SETUP_COMPLETED 覆盖 setup.completed（布尔转换生效）。"""
+    monkeypatch.setenv("CXA_SETUP_COMPLETED", "true")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"setup": {"completed": False}}), encoding="utf-8"
+    )
+    cfg = _make_manager(tmp_path)
+    assert cfg.get("setup", "completed") is True
+
+
+def test_reloadable_download(tmp_path):
+    """download 段纳入热更新；setup 段亦被 reload 列表覆盖（全段覆盖不变量）。"""
+    cfg = _make_manager(tmp_path)
+    assert cfg.reloadable("download") is True
+    assert "download" in HOT_RELOAD_SECTIONS
