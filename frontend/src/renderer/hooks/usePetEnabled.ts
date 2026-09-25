@@ -7,12 +7,17 @@ import { openPetOverlay, closePetOverlay } from '../bridge';
  */
 export const PET_ENABLED_KEY = 'cx-a.petEnabled';
 
-/** 读取持久化开关（默认关闭）；存储不可用时静默回退为关闭。 */
+/**
+ * 读取持久化开关（默认开启）；存储不可用时按默认开启处理。
+ * 语义：无记录 → 开启（开箱即见桌宠）；显式写入过 '0'/'false' → 关闭（尊重用户选择）。
+ */
 function readStoredEnabled(): boolean {
   try {
-    return parseStoredEnabled(window.localStorage.getItem(PET_ENABLED_KEY));
+    const raw = window.localStorage.getItem(PET_ENABLED_KEY);
+    if (raw === null) return true;
+    return parseStoredEnabled(raw);
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -27,10 +32,12 @@ function parseStoredEnabled(raw: string | null): boolean {
 }
 
 /**
- * 桌宠开关 Hook（默认关闭，轻量优先）。
+ * 桌宠开关 Hook（默认开启）。
  *
  * 职责：
  * - 读取 / 写入 `cx-a.petEnabled` 并监听跨窗口 storage 事件保持同步；
+ * - 缺省即开启（localStorage 无记录视为开启）；用户关闭后写入 '0' 并持久化，
+ *   后续启动尊重用户选择（不强行重置为开启）；
  * - Electron 环境下开关联动透明悬浮窗生命周期：开启 → IPC 打开悬浮窗，
  *   关闭 → IPC 关闭悬浮窗（开后必有窗、关后必无窗）；纯浏览器预览下
  *   桥调用自动降级为 no-op，行为与旧版一致。
@@ -52,7 +59,8 @@ export function usePetEnabled() {
     });
   }, []);
 
-  // 挂载恢复：应用重启后若上次为开启状态，主动拉起透明悬浮窗（主进程侧幂等创建）。
+  // 挂载恢复：默认开启——应用启动（或进入桌宠页）时若开关为开启态，主动拉起透明悬浮窗
+  // （主进程侧幂等创建）；用户关闭后持久化 '0'，此处即不再拉起，尊重用户选择。
   // 非 Electron 环境下桥调用自动降级 no-op（返回 false），静默跳过，不影响页面渲染。
   useEffect(() => {
     if (readStoredEnabled()) {

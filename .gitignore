@@ -27,10 +27,19 @@ node_modules/
 dist/
 build/
 
+# ===== 开发态运行时环境（便携根布局：runtime/conda、runtime/voice，本地重建） =====
+runtime/
+
 # ===== 测试缓存 =====
 .pytest_cache/
 .coverage
 htmlcov/
+
+# ===== 内置组件源（本地填充，二进制不入 git；保留目录占位） =====
+# installer/bundled/ 下的真实组件（如 pet_model 桌宠 VRM ~15MB）体积大，
+# 与其它内置组件同为「本地填充」口径：不入 git，但打包链路照常包含。
+installer/bundled/*
+!installer/bundled/.gitkeep
 
 # ===== 第三方源码（手动克隆 / 管理） =====
 MeloTTS/

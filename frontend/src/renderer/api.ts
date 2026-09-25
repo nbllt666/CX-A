@@ -17,11 +17,22 @@ export const API_BASE = `http://127.0.0.1:${API_PORT}/api`;
 export const IS_BACKEND_READY = true;
 
 export const API_ENDPOINTS = {
+  /**
+   * 桌宠 VRM 模型原始字节（GET，Content-Type: model/gltf-binary）。
+   * 服务端默认模型为 <root>/data/pet/cx-open.vrm，用户可替换；前端只认接口，不关心路径。
+   */
+  petModel: `${API_BASE}/pet/model`,
   chat: {
     /** 发起聊天（既有守卫端点，复数路径） */
     sendMessage: `${API_BASE}/chat/messages`,
     /** 表情聊天（Task H3）：走云端流式拼接 + 标签解析，返回 {clean_text, mood, raw} */
     message: `${API_BASE}/chat/message`,
+  },
+  voice: {
+    /** 文本合成语音（POST {text, voice?} → {ok, audio_base64, mime:'audio/wav'}） */
+    synthesize: `${API_BASE}/voice/synthesize`,
+    /** 语音转文本（POST {audio_base64, sample_rate?} → {ok, text}） */
+    transcribe: `${API_BASE}/voice/transcribe`,
   },
   memories: {
     /** 记忆列表 */
@@ -145,6 +156,66 @@ export async function requestJson<T>(
   return res.json() as Promise<T>;
 }
 
+/**
+ * 桌宠模型请求超时（毫秒）：15MB 本地回环传输，给足余量避免弱机首次加载被误判超时
+ * （比 requestJson 默认 300s 短，但远高于进度轮询的 10s）。
+ */
+const PET_MODEL_TIMEOUT_MS = 120_000;
+
+/**
+ * 拉取桌宠 VRM 模型原始字节（GET /api/pet/model，Content-Type: model/gltf-binary）。
+ *
+ * 为何不复用 requestJson：requestJson 末段固定做 `res.json()` 解析，而本端点返回的是
+ * 二进制 GLB 字节流，JSON 解析必然失败；故这里另写一个只做 `arrayBuffer()` 的取体函数，
+ * 但沿用 requestJson 的鉴权（X-Client-Token）、AbortController 超时与中文错误语义。
+ *
+ * 失败（404 / 无网络 / 后端未起 / 超时）统一抛中文错误，由 VrmAvatar 捕获后给出
+ * 中文「暂时显示不了 3D 桌宠」提示（不回落卡通形象）。
+ *
+ * @param signal 可选外部取消信号：组件卸载时会 abort，联动内部超时控制器一起取消
+ *   （15MB 下载不应在悬浮窗反复开关后继续占用连接）。
+ */
+export async function fetchPetModelBuffer(signal?: AbortSignal): Promise<ArrayBuffer> {
+  // N1：持有启动令牌时自动附带 X-Client-Token 头（后端开启令牌校验后必需）
+  const token = await ensureBackendToken();
+  const headers = new Headers();
+  if (token) {
+    headers.set('X-Client-Token', token);
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PET_MODEL_TIMEOUT_MS);
+  // 外部取消（组件卸载）联动内部控制器：任一 abort 都终止本次取体
+  const onExternalAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+  }
+  try {
+    const res = await fetch(API_ENDPOINTS.petModel, { headers, signal: controller.signal });
+    if (!res.ok) {
+      throw new Error(`桌宠模型请求失败: ${res.status} ${res.statusText}`);
+    }
+    // 读体放在 try 内：让超时 / 外部取消同样覆盖 15MB 字节流读取阶段
+    return await res.arrayBuffer();
+  } catch (err) {
+    if (signal?.aborted) {
+      throw new Error('桌宠模型请求已取消');
+    }
+    if (controller.signal.aborted) {
+      throw new Error(
+        `桌宠模型请求超时（${Math.round(PET_MODEL_TIMEOUT_MS / 1000)} 秒）: ${API_ENDPOINTS.petModel}`,
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onExternalAbort);
+  }
+}
+
 /** 聊天发送请求体 */
 export interface ChatSendPayload {
   content: string;
@@ -194,6 +265,58 @@ export async function sendChatMessage(payload: ChatMessagePayload): Promise<Chat
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+  });
+}
+
+/** 语音合成响应（/api/voice/synthesize）。 */
+export interface SpeechSynthesisResult {
+  ok?: boolean;
+  /** base64 编码的 wav 音频字节 */
+  audio_base64?: string;
+  mime?: string;
+  error?: string;
+  message?: string;
+}
+
+/**
+ * 文本合成语音（伴侣回复朗读）。
+ *
+ * @param text 待合成文本（非空）
+ * @param voice 可选音色标识；缺省由服务端使用默认音色（cx-open）
+ */
+export async function synthesizeSpeech(
+  text: string,
+  voice?: string,
+): Promise<SpeechSynthesisResult> {
+  return requestJson<SpeechSynthesisResult>(API_ENDPOINTS.voice.synthesize, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(voice ? { text, voice } : { text }),
+  });
+}
+
+/** 语音识别响应（/api/voice/transcribe）。 */
+export interface SpeechTranscriptionResult {
+  ok?: boolean;
+  text?: string;
+  error?: string;
+  message?: string;
+}
+
+/**
+ * 语音转文本（麦克风输入）。
+ *
+ * @param audioBase64 裸 int16 PCM 的 base64（见 audioRecorder 采集口径）
+ * @param sampleRate 输入采样率（Hz）；服务端据此重采样到识别器期望的 16kHz
+ */
+export async function transcribeAudio(
+  audioBase64: string,
+  sampleRate: number,
+): Promise<SpeechTranscriptionResult> {
+  return requestJson<SpeechTranscriptionResult>(API_ENDPOINTS.voice.transcribe, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ audio_base64: audioBase64, sample_rate: sampleRate }),
   });
 }
 

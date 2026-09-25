@@ -821,6 +821,7 @@ def test_t9_install_explicit_official_has_no_mirror_index(tmp_path, monkeypatch,
     report = _t9_install_report(root)
     assert report["pending_commands"] == [
         "pip install torch --index-url https://download.pytorch.org/whl/cpu",
+        "pip install torchaudio --index-url https://download.pytorch.org/whl/cpu",
         "pip install onnxruntime",
     ]
     assert not any(_T9_MIRROR_INDEX in cmd for cmd in report["pending_commands"])
@@ -838,6 +839,7 @@ def test_t9_install_explicit_mirror_appends_index(tmp_path, monkeypatch):
     report = _t9_install_report(root)
     assert report["pending_commands"] == [
         "pip install torch --index-url https://download.pytorch.org/whl/cpu",
+        "pip install torchaudio --index-url https://download.pytorch.org/whl/cpu",
         f"pip install onnxruntime -i {_T9_MIRROR_INDEX}",
     ]
 
@@ -1112,3 +1114,165 @@ def test_t9_model_repo_step_removed_and_no_legacy_endpoint_names():
     assert "HF_MIRROR" not in source
     assert "hf_endpoint" not in source
     assert "魔搭" not in source
+
+
+# ------------------------------------------------------------------ #
+# 悬浮桌宠模型：文件型内置组件随包分发（20260924_模块0_接入VRM悬浮桌宠）  #
+# ------------------------------------------------------------------ #
+
+def test_zip_portable_keeps_file_type_builtin_target(tmp_path):
+    """文件型 install_target 保留进 zip：``data/pet/cx-open.vrm`` 命中白名单（精确匹配）。"""
+    import zipfile
+
+    from installer import build as build_mod
+
+    root = tmp_path / "portable-file-target"
+    root.mkdir(parents=True)
+    (root / "CX-A.exe").write_bytes(b"fake-shell")
+    (root / "data" / "pet").mkdir(parents=True)
+    (root / "data" / "pet" / "cx-open.vrm").write_bytes(b"CXA-FAKE-VRM")
+    # 对照：白名单外的运行期产物仍应被排除
+    (root / "data" / "memories.db").write_bytes(b"sqlite-payload")
+
+    # 白名单真相源为 manifest：pet_model 组件已登记该文件型 install_target
+    rel_target = os.path.normpath(os.path.join("data", "pet", "cx-open.vrm"))
+    whitelist = build_mod._bundled_data_whitelist()
+    assert rel_target in whitelist
+    assert build_mod._under_whitelist(rel_target, whitelist) is True
+
+    zip_path = build_mod.zip_portable(str(root), str(tmp_path / "rel"))
+    with zipfile.ZipFile(zip_path) as zf:
+        names = [n.replace("\\", "/") for n in zf.namelist()]
+    assert "CX-A-portable/data/pet/cx-open.vrm" in names
+    assert "CX-A-portable/data/memories.db" not in names
+
+# ------------------------------------------------------------------ #
+# 安装器分发：语音桥落位 + Inno Setup 编译（步骤6）                     #
+# ------------------------------------------------------------------ #
+
+def test_assemble_places_voice_bridge_dispatch_script(tmp_path):
+    """assemble 必须把 lite/audio/voice_bridge.py 复制到 runtime/voice_bridge/bridge.py。
+
+    客户端（voice_bridge_client._resolve_script）**仅认该分发落点**——缺它则打包态
+    语音全部降级为 Mock；单一真相源为源码文件，此处断言字节一致。
+    """
+    import zipfile
+
+    from installer import build as build_mod
+
+    electron_dist = tmp_path / "win-unpacked"
+    (electron_dist / "resources").mkdir(parents=True)
+    (electron_dist / "CX-A.exe").write_bytes(b"fake-exe")
+    backend_dist = tmp_path / "backend-dist"
+    backend_dist.mkdir(parents=True)
+    (backend_dist / "backend.exe").write_bytes(b"fake-backend")
+
+    portable_root = str(tmp_path / "portable")
+    build_mod.assemble(str(electron_dist), str(backend_dist), portable_root)
+
+    bridge_dst = os.path.join(portable_root, "runtime", "voice_bridge", "bridge.py")
+    bridge_src = os.path.join(build_mod.PROJECT_ROOT, "lite", "audio", "voice_bridge.py")
+    assert os.path.isfile(bridge_dst)
+    with open(bridge_dst, "rb") as dst_fh, open(bridge_src, "rb") as src_fh:
+        assert dst_fh.read() == src_fh.read()
+
+    # 随包分发（zip 收录 runtime/ 树）
+    zip_path = build_mod.zip_portable(portable_root, str(tmp_path / "rel"))
+    with zipfile.ZipFile(zip_path) as zf:
+        names = [n.replace("\\", "/") for n in zf.namelist()]
+    assert "CX-A-portable/runtime/voice_bridge/bridge.py" in names
+
+
+def test_find_iscc_returns_none_without_install(tmp_path, monkeypatch):
+    """三处候选皆无 ISCC → None（build_installer 据此告警跳过）。"""
+    from installer import build as build_mod
+
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "pf86"))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "pf"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "lad"))
+
+    assert build_mod.find_iscc() is None
+
+
+def test_find_iscc_prefers_user_install_location(tmp_path, monkeypatch):
+    """用户在 LOCALAPPDATA 下安装（winget 默认）也能被找到。"""
+    from installer import build as build_mod
+
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "pf86"))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "pf"))
+    lad = tmp_path / "lad"
+    monkeypatch.setenv("LOCALAPPDATA", str(lad))
+    iscc = lad / "Programs" / "Inno Setup 6" / "ISCC.exe"
+    iscc.parent.mkdir(parents=True)
+    iscc.write_bytes(b"fake-iscc")
+
+    assert build_mod.find_iscc() == str(iscc)
+
+
+def test_build_installer_skips_without_iscc(tmp_path, monkeypatch, capsys):
+    """ISCC 缺失：告警跳过并返回 None，不阻断主链路。"""
+    from installer import build as build_mod
+
+    monkeypatch.setattr(build_mod, "find_iscc", lambda: None)
+
+    assert build_mod.build_installer(str(tmp_path / "portable"), str(tmp_path / "rel")) is None
+    assert "未检测到 Inno Setup 编译器" in capsys.readouterr().out
+
+
+def test_build_installer_skips_when_runtime_sources_missing(tmp_path, monkeypatch, capsys):
+    """随包运行时源缺失：明确告警跳过（不产生半成品安装器）。"""
+    from installer import build as build_mod
+
+    monkeypatch.setattr(build_mod, "find_iscc", lambda: str(tmp_path / "ISCC.exe"))
+    monkeypatch.setattr(build_mod, "BUNDLED_DIR", str(tmp_path / "bundled-empty"))
+
+    assert build_mod.build_installer(str(tmp_path / "portable"), str(tmp_path / "rel")) is None
+    out = capsys.readouterr().out
+    assert "随包运行时源缺失" in out
+    assert "Miniconda 安装器" in out
+
+
+def test_build_installer_compiles_with_defines(tmp_path, monkeypatch):
+    """源齐备：以 /D 传参调用 ISCC，产物存在则返回其路径。"""
+    from installer import build as build_mod
+
+    bundled = tmp_path / "bundled"
+    bundled.mkdir()
+    (bundled / "miniconda_installer.exe").write_bytes(b"MZ")
+    (bundled / "melotts_src").mkdir()
+    (bundled / "nltk_data").mkdir()
+    (bundled / "sensevoice").mkdir()
+    iscc = tmp_path / "ISCC.exe"
+    iscc.write_bytes(b"fake")
+    monkeypatch.setattr(build_mod, "find_iscc", lambda: str(iscc))
+    monkeypatch.setattr(build_mod, "BUNDLED_DIR", str(bundled))
+
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = "compiled"
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        # 编译产物由 ISCC 产生：此处伪造为脚本路径推导出的目标名
+        rel = tmp_path / "rel"
+        rel.mkdir(exist_ok=True)
+        (rel / "CX-A-Setup-9.9.9.exe").write_bytes(b"MZ-installer")
+        return _Proc()
+
+    monkeypatch.setattr(build_mod.subprocess, "run", fake_run)
+
+    result = build_mod.build_installer(
+        str(tmp_path / "portable"), str(tmp_path / "rel"), version="9.9.9"
+    )
+
+    assert result == str(tmp_path / "rel" / "CX-A-Setup-9.9.9.exe")
+    cmd = captured["cmd"]
+    assert cmd[0] == str(iscc)
+    assert f"/DPayloadDir={tmp_path / 'portable'}" in cmd
+    assert f"/DBundledDir={bundled}" in cmd
+    assert f"/DOutputDir={tmp_path / 'rel'}" in cmd
+    assert "/DAppVersion=9.9.9" in cmd
+    assert cmd[-1].endswith("installer.iss")

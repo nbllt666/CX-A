@@ -10,6 +10,7 @@ import PetPage from './pages/PetPage';
 import MemoriesPage from './pages/MemoriesPage';
 import SettingsPage from './pages/SettingsPage';
 import SetupWizard from './pages/SetupWizard';
+import { usePetEnabled } from './hooks/usePetEnabled';
 
 /**
  * 伴侣面视图。
@@ -24,42 +25,16 @@ export type View = 'chat' | 'pet' | 'memories' | 'settings' | 'setup';
 
 const VIEWS: View[] = ['chat', 'pet', 'memories', 'settings', 'setup'];
 
-/** localStorage 键（cx-a.* 家族）：接口不可达时本地记「已跳过向导」 */
-const LS_SETUP_SKIPPED_KEY = 'cx-a.setup.skipped';
-/** 旧版键名（cx.* 家族）：仅用于读取回退迁移，写入一律走新键 */
-const LEGACY_LS_SETUP_SKIPPED_KEY = 'cx.setup.skipped';
-
-/** 读取「已跳过向导」本地记录；新键缺失时回落旧键并顺手写入新键（静默迁移） */
-function readSetupSkipped(): boolean {
-  try {
-    const raw = localStorage.getItem(LS_SETUP_SKIPPED_KEY);
-    if (raw !== null) return raw === '1';
-    const legacy = localStorage.getItem(LEGACY_LS_SETUP_SKIPPED_KEY);
-    if (legacy !== null) {
-      const value = legacy === '1';
-      writeSetupSkipped(value);
-      return value;
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-/** 写入「已跳过向导」（'1'/'0'），异常静默 */
-function writeSetupSkipped(value: boolean): void {
-  try {
-    localStorage.setItem(LS_SETUP_SKIPPED_KEY, value ? '1' : '0');
-  } catch {
-    /* 存储被禁用时静默忽略 */
-  }
-}
-
 /**
  * 首启门控状态：
  * - `checking`：首帧等待接口，渲染轻量 loading（不白屏）；
- * - `wizard`：需要初始化 → 向导覆盖主界面（不渲染 TopBar / Sidebar / 主视图）；
- * - `main`：正常渲染主界面（含「已完成初始化」「已跳过」两种来源）。
+ * - `wizard`：后端明确要求初始化 → 向导覆盖主界面（不渲染 TopBar / Sidebar / 主视图）；
+ * - `main`：正常渲染主界面（后端说已完成，或接口不可达时本次会话降级放行）。
+ *
+ * 门控真相唯一来源是后端 `/api/setup/status`：**不持久化「已跳过向导」标记**。
+ * 早期版本把「接口不可达」写进 localStorage 并据此短路门控，导致首启时后端
+ * 稍慢一拍（或端口被占）就会让向导**永久不再出现**；降级放行只应作用于
+ * 本次会话，下次启动必须重新询问后端。
  */
 type SetupGate = 'checking' | 'wizard' | 'main';
 
@@ -102,8 +77,8 @@ function viewToHash(view: View): string {
 export default function App() {
   const [view, setView] = useState<View>(() => parseHash(window.location.hash));
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
-  // 首帧门控：已本地记过「跳过」则不再请求（显式 `#/setup` 深链仍可在主界面内进向导）
-  const [gate, setGate] = useState<SetupGate>(() => (readSetupSkipped() ? 'main' : 'checking'));
+  // 首帧门控：每次启动都询问后端（不持久化跳过标记；显式 `#/setup` 深链可在主界面内进向导）
+  const [gate, setGate] = useState<SetupGate>('checking');
   // 门控拿到的状态：透传给向导作为默认选择，避免重复请求
   const [setupStatus, setSetupStatus] = useState<SetupStatusView | null>(null);
 
@@ -126,9 +101,10 @@ export default function App() {
 
   // 首启门控：问一次「要不要初始化」
   //   wizard_required → 覆盖主界面展示向导；
-  //   其余（completed）→ 正常主界面并清掉「已跳过」记录；
-  //   请求失败（后端未就绪 / 浏览器 dev）→ 降级放行：记「已跳过」并进主界面，
-  //   绝不出现空白页 / 死循环 / 永久 loading。
+  //   其余（completed）→ 正常主界面；
+  //   请求失败（后端未就绪 / 浏览器 dev）→ 本次会话降级放行进主界面，
+  //   绝不出现空白页 / 死循环 / 永久 loading，也不持久化跳过标记
+  //   （否则首启时后端慢一拍就会让向导永久消失）。
   useEffect(() => {
     if (gate !== 'checking') return;
     let alive = true;
@@ -140,12 +116,11 @@ export default function App() {
         if (st?.wizard_required) {
           setGate('wizard');
         } else {
-          writeSetupSkipped(false);
           setGate('main');
         }
       } catch {
         if (!alive) return;
-        writeSetupSkipped(true);
+        // 接口不可达：本次会话降级放行（不写持久标记），下次启动重新询问后端
         setGate('main');
       }
     })();
@@ -193,9 +168,8 @@ export default function App() {
     [view, appInfo],
   );
 
-  // 向导走完（或选择「先进去用」）：清掉「已跳过」记录并进聊天页
+  // 向导走完（或选择「先进去用」）：进聊天页
   const handleWizardDone = () => {
-    writeSetupSkipped(false);
     setGate('main');
     window.location.hash = viewToHash('chat');
     setView('chat');
@@ -218,6 +192,7 @@ export default function App() {
   return (
     <RouterContext.Provider value={router}>
       <div className="app-surface flex h-full w-full overflow-hidden">
+        <PetLifecycle />
         <TopBar />
         <Sidebar />
         <main className="flex-1 min-w-0 pt-14 pl-56">
@@ -226,6 +201,20 @@ export default function App() {
       </div>
     </RouterContext.Provider>
   );
+}
+
+/**
+ * 桌宠生命周期挂载点：进入主界面即按开关自动拉起透明悬浮窗。
+ *
+ * 为什么要挂在 App 主界面而不是只挂桌宠页：`usePetEnabled` 的挂载恢复逻辑
+ * 只在「hook 被挂载」时才执行——若仅挂桌宠页，用户不点进那一页就永远看不到
+ * 悬浮角色，与「默认开启、双击即见」的预期不符。挂在主界面后每次启动都会
+ * 询问一次开关状态；主进程侧建窗幂等（已存在则复用），不会重复开窗。
+ * 向导阶段（gate==='wizard'）不挂载，避免悬浮角色盖在首启向导上。
+ */
+function PetLifecycle() {
+  usePetEnabled();
+  return null;
 }
 
 /** 首帧等待用的轻量加载态（避免白屏） */

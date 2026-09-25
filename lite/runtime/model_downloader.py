@@ -37,12 +37,21 @@ from pathlib import Path
 # HuggingFace 官方端点唯一真相源：统一下载源真相源模块（纯常量模块，无导入期耦合），
 # 本模块不再自建同值常量，避免出现两份不同来源的同名常量。
 from lite.config.download_sources import HF_OFFICIAL
+from lite.config.paths import data_root
 
-#: 工程根目录推导：model_downloader.py 位于 lite/runtime/ 下，上溯两层 dirname 即工程根
-_LITE_RUNTIME_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(_LITE_RUNTIME_DIR))
-#: 默认本地小 LLM 存储目录（工程根 / data / local_llm）
-DEFAULT_DOWNLOAD_DIR = os.path.normpath(os.path.join(_PROJECT_ROOT, "data", "local_llm"))
+
+def default_download_dir() -> str:
+    """默认本地小 LLM 存储目录：``<app_root>/data/local_llm``。
+
+    根解析统一收敛到 :func:`lite.config.paths.data_root`（frozen-aware）——
+    修复前此处用 ``__file__`` 上溯两层推导：PyInstaller onedir 冻结态下 ``__file__``
+    位于 ``<便携根>/runtime/backend/_internal/lite/runtime/``，上溯得 ``_internal``，
+    导致向导里下载的模型被写进 ``runtime/backend/_internal/data/local_llm/``
+    （用户数据目录里看不到、重装即丢）。**必须调用时解析**，不得在导入期固化为常量。
+
+    :return: str 绝对路径（已 normpath，不含相对路径与字符串拼接斜杠）。
+    """
+    return os.path.normpath(os.path.join(data_root(), "local_llm"))
 
 #: 支持的下载源别名 -> 规范名（国内优先魔塔）
 _SOURCE_ALIASES = {
@@ -155,12 +164,12 @@ class LlmDownloader:
         """初始化下载器。
 
         Args:
-            dest_dir: 模型存储目录；默认 ``工程根/data/local_llm``（基于
-                ``os.path.abspath(__file__)`` 逐级推导，无相对路径）。
+            dest_dir: 模型存储目录；默认 :func:`default_download_dir`
+                （``<app_root>/data/local_llm``，经 frozen-aware 根解析，无相对路径）。
             source: 默认下载源，'' 时取默认 ``"modelscope"``（国内优先魔塔）。
             timeout: 网络请求超时秒数。
         """
-        self.dest_dir = dest_dir or DEFAULT_DOWNLOAD_DIR
+        self.dest_dir = dest_dir or default_download_dir()
         self.source = source or "modelscope"
         self.timeout = timeout
         #: 可选 requests 库；未安装时置 None，下载走 urllib 兜底。

@@ -357,7 +357,7 @@ class LoopingASRBackend:
         self.texts = list(texts)
         self.n = 0
 
-    def transcribe(self, audio):
+    def transcribe(self, audio, sample_rate=None):
         text = self.texts[self.n % len(self.texts)]
         self.n += 1
         return {"text": text, "emotion": "", "event": None}
@@ -436,7 +436,7 @@ class RecordingASRBackend:
         self.text = text
         self.frames = []
 
-    def transcribe(self, audio):
+    def transcribe(self, audio, sample_rate=None):
         self.frames.append(audio)
         return {"text": self.text, "emotion": "", "event": None}
 
@@ -650,7 +650,7 @@ def test_utterance_buffer_counter_reset_on_start_session():
 def test_asr_exception_returns_structured_false_and_loop_survives():
     """asr.transcribe 抛异常时返回结构化 should_reply=False 且后续轮次存活。"""
     class BoomASRBackend:
-        def transcribe(self, audio):
+        def transcribe(self, audio, sample_rate=None):
             raise RuntimeError("识别引擎崩溃")
 
     vad = ToggleVAD()

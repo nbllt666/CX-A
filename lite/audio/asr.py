@@ -10,11 +10,13 @@
 默认不实际加载模型（funasr 未安装时测试只用 Mock）。
 """
 
+import base64
 import os
 
 __all__ = [
     "ASRBackend",
     "SenseVoiceBackend",
+    "BridgeASRBackend",
     "MockASRBackend",
     "LiteASR",
     "resolve_torch_device",
@@ -65,10 +67,12 @@ def resolve_torch_device(device="cpu"):
 class ASRBackend:
     """语音识别后端抽象基类。"""
 
-    def transcribe(self, audio):
+    def transcribe(self, audio, sample_rate=None):
         """识别带音频，返回 ``{text, emotion, event}``。
 
         :param audio: PCM 音频字节
+        :param sample_rate: 可选输入采样率（Hz）；桥后端据此重采样到 16k
+            （SenseVoice 期望值），其余后端可忽略（缺省 None 表示未提供）
         :return: dict，键为 text / emotion / event
         """
         raise NotImplementedError
@@ -111,12 +115,15 @@ class SenseVoiceBackend(ASRBackend):
         )
         self._loaded = True
 
-    def transcribe(self, audio):
+    def transcribe(self, audio, sample_rate=None):
         """识别音频并返回 ``{text, emotion, event}``。
 
         L12：bytes（裸 int16 PCM）先转换为 funasr 公开支持的 numpy 波形数组
         （float32，取值 [-1, 1]）再投递 generate；ndarray/list 按需 asarray 为
         float32。numpy 延迟导入。
+
+        :param sample_rate: 可选输入采样率；**进程内路径按 16k 假定处理**（不做
+            重采样——重采样唯一实现位于 sidecar 桥内 `voice_bridge._resample`）
         """
         self._load()
         res = self._model.generate(input=_coerce_to_waveform(audio), language="auto", use_itn=True)
@@ -137,6 +144,32 @@ def _coerce_to_waveform(audio):
     if isinstance(audio, (bytes, bytearray)):
         return np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
     return np.asarray(audio, dtype=np.float32)
+
+
+def _coerce_to_pcm16_bytes(audio):
+    """把音频输入归一化为裸 int16 PCM 字节（sidecar 桥解码口径，与 ASR 约定对齐）。
+
+    - bytes / bytearray：按既有约定视为裸 int16 PCM，**原样返回**（不触 numpy——
+      主进程冻结包刻意不含 numpy，前端上传的 PCM 即走本分支）；
+    - ndarray / list：float 波形（[-1, 1]）按 ×32768 钳制转 int16；
+      已是 int16 的数组原样编码。numpy 仅在**本分支内**延迟导入。
+
+    :param audio: 音频输入（bytes / ndarray / list）
+    :return: bytes，裸 int16 PCM
+    """
+    if isinstance(audio, (bytes, bytearray)):
+        return bytes(audio)
+
+    import numpy as np
+
+    arr = np.asarray(audio)
+    if arr.dtype == np.int16:
+        return arr.tobytes()
+    return (
+        np.clip(np.asarray(arr, dtype=np.float32) * 32768.0, -32768, 32767)
+        .astype(np.int16)
+        .tobytes()
+    )
 
 
 def _parse_funasr_result(res):
@@ -187,6 +220,43 @@ def _parse_funasr_result(res):
     }
 
 
+class BridgeASRBackend(ASRBackend):
+    """经 sidecar 桥调用 SenseVoice 的识别后端（stdio + 常驻进程，uv1 协议）。
+
+    与 :class:`SenseVoiceBackend` 的差异：funasr 与模型仅在 sidecar conda
+    环境内加载，主进程只做 PCM 归一（→ base64）与结果解析（复用
+    :func:`_parse_funasr_result`，跨进程不产生第二份解析逻辑）。
+    """
+
+    def __init__(self, client, device="cpu"):
+        """初始化桥后端。
+
+        :param client: VoiceBridgeClient 实例（进程管理与协议交互）
+        :param device: 推理设备意图（透传 sidecar；"gpu" 由客户端归一为 auto）
+        """
+        self.client = client
+        self.device = device or "cpu"
+
+    def transcribe(self, audio, sample_rate=None):
+        """经桥识别音频并返回 ``{text, emotion, event}``。
+
+        :param audio: bytes（裸 int16 PCM）/ ndarray / list 音频输入
+        :param sample_rate: 输入采样率（Hz）；桥侧非 16k 时自动重采样
+            （SenseVoice 期望 16kHz）；缺省 None → 16000（历史默认口径）
+        :return: dict，键为 text / emotion / event
+        :raises RuntimeError: 桥不可用或 sidecar 返回错误时（消息含中文诊断）
+        """
+        audio_b64 = base64.b64encode(_coerce_to_pcm16_bytes(audio)).decode("ascii")
+        header, _payload = self.client.request(
+            {
+                "op": "asr",
+                "audio_b64": audio_b64,
+                "sample_rate": int(sample_rate or 16000),
+            }
+        )
+        return _parse_funasr_result([{"text": header.get("raw", "")}])
+
+
 class MockASRBackend(ASRBackend):
     """测试用识别后端：预设返回文本 / 情感 / 事件。"""
 
@@ -201,8 +271,8 @@ class MockASRBackend(ASRBackend):
         self.emotion = emotion
         self.event = event
 
-    def transcribe(self, audio):
-        """直接返回预设结果，不解析音频。"""
+    def transcribe(self, audio, sample_rate=None):
+        """直接返回预设结果，不解析音频（``sample_rate`` 仅为契约兼容而忽略）。"""
         return {"text": self.text, "emotion": self.emotion, "event": self.event}
 
 
@@ -221,9 +291,14 @@ class LiteASR:
         self.backend = backend if backend is not None else MockASRBackend()
         self.device = device
 
-    def transcribe(self, audio):
-        """识别音频，返回归一化的 ``{text, emotion, event}``。"""
-        result = self.backend.transcribe(audio)
+    def transcribe(self, audio, sample_rate=None):
+        """识别音频，返回归一化的 ``{text, emotion, event}``。
+
+        :param audio: PCM 音频字节
+        :param sample_rate: 可选输入采样率（Hz）；透传后端（桥后端据此重采样
+            到 SenseVoice 期望的 16kHz），缺省 None 表示未提供
+        """
+        result = self.backend.transcribe(audio, sample_rate)
         if not isinstance(result, dict):
             result = {}
         return {

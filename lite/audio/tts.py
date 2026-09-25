@@ -17,7 +17,50 @@ from lite.audio.asr import data_dir  # noqa: F401  （re-export 供既有引用�
 from lite.audio.asr import resolve_torch_device
 from lite.audio.voice_manager import DEFAULT_VOICE_ID, is_unsafe_voice_id
 
-__all__ = ["TTSBackend", "MeloTTSBackend", "MockTTSBackend", "LiteTTS", "data_dir"]
+__all__ = [
+    "TTSBackend",
+    "MeloTTSBackend",
+    "BridgeTTSBackend",
+    "MockTTSBackend",
+    "LiteTTS",
+    "resolve_voice_path",
+    "data_dir",
+]
+
+
+def resolve_voice_path(voice_dir, voice):
+    """解析某音色的模型目录路径（进程内后端与 sidecar 桥后端共用的单一实现）。
+
+    区分"裸 id"与"绝对路径"两种入参形态（H-2 + 第四轮体检批次C 口径不变）：
+
+    - ``voice`` 含路径穿越特征（``/``、``\\``、``..``、盘符）时按**绝对路径**
+      形态校验——不拼接逃逸 ``voice_dir`` 根目录的任意路径；仅当位于
+      ``voice_dir`` 前缀内（``os.path.commonpath`` 校验）且目录真实存在时放行；
+    - 越出音色根目录、目录不存在或跨盘无法判定前缀时返回 ``None``，
+      由调用方回退默认音色。
+
+    :param voice_dir: 音色根目录（如 ``data/voices``）
+    :param voice: 音色标识（裸 id）或音色包绝对路径
+    :return: 音色模型目录路径；非法或越界返回 None
+    """
+    if not isinstance(voice, str) or not voice:
+        return None
+    if not is_unsafe_voice_id(voice):
+        # 裸 id（无分隔符/盘符/穿越特征）：照常拼接音色根目录
+        return os.path.join(voice_dir, voice)
+    # 含路径特征的入参：按绝对路径形态校验——必须在音色根目录前缀内且存在
+    candidate = os.path.abspath(voice)
+    voice_root = os.path.abspath(voice_dir)
+    try:
+        common = os.path.commonpath([candidate, voice_root])
+    except ValueError:
+        # 跨盘 / 绝对相对混合等无法判定公共前缀的情形：一律拒绝
+        return None
+    if common != voice_root:
+        return None
+    if not os.path.isdir(candidate):
+        return None
+    return candidate
 
 
 def _audio_to_pcm16(audio):
@@ -117,38 +160,13 @@ class MeloTTSBackend(TTSBackend):
         return engine
 
     def _voice_path(self, voice):
-        """推导某音色的模型目录路径，区分"裸 id"与"绝对路径"两种入参形态。
+        """（兼容保留）音色路径解析委托模块级 :func:`resolve_voice_path`。
 
-        H-2（第三轮体检批次3）+ 第四轮体检批次C：``voice`` 含路径穿越特征
-        （``/``、``\\``、``..``、盘符）时按裸 id 口径拒绝——不拼接逃逸
-        ``data/voices/`` 根目录的任意路径。
-
-        绝对路径形态（与 :meth:`VoiceManager.resolve_voice` 的返回值契约对齐，
-        该契约返回音色包绝对路径）：仅当位于 ``self.voice_dir`` 前缀内
-        （``os.path.commonpath`` 校验）且目录真实存在时放行；越出音色根目录、
-        目录不存在或跨盘无法判定前缀时返回 ``None``，由调用方回退默认音色。
-
-        :param voice: 音色标识（裸 id）或音色包绝对路径
-        :return: 音色模型目录路径；非法或越界返回 None
+        完整语义（裸 id 拼接 / 绝对路径前缀校验 / 越界返回 None）见模块级
+        函数 docstring；本方法保持既有调用方与测试的 ``backend._voice_path``
+        形态不变。
         """
-        if not isinstance(voice, str) or not voice:
-            return None
-        if not is_unsafe_voice_id(voice):
-            # 裸 id（无分隔符/盘符/穿越特征）：照常拼接音色根目录
-            return os.path.join(self.voice_dir, voice)
-        # 含路径特征的入参：按绝对路径形态校验——必须在音色根目录前缀内且存在
-        candidate = os.path.abspath(voice)
-        voice_root = os.path.abspath(self.voice_dir)
-        try:
-            common = os.path.commonpath([candidate, voice_root])
-        except ValueError:
-            # 跨盘 / 绝对相对混合等无法判定公共前缀的情形：一律拒绝
-            return None
-        if common != voice_root:
-            return None
-        if not os.path.isdir(candidate):
-            return None
-        return candidate
+        return resolve_voice_path(self.voice_dir, voice)
 
     def synthesize(self, text, voice=None):
         """合成文本为 wav 音频字节（真实引擎委托）。
@@ -203,6 +221,83 @@ class MeloTTSBackend(TTSBackend):
         buf = io.BytesIO()
         sf.write(buf, pcm, sr, format="WAV")
         return buf.getvalue()
+
+
+class BridgeTTSBackend(TTSBackend):
+    """经 sidecar 桥调用 MeloTTS 的合成后端（stdio + 常驻进程，uv1 协议）。
+
+    适用场景：主环境无法安装 MeloTTS（如 Python 3.14 无 cp314 轮子）但内置
+    sidecar conda 环境就绪——引擎在 sidecar 进程内加载，主进程零重依赖。
+    协议与进程管理分别由 :mod:`lite.audio.voice_bridge`（sidecar 侧脚本）与
+    :class:`lite.audio.voice_bridge_client.VoiceBridgeClient`（主侧客户端）承载。
+
+    音色路径语义与 :class:`MeloTTSBackend` 完全一致（共用
+    :func:`resolve_voice_path`)；音频封装（clip + wav）由 sidecar 侧完成
+    （``voice_bridge._pack_wav``），主进程只透传字节——冻结包不含 numpy/soundfile。
+    """
+
+    def __init__(self, client, default_voice="cx-open", voice_dir="", device="cpu"):
+        """初始化桥后端。
+
+        :param client: VoiceBridgeClient 实例（进程管理与协议交互）
+        :param default_voice: 默认音色标识，默认 ``cx-open``
+        :param voice_dir: 音色根目录；留空时回退 ``data/voices``
+        :param device: 推理设备意图（透传 sidecar；"gpu" 由客户端归一为 auto）
+        """
+        self.client = client
+        self.default_voice = default_voice or "cx-open"
+        self.voice_dir = voice_dir or os.path.join(data_dir(), "voices")
+        self.device = device or "cpu"
+
+    def synthesize(self, text, voice=None):
+        """经桥合成文本为 wav 音频字节。
+
+        音色回退链与进程内后端同口径：非法标识 → 默认音色 → 官方默认
+        ``cx-open``；音色目录缺训练产物（config.json/ckpt.txt）时告警，由
+        bridge 侧按同规则回退 MeloTTS 官方默认模型。
+
+        :param text: 待合成文本
+        :param voice: 音色标识；留空使用默认音色
+        :return: bytes，16-bit PCM WAV 字节
+        :raises RuntimeError: 桥不可用或 sidecar 返回错误时（消息含中文诊断）
+        """
+        _voice = voice or self.default_voice
+        _voice_path = resolve_voice_path(self.voice_dir, _voice)
+        if _voice_path is None:
+            warnings.warn(
+                f"音色标识含路径穿越特征或越出音色根目录，已拒绝并回退官方默认音色：{_voice!r}",
+                UserWarning,
+                stacklevel=2,
+            )
+            _voice = self.default_voice
+            _voice_path = resolve_voice_path(self.voice_dir, _voice)
+            if _voice_path is None:
+                _voice = DEFAULT_VOICE_ID
+                _voice_path = resolve_voice_path(self.voice_dir, _voice)
+        if _voice_path is not None and not (
+            os.path.exists(os.path.join(_voice_path, "config.json"))
+            or os.path.exists(os.path.join(_voice_path, "ckpt.txt"))
+        ):
+            # G-4 告警口径与进程内后端一致：缺训练产物将回退官方默认音色
+            warnings.warn(
+                f"音色目录缺少 config.json/ckpt.txt，已回退官方默认音色：{_voice_path}",
+                UserWarning,
+                stacklevel=2,
+            )
+        header, payload = self.client.request(
+            {
+                "op": "tts",
+                "text": text,
+                "voice": _voice_path or "",
+                "speed": 1.0,
+            }
+        )
+        # 载荷即完整 WAV（clip 钳制与封装在 sidecar 内完成，见 voice_bridge._pack_wav）——
+        # 主进程（冻结包）刻意不含 numpy/soundfile，此处不得再引入（2026-09-25 打包态实测：
+        # 原先在主进程封装会直接 503「No module named 'numpy'」）。
+        if not payload:
+            raise RuntimeError("语音侧车返回空音频载荷")
+        return bytes(payload)
 
 
 class MockTTSBackend(TTSBackend):

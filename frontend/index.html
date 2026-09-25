@@ -4,7 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#fafafc" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:8600 http://localhost:8600" />
+    <!-- CSP：connect-src 追加 blob: —— VRM/GLTFLoader 对 GLB 内嵌贴图走 fetch(blob:) 加载（three 的 ImageBitmapLoader），
+         不放行会导致模型贴图加载失败；img-src 同步放行 blob: 以兼容非 ImageBitmap 回退路径。
+         media-src 放行 data:/blob: —— 聊天朗读以 new Audio('data:audio/wav;base64,…') 播放后端返回的音频，
+         缺 media-src 时会回落 default-src 'self' 而被拒（真机实测：朗读无声 + NotSupportedError）；
+         回归防线见 tests/unit/csp.test.ts。 -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' blob: http://127.0.0.1:8600 http://localhost:8600" />
     <title>CX-A 赛博伴侣</title>
   </head>
   <body>

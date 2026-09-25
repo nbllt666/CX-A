@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { requestJson } from '../../src/renderer/api';
+import { requestJson, synthesizeSpeech, transcribeAudio } from '../../src/renderer/api';
 
 /**
  * Test1 · requestJson 非 2xx 错误体透出（D5 修复回归）。
@@ -214,5 +214,57 @@ describe('首启向导接口：URL / method / body（Task 8）', () => {
     expect(url).toBe(API_ENDPOINTS.setup.modelCancel);
     expect(API_ENDPOINTS.setup.modelCancel).toMatch(/\/api\/setup\/model\/cancel$/);
     expect(init.method).toBe('POST');
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 追加（语音接线）：合成 / 识别请求函数的 URL / method / body 断言。
+ * 既有用例与断言零修改，本段为纯追加。
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+describe('语音接口：合成与识别请求（voice）', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** stub fetch 返回 2xx JSON，返回 mock 以便断言调用参数 */
+  function stubJson(payload: unknown): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('synthesizeSpeech → POST /api/voice/synthesize，body 携带 text 与可选 voice', async () => {
+    const fetchMock = stubJson({ ok: true, audio_base64: 'UklGRg==', mime: 'audio/wav' });
+    const result = await synthesizeSpeech('你好', 'cx-open');
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(API_ENDPOINTS.voice.synthesize);
+    expect(API_ENDPOINTS.voice.synthesize).toMatch(/\/api\/voice\/synthesize$/);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({ text: '你好', voice: 'cx-open' });
+    expect(result.audio_base64).toBe('UklGRg==');
+
+    // 不传音色时请求体不含 voice 键（由服务端使用默认音色）
+    await synthesizeSpeech('你好');
+    expect(JSON.parse(String((fetchMock.mock.calls[1] as [string, RequestInit])[1].body))).toEqual({
+      text: '你好',
+    });
+  });
+
+  it('transcribeAudio → POST /api/voice/transcribe，body 携带 audio_base64 与 sample_rate', async () => {
+    const fetchMock = stubJson({ ok: true, text: '你好呀' });
+    const result = await transcribeAudio('AAA=', 16000);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(API_ENDPOINTS.voice.transcribe);
+    expect(API_ENDPOINTS.voice.transcribe).toMatch(/\/api\/voice\/transcribe$/);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({ audio_base64: 'AAA=', sample_rate: 16000 });
+    expect(result.text).toBe('你好呀');
   });
 });

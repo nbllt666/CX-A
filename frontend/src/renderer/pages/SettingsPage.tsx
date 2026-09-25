@@ -190,7 +190,7 @@ export default function SettingsPage() {
     } else {
       // 选中后端自定义音色：不支持在线保存，显式提示而非静默跳过（D8）
       setSaveError(null);
-      setCustomHint('当前为后端自定义音色，暂不支持在线修改；如需切换请选择列表中的音色');
+      setCustomHint('当前音色不在列表里，暂不支持在线修改；如需切换请选择列表中的音色');
     }
   };
 
@@ -230,7 +230,7 @@ export default function SettingsPage() {
       {/* 首帧加载失败降级提示条：本次展示的是默认值，可能与后端不一致 */}
       {settingsDegraded && (
         <div className="mb-3 rounded-xl border border-[var(--glass-border)] bg-[rgba(255,183,225,0.10)] px-3 py-2 text-xs text-[var(--text-secondary)]">
-          设置加载失败啦～下面先用默认值顶着，可能与你的后端配置不太一样，连上后会自动同步的
+          设置加载失败啦～下面先用默认值顶着，连上后会自动同步的
         </div>
       )}
 
@@ -275,7 +275,7 @@ export default function SettingsPage() {
           desc={
             computerOnline
               ? '允许它帮你点点鼠标、敲敲键盘、跑跑指令？权限很敏感，谨慎开关'
-              : '后端还没连上，先在本地记一下你的选择（离线记忆）'
+              : '还没连上 TA，先在本地记一下你的选择（稍后自动同步）'
           }
         >
           <Toggle
@@ -345,10 +345,6 @@ export default function SettingsPage() {
             </button>
           </div>
         </GlassCard>
-
-        <p className="text-xs text-[var(--text-tertiary)]">
-          云端 / 本地模式 / 音色已接入后端配置（GET/PUT /api/settings），后端不可用时回退默认值；电脑控制授权已接入真实后端。
-        </p>
       </div>
     </div>
   );

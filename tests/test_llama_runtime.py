@@ -428,3 +428,149 @@ def test_load_passes_gpu_layers_to_constructor(emb_model, llm_model, fake_llama_
     emb_inst, llm_inst = FakeLlama.instances[-2], FakeLlama.instances[-1]
     assert emb_inst.init_kwargs.get("n_gpu_layers") == GPU_LAYERS_ALL
     assert llm_inst.init_kwargs.get("n_gpu_layers") == 8
+
+
+# ------------------------------------------------------------------ #
+# 8. 外部解释器路径（llama.cpp 预编译二进制 + 语音桥，规划 §四-15）     #
+# ------------------------------------------------------------------ #
+
+from lite.runtime.llama_runtime import (  # noqa: E402
+    EXTERNAL_CHAT_TIMEOUT_S,
+    JUDGE_MAX_TOKENS,
+    OFFLINE_CHAT_MAX_TOKENS,
+    OFFLINE_CHAT_TEMPERATURE,
+)
+
+
+class _StubExternalClient:
+    """替身语音桥客户端：记录请求并回预设 text（外部 llama-cli 路径）。"""
+
+    available_value = True
+    reply_text = "我在呢"
+    instances = []
+
+    def __init__(self, root=None, device="cpu", timeout=None):
+        """记录构造参数（root/device/timeout 供断言）。"""
+        self.root = root
+        self.device = device
+        self.timeout = timeout
+        self.calls = []
+        _StubExternalClient.instances.append(self)
+
+    def available(self):
+        """返回类级开关（默认 True）。"""
+        return _StubExternalClient.available_value
+
+    def request(self, payload, timeout=None):
+        """记录请求并返回预设帧（不触真实进程）。"""
+        self.calls.append({"payload": payload, "timeout": timeout})
+        return {"ok": True, "text": _StubExternalClient.reply_text}, b""
+
+
+@pytest.fixture
+def external_env(tmp_path, monkeypatch):
+    """外部路径环境：cli 落位 + 替身桥 + llama_cpp 缺席（确定性）。"""
+    import lite.audio.voice_bridge_client as bridge_client_mod
+    import lite.runtime.llama_runtime as llama_mod
+
+    root = tmp_path / "portable"
+    (root / "runtime" / "llama").mkdir(parents=True)
+    (root / "runtime" / "llama" / "llama-cli.exe").write_bytes(b"stub-exe")
+    monkeypatch.setattr(bridge_client_mod, "VoiceBridgeClient", _StubExternalClient)
+
+    def _missing_llama():
+        raise RuntimeError("llama-cpp-python 未安装：请先执行 pip install llama-cpp-python")
+
+    monkeypatch.setattr(llama_mod, "_import_llama", _missing_llama)
+    _StubExternalClient.available_value = True
+    _StubExternalClient.reply_text = "我在呢"
+    _StubExternalClient.instances = []
+    return root
+
+
+def test_external_path_load_and_offline_chat(external_env, llm_model):
+    """llama_cpp 缺席时选出外部路径：加载就绪（_external_client 非空、_llm 为 None），
+    offline_chat 经桥 chat 请求拿到真文本，且请求参数按配置透传。"""
+    rt = LlamaRuntime(config={"local_llm": {"device": "gpu", "n_ctx": 512}}, root=str(external_env))
+    assert rt.load_local_llm(llm_model) is True
+    assert rt._llm_ready is True
+    assert rt._external_client is not None and rt._llm is None
+
+    out = rt.offline_chat([{"role": "user", "content": "你好"}])
+    assert out == "我在呢"
+
+    payload = rt._external_client.calls[-1]["payload"]
+    assert payload["op"] == "chat"
+    assert payload["model"] == llm_model
+    assert "你好" in payload["prompt"]
+    assert payload["max_tokens"] == OFFLINE_CHAT_MAX_TOKENS
+    assert payload["n_ctx"] == 512
+    assert payload["n_gpu_layers"] == GPU_LAYERS_ALL  # device=gpu 推导 -1
+    assert payload["temperature"] == OFFLINE_CHAT_TEMPERATURE
+    assert rt._external_client.calls[-1]["timeout"] == EXTERNAL_CHAT_TIMEOUT_S
+
+
+def test_external_path_judge_uses_bridge(external_env, llm_model):
+    """外部路径下的判定：同一桥 chat 通道（temperature=0.0），解析口径复用。"""
+    rt = LlamaRuntime(config=None, root=str(external_env))
+    assert rt.load_local_llm(llm_model) is True
+    _StubExternalClient.reply_text = "是"
+    assert rt.judge_should_reply("在吗") is True
+    payload = rt._external_client.calls[-1]["payload"]
+    assert payload["max_tokens"] == JUDGE_MAX_TOKENS
+    assert payload["temperature"] == 0.0
+    assert "在吗" in payload["prompt"]
+
+
+def test_external_not_ready_raises_llama_not_ready(external_env, llm_model):
+    """外部路径就绪前（未 load）调用仍抛 LlamaNotReady（双路径统一门禁）。"""
+    rt = LlamaRuntime(config=None, root=str(external_env))
+    with pytest.raises(LlamaNotReady):
+        rt.offline_chat([{"role": "user", "content": "你好"}])
+    with pytest.raises(LlamaNotReady):
+        rt.judge_should_reply("在吗")
+
+
+def test_external_missing_binary_raises_runtime_error(tmp_path, monkeypatch, llm_model):
+    """llama_cpp 缺席且 cli 不在位：维持 RuntimeError（并提示外部路径条件）。"""
+    import lite.runtime.llama_runtime as llama_mod
+
+    def _missing_llama():
+        raise RuntimeError("llama-cpp-python 未安装")
+
+    monkeypatch.setattr(llama_mod, "_import_llama", _missing_llama)
+    rt = LlamaRuntime(config=None, root=str(tmp_path))  # 无 runtime/llama
+    with pytest.raises(RuntimeError) as ei:
+        rt.load_local_llm(llm_model)
+    assert "外部 llama-cli 路径亦不可用" in str(ei.value)
+    assert rt._llm_ready is False
+
+
+def test_external_missing_sidecar_raises_runtime_error(external_env, llm_model, monkeypatch):
+    """cli 在位但桥不可用（available=False）：同样维持 RuntimeError 且不误置就绪。"""
+    import lite.runtime.llama_runtime as llama_mod
+
+    def _missing_llama():
+        raise RuntimeError("llama-cpp-python 未安装")
+
+    monkeypatch.setattr(llama_mod, "_import_llama", _missing_llama)
+    _StubExternalClient.available_value = False
+    rt = LlamaRuntime(config=None, root=str(external_env))
+    with pytest.raises(RuntimeError) as ei:
+        rt.load_local_llm(llm_model)
+    assert "外部 llama-cli 路径亦不可用" in str(ei.value)
+    assert rt._external_client is None and rt._llm_ready is False
+
+
+def test_external_priority_only_when_llama_cpp_missing(tmp_path, monkeypatch, llm_model, fake_llama_cpp):
+    """llama_cpp 可用时优先 in-process（外部路径不抢占）：既有行为不受宿主二进制影响。"""
+    import lite.audio.voice_bridge_client as bridge_client_mod
+
+    root = tmp_path / "portable"
+    (root / "runtime" / "llama").mkdir(parents=True)
+    (root / "runtime" / "llama" / "llama-cli.exe").write_bytes(b"stub-exe")
+    monkeypatch.setattr(bridge_client_mod, "VoiceBridgeClient", _StubExternalClient)
+
+    rt = LlamaRuntime(config=None, root=str(root))
+    assert rt.load_local_llm(llm_model) is True
+    assert rt._llm is not None and rt._external_client is None

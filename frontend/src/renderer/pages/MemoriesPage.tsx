@@ -163,7 +163,7 @@ export default function MemoriesPage() {
 
       {mode === 'offline' && (
         <div className="mb-3 rounded-xl border border-[var(--glass-border)] bg-[rgba(124,216,255,0.08)] px-3 py-2 text-xs text-[var(--text-secondary)]">
-          后端暂不可用，当前展示离线示例数据
+          还没连上 TA，先给你看些示例回忆
         </div>
       )}
 

@@ -1,4 +1,5 @@
 import React from 'react';
+import { Brain, Cat, MessageSquareText, Settings, type LucideIcon } from 'lucide-react';
 import { useRouter } from '../App';
 import type { View } from '../App';
 
@@ -7,15 +8,19 @@ import type { View } from '../App';
  *
  * 管理面已收敛为纯后端 API（/api/agents、/api/remote/*、/api/status），
  * 不再进入前端导航，由另一 Agent / 管理工具调用。
+ *
+ * 图标统一走 lucide-react（与设计参考项目同一套图标语言），**不使用 emoji 当图标**：
+ * emoji 的字形由系统字体决定（跨机器观感不一致、基线不齐），且高饱和色与
+ * 玻璃拟态/扁平设计冲突。详见 .trae/documents/20260925_模块0_清理不合设计风格元素.md。
  */
 export default function Sidebar() {
   const { view, navigate } = useRouter();
 
-  const companionItems: { view: View; label: string; icon: string }[] = [
-    { view: 'chat', label: '聊天', icon: '💬' },
-    { view: 'pet', label: '桌宠', icon: '🐾' },
-    { view: 'memories', label: '记忆', icon: '💫' },
-    { view: 'settings', label: '设置', icon: '⚙️' },
+  const companionItems: { view: View; label: string; icon: LucideIcon }[] = [
+    { view: 'chat', label: '聊天', icon: MessageSquareText },
+    { view: 'pet', label: '桌宠', icon: Cat },
+    { view: 'memories', label: '记忆', icon: Brain },
+    { view: 'settings', label: '设置', icon: Settings },
   ];
 
   return (
@@ -40,12 +45,12 @@ export default function Sidebar() {
 
 function NavItem({
   label,
-  icon,
+  icon: Icon,
   active,
   onClick,
 }: {
   label: string;
-  icon: string;
+  icon: LucideIcon;
   active: boolean;
   onClick: () => void;
 }) {
@@ -60,7 +65,7 @@ function NavItem({
           : 'text-[var(--text-secondary)] hover:bg-[rgba(255,255,255,0.1)] hover:text-[var(--text-primary)]',
       ].join(' ')}
     >
-      <span className="text-base leading-none">{icon}</span>
+      <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
       <span className="flex-1 text-left">{label}</span>
     </button>
   );

@@ -724,3 +724,31 @@ def test_download_modelscope_url_unaffected_by_endpoint_removal(tmp_path):
     dl = make_loader(tmp_path, data=data)
     dl.download(MODELSCOPE_REPO, MODELSCOPE_FILE, source="modelscope")
     assert dl._requests.calls[0].startswith("https://modelscope.cn/api/v1/models/")
+
+
+def test_default_download_dir_frozen_follows_portable_root(tmp_path, monkeypatch):
+    """M-14 回归：冻结态默认下载目录必须落在便携根 ``data/local_llm``。
+
+    修复前本模块用 ``__file__`` 上溯两层推导工程根：PyInstaller onedir 冻结态下
+    ``__file__`` 位于 ``<便携根>/runtime/backend/_internal/lite/runtime/``，上溯得
+    ``_internal`` → 首启向导里下载的模型被写进 ``runtime/backend/_internal/data/local_llm/``，
+    用户数据目录里看不到、重装即丢。本用例把 ``sys.frozen``/``sys.executable``
+    指向伪便携根，断言推导改为跟随 ``app_root()``（与 test_installer 的 app_root 冻结用例同手法）。
+    """
+    import sys
+
+    from lite.runtime import model_downloader as md
+
+    portable = tmp_path / "CX-A-portable"
+    backend = portable / "runtime" / "backend"
+    backend.mkdir(parents=True)
+    exe = backend / "backend.exe"
+    exe.write_bytes(b"")
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe))
+
+    expected = os.path.normpath(os.path.join(str(portable), "data", "local_llm"))
+    assert md.default_download_dir() == expected
+    # 构造器缺省也走同一解析——防止有人把结果再固化成导入期常量
+    assert LlmDownloader().dest_dir == expected

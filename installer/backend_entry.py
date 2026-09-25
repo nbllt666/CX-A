@@ -13,6 +13,10 @@ PyInstaller 打包本文件为 ``backend.exe``，落位于便携根 ``runtime/ba
     --host 127.0.0.1 --port 8600 --data-dir <root>/data
 （host/port 与 frontend/src/renderer/api.ts 的 API_PORT 约定一致。）
 
+另提供**安装期装配子命令**（由独立安装程序调用，与启动路径互斥）：
+    backend.exe --provision-runtime [--root <安装根>]
+    见 :func:`provision_main`（内置 conda + 语音 sidecar 环境一次性装完）。
+
 路径规范：一律基于 ``sys.executable`` / ``os.path.abspath(__file__)`` 推导，
 禁止相对路径与字符串斜杠拼接。
 """
@@ -100,6 +104,36 @@ def _extract_host_port(args):
     return host, port
 
 
+def provision_main(argv=None):
+    """安装期运行时装配入口（``backend.exe --provision-runtime``）。
+
+    由**独立安装程序**在展开载荷后调用：内置 conda + 语音 sidecar 环境 +
+    语音依赖（GPU 自动探测分叉）+ nltk 数据，一次性装完（人类裁决③）。
+    任何一步失败不阻断安装——本函数恒返回 0，结果如实落
+    ``<root>/runtime/provision.log`` 与 ``<root>/data/install_report.json``。
+
+    :param argv: 命令行参数列表（缺省 ``sys.argv[1:]``）；支持
+        ``--root <安装根>`` 覆盖推导结果（安装器可显式传入 {app}）。
+    :return: int 退出码（恒 0）。
+    """
+    raw = list(sys.argv[1:] if argv is None else argv)
+    root = None
+    for index, token in enumerate(raw):
+        if token == "--root" and index + 1 < len(raw):
+            root = raw[index + 1]
+    root = os.path.abspath(root) if root else resolve_root()
+
+    # 延迟导入：装配依赖（conda_runtime → bootstrap → lite.*）不应影响普通启动路径
+    try:
+        from installer import conda_runtime
+    except ImportError:  # pragma: no cover - CLI 直跑 / 冻结态包上下文差异兜底
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from installer import conda_runtime  # type: ignore[no-redef]
+
+    conda_runtime.provision_runtime(root)
+    return 0
+
+
 def main(argv=None):
     """可执行入口：数据目录自愈 + 端口预检后进入 API 服务主循环。"""
     root = resolve_root()
@@ -125,4 +159,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":  # pragma: no cover - PyInstaller 冻结入口
+    # 安装期装配子命令（独立安装程序调用）：与常规启动路径互斥
+    if "--provision-runtime" in sys.argv[1:]:
+        sys.exit(provision_main())
     main()

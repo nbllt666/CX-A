@@ -31,6 +31,20 @@ from lite.audio import (
     build_default_pipeline,
 )
 
+
+@pytest.fixture(autouse=True)
+def _isolate_voice_bridge(monkeypatch):
+    """隔离内置语音 sidecar 探测：工厂类测试稳定落到 Mock / 进程内后端。
+
+    宿主开发机可能已安装运行时（``runtime/voice`` + ``runtime/voice_bridge``，
+    如本轮联测环境），统一屏蔽以保证测试确定性（不真启动桥进程、不依赖宿主）；
+    sidecar 接线本身由 ``tests/test_voice_bridge.py`` 专项覆盖。
+    """
+    import lite.audio as lite_audio
+
+    monkeypatch.setattr(lite_audio, "_try_voice_bridge", lambda *args, **kwargs: None)
+
+
 SR = 16000
 SW = 2
 

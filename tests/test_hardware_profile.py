@@ -292,3 +292,35 @@ def test_recommend_no_raise_when_probe_notes_missing():
 
     assert result["use_local"] is True
     assert isinstance(result["probe_notes"], list)
+
+
+def test_detect_profile_default_root_follows_portable_root_when_frozen(tmp_path, monkeypatch):
+    """M-14 回归：冻结态未显式传 ``root`` 时，磁盘余量必须按便携根估算。
+
+    修复前 ``root`` 缺省用 ``__file__`` 上溯两层，冻结态得 ``runtime/backend/_internal``，
+    磁盘预检会指向运行时目录（与安装根不同盘时判断直接失真）。
+    """
+    import os
+    import sys
+
+    portable = tmp_path / "CX-A-portable"
+    backend = portable / "runtime" / "backend"
+    backend.mkdir(parents=True)
+    (backend / "backend.exe").write_bytes(b"")
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(backend / "backend.exe"))
+
+    seen = {}
+
+    def fake_disk_free(path):
+        seen["path"] = path
+        return 100.0
+
+    monkeypatch.setattr(hp, "probe_disk_free_gb", fake_disk_free)
+    # runner 全失败 → 走 cpu 降级分支，不触碰真实硬件（runner 契约为 (returncode, stdout)）
+    profile = hp.detect_profile(runner=lambda cmd: (1, ""))
+
+    assert "path" in seen, "detect_profile 必须调用磁盘探测"
+    assert os.path.normpath(seen["path"]) == os.path.normpath(str(portable))
+    assert profile["disk_free_gb"] == 100.0

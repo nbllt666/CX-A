@@ -3,7 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:8600 http://localhost:8600" />
+    <!-- CSP：connect-src 追加 blob: —— VRM/GLTFLoader 对 GLB 内嵌贴图走 fetch(blob:) 加载（three 的 ImageBitmapLoader），
+         不放行会导致模型贴图加载失败；img-src 同步放行 blob:。 -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' blob: http://127.0.0.1:8600 http://localhost:8600" />
     <!-- 透明悬浮窗：html/body 必须无背景色，透明由 Electron BrowserWindow backgroundColor '#00000000' 提供 -->
     <style>html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }</style>
     <title>CX-A 桌宠</title>

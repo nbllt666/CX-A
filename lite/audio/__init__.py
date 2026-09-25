@@ -20,12 +20,14 @@ from lite.audio.vad import LiteVAD
 from lite.audio.asr import (
     ASRBackend,
     SenseVoiceBackend,
+    BridgeASRBackend,
     MockASRBackend,
     LiteASR,
 )
 from lite.audio.tts import (
     TTSBackend,
     MeloTTSBackend,
+    BridgeTTSBackend,
     MockTTSBackend,
     LiteTTS,
 )
@@ -42,10 +44,12 @@ __all__ = [
     "LiteVAD",
     "ASRBackend",
     "SenseVoiceBackend",
+    "BridgeASRBackend",
     "MockASRBackend",
     "LiteASR",
     "TTSBackend",
     "MeloTTSBackend",
+    "BridgeTTSBackend",
     "MockTTSBackend",
     "LiteTTS",
     "VoiceManager",
@@ -94,6 +98,43 @@ def _try_melotts(tts_cfg):
     return MeloTTSBackend(
         default_voice=tts_cfg.get("voice", "cx-open"),
         device=tts_cfg.get("device", "cpu"),
+    )
+
+
+def _try_voice_bridge(asr_cfg, tts_cfg, root=None):
+    """探测内置语音 sidecar：就绪返回 ``(asr_backend, tts_backend)``，否则 None。
+
+    判定条件（不做任何真实推理，零成本）：``<便携根>/runtime/voice/python.exe``
+    与 bridge 脚本同时存在。命中即返回共享同一 ``VoiceBridgeClient``（单常驻
+    进程）的 :class:`BridgeASRBackend` / :class:`BridgeTTSBackend`。
+
+    设备口径：bridge 为单进程单设备参数，取 ``tts.device`` 优先、``asr.device``
+    次之、缺省 ``cpu``（"gpu" 由客户端归一为 auto，交由 sidecar 的 torch 判定）。
+
+    :param asr_cfg: 配置的 asr 段 dict。
+    :param tts_cfg: 配置的 tts 段 dict。
+    :param root: 便携根显式覆盖（测试注入）；None 表示由客户端经 ``app_root()`` 推导。
+    :return: ``(BridgeASRBackend, BridgeTTSBackend)`` 或 None。
+    """
+    try:
+        from lite.audio.tts import BridgeTTSBackend
+        from lite.audio.asr import BridgeASRBackend
+        from lite.audio.voice_bridge_client import VoiceBridgeClient
+    except ImportError as exc:  # 理论不可达（同包内模块）；保守降级回既有路径
+        print(f"[LiteAudio][WARN] sidecar 桥模块导入失败，回退进程内后端：{exc}")
+        return None
+
+    device = tts_cfg.get("device") or asr_cfg.get("device") or "cpu"
+    client = VoiceBridgeClient(root=root, device=device)
+    if not client.available():
+        return None
+    return (
+        BridgeASRBackend(client=client, device=device),
+        BridgeTTSBackend(
+            client=client,
+            default_voice=tts_cfg.get("voice", "cx-open"),
+            device=device,
+        ),
     )
 
 
@@ -211,15 +252,21 @@ def build_default_pipeline(config=None):
         silence_ms=vad_cfg.get("silence_ms", 600),
     )
 
-    asr_backend = _try_sensevoice(asr_cfg)
-    if asr_backend is None:
-        asr_backend = MockASRBackend()
-        print("[LiteAudio][WARN] funasr 未安装，LiteASR 回退 MockASRBackend")
+    # 装配优先级：内置 sidecar 桥（真引擎，本仓裁决路线）→ 主环境进程内三方库 → Mock
+    bridge_backends = _try_voice_bridge(asr_cfg, tts_cfg)
+    if bridge_backends is not None:
+        asr_backend, tts_backend = bridge_backends
+        print("[LiteAudio][INFO] 已接入内置语音 sidecar（常驻桥进程）")
+    else:
+        asr_backend = _try_sensevoice(asr_cfg)
+        if asr_backend is None:
+            asr_backend = MockASRBackend()
+            print("[LiteAudio][WARN] funasr 未安装，LiteASR 回退 MockASRBackend")
 
-    tts_backend = _try_melotts(tts_cfg)
-    if tts_backend is None:
-        tts_backend = MockTTSBackend()
-        print("[LiteAudio][WARN] melotts 未安装，LiteTTS 回退 MockTTSBackend")
+        tts_backend = _try_melotts(tts_cfg)
+        if tts_backend is None:
+            tts_backend = MockTTSBackend()
+            print("[LiteAudio][WARN] melotts 未安装，LiteTTS 回退 MockTTSBackend")
 
     return {
         "vad": vad,

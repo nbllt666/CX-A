@@ -319,6 +319,9 @@ def build_gpu_dependency_commands(recommend, cuda_version=None, channel=None):
             # cuda_version 写入注释而非硬编码进命令，保持命令可直接执行。
             f"# 检测到驱动 CUDA 版本：{cuda_version or '未知'}；下列 cu128 轮子面向 CUDA 12.8+ 运行时",
             "pip install torch --index-url https://download.pytorch.org/whl/cu128",
+            # torchaudio 与 torch 同版本族、同源（MeloTTS / funasr 的硬依赖；
+            # 2026-09-25 实装发现：缺它则 sidecar 内 melo.api 导入即失败）
+            "pip install torchaudio --index-url https://download.pytorch.org/whl/cu128",
             "pip install onnxruntime-gpu",
             "pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu128 --force-reinstall --no-cache-dir",
         ]
@@ -326,6 +329,7 @@ def build_gpu_dependency_commands(recommend, cuda_version=None, channel=None):
         commands = [
             "# PyTorch ROCm 官方轮子（Linux）；Windows 平台 AMD 建议改用 DirectML 后端",
             "pip install torch --index-url https://download.pytorch.org/whl/rocm6.0",
+            "pip install torchaudio --index-url https://download.pytorch.org/whl/rocm6.0",
             "# Windows + AMD：onnxruntime 采用 DirectML 版本（替代 onnxruntime-gpu）",
             "pip install onnxruntime-directml",
             "# llama.cpp 建议使用 Vulkan 预编译构建（llama-*-bin-win-vulkan-x64.zip），解压至 data/local_llm/ 供本地推理调用",
@@ -333,6 +337,7 @@ def build_gpu_dependency_commands(recommend, cuda_version=None, channel=None):
     else:
         commands = [
             "pip install torch --index-url https://download.pytorch.org/whl/cpu",
+            "pip install torchaudio --index-url https://download.pytorch.org/whl/cpu",
             "pip install onnxruntime",
         ]
     # channel 未指定（None）时不做任何改写；official 经 pip_index_url 派生为 None，

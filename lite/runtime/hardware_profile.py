@@ -11,7 +11,8 @@
   探测失败一律降级并记入 ``probe_notes``，绝不抛错（接口永不返回 5xx）。
 
 设计要点（对齐 lite/runtime/model_downloader.py）：
-- 全部路径基于 ``os.path.abspath(__file__)`` 推导，禁止相对路径与 ``../../``；
+- 路径解析统一收敛到 ``lite.config.paths.app_root()``（frozen-aware），
+  禁止用 ``__file__`` 上溯推导安装根（冻结态会指到 ``runtime/backend/_internal``）；
 - 可选依赖（psutil / requests 等）统一 try/except ImportError 降级；
 - 探测类函数不打印噪声，失败信息进 ``probe_notes``；
 - 依赖外部命令一律经 ``runner`` 注入点，测试可完全 mock，不触碰真实硬件。
@@ -23,8 +24,7 @@ import shutil
 import subprocess
 import sys
 
-#: 运行时目录（lite/runtime/），基于文件绝对位置推导，禁止相对路径。
-_RUNTIME_DIR = os.path.dirname(os.path.abspath(__file__))
+from lite.config.paths import app_root
 
 # ------------------------------------------------------------------ #
 # GPU 探测核心（自 installer/gpu_detect.py 原样下沉，逻辑与正则一字不改）#
@@ -278,9 +278,11 @@ def detect_profile(root=None, runner=None) -> dict:
     exe = runner if runner is not None else default_runner
     notes: list[str] = []
 
-    #: 安装根：优先入参，其次基于本文件上溯（lite/runtime → lite → 项目根）。
+    #: 安装根：优先入参，其次走 frozen-aware 的 app_root()（开发态＝项目根，
+    #: 冻结态＝便携根）。修复前此处用 __file__ 上溯两层，冻结态会指到
+    #: runtime/backend/_internal，导致磁盘余量按错误的盘/目录估算。
     if root is None:
-        root = os.path.dirname(os.path.dirname(_RUNTIME_DIR))
+        root = app_root()
 
     cpu_cores = probe_cpu_cores()
     if cpu_cores is None:

@@ -42,6 +42,13 @@ CXFC relay 前端转接（Task H1，对齐 C:\\CX-O\\docs\\CXFC开发文档.md �
                                     作为 system 人设。既有 /api/chat/messages（复数，
                                     未启用守卫）保持不变。
 
+悬浮桌宠模型分发（20260924_模块0_接入VRM悬浮桌宠）：
+    GET    /api/pet/model           分发悬浮桌宠默认 VRM 模型原始字节（200，
+                                    Content-Type: model/gltf-binary；文件缺失
+                                    404 pet_model_missing）。路径经 app_root()
+                                    （frozen-aware）解析为 <app_root>/data/pet/cx-open.vrm。
+                                    过既有 Host / 令牌闸（不新增豁免端点），仅 GET。
+
 首启向导接口族（Task 6 / Task 7，对齐 spec「首启向导后端接口」「向导内下载」）：
     GET    /api/setup/status            向导门控（completed / wizard_required / 当前通道与模型仓库；不含 api_key）
     GET    /api/setup/recommend         硬件画像 + 推荐配置补丁 + 候选档位 + 建议仓库（探测异常不 5xx）
@@ -93,6 +100,57 @@ _CHAT_DEFAULT_SYSTEM = (
     "你是用户的虚拟伴侣，回复请自然、温暖；可在句中插入情绪标签表达当下心情，"
     "格式为 [emotion:情绪]，支持：happy/calm/sad/surprised/angry/sleepy/shy。"
 )
+
+
+def build_local_chat_runtime(config):
+    """按 local_llm 配置段组装本地小 LLM 运行时（供离线聊天兜底）。
+
+    - 未启用 / 未配置 model_path → None（不接兜底，行为同旧版）
+    - 延迟导入 llama_runtime（llama-cpp-python 缺席不污染顶层导入路径）
+    - 文件缺失 / 加载失败 / 依赖缺席 → None 并 LOGGER.warning（聊天端点必须可用，绝不抛错）
+    """
+    local_llm_cfg = {}
+    if isinstance(config, dict):
+        sec = config.get("local_llm")
+        if isinstance(sec, dict):
+            local_llm_cfg = sec
+    elif config is not None:
+        inner = getattr(config, "config", None)
+        if isinstance(inner, dict) and isinstance(inner.get("local_llm"), dict):
+            local_llm_cfg = inner["local_llm"]
+    if not bool(local_llm_cfg.get("enabled", False)):
+        return None
+    model_path = str(local_llm_cfg.get("model_path", "") or "").strip()
+    if not model_path:
+        return None
+    try:
+        # 函数内延迟导入：llama_runtime 依赖链不进入本模块顶层导入路径
+        from lite.runtime.llama_runtime import LlamaRuntime
+
+        runtime = LlamaRuntime(
+            config={
+                "local_llm": {
+                    "enabled": True,
+                    "model_path": model_path,
+                    "n_ctx": local_llm_cfg.get("n_ctx"),
+                    "device": local_llm_cfg.get("device"),
+                    "n_gpu_layers": local_llm_cfg.get("n_gpu_layers"),
+                }
+            }
+        )
+        if not runtime.load_local_llm(model_path):
+            LOGGER.warning(
+                "本地小 LLM 加载失败，离线兜底降级为提示：%s",
+                "; ".join(runtime.warnings) or "未知原因",
+            )
+            return None
+        return runtime
+    except Exception as exc:  # noqa: BLE001 - 依赖缺席 / 加载异常：聊天端点必须可用
+        LOGGER.warning(
+            "本地小 LLM 运行时装配失败（%s）：%s", exc.__class__.__name__, exc
+        )
+        return None
+
 
 # ------------------------------------------------------------------ 启动令牌鉴权（N1）
 # 环境变量 CXA_API_TOKEN 非空时，除 OPTIONS 预检与 GET /api/health 外的所有请求
@@ -188,8 +246,12 @@ _TOOLS_USAGE = {
         "result": "200 {ok:true, audio_base64, mime:'audio/wav'}；后端异常 503 voice_backend_unavailable",
     },
     "POST /api/voice/transcribe": {
-        "body": {"audio_base64": "PCM 音频的 base64 编码", "sample_rate": "可选采样率（默认 16000，当前透传忽略）"},
+        "body": {"audio_base64": "PCM 音频的 base64 编码", "sample_rate": "可选采样率（默认 16000；非 16k 时由语音桥重采样，避免慢放误识别）"},
         "result": "200 {ok:true, text}；解码失败 400；后端异常 503 voice_backend_unavailable",
+    },
+    "GET /api/pet/model": {
+        "args": "无",
+        "result": "200 原始 VRM 字节（Content-Type: model/gltf-binary）；文件缺失 404 pet_model_missing",
     },
 }
 
@@ -231,6 +293,7 @@ from lite.config.download_sources import (  # noqa: E402
     model_repo_for_channel,
     normalize_channel,
 )
+from lite.config.paths import app_root  # noqa: E402
 from lite.cloud.adapter import PROVIDER_BASE_URLS  # noqa: E402
 from lite.cloud.adapter import CloudAdapter, CloudConfigError, CloudUnavailableError  # noqa: E402
 from lite.avatar import EmotionTagParser  # noqa: E402
@@ -251,6 +314,23 @@ DEFAULT_DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
 # 默认监听端口（与前端 API_PORT 一致）
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8600
+
+# 悬浮桌宠默认 VRM 模型相对应用根的路径（模块级单一真相源，供测试 monkeypatch app_root 复用）。
+# 与 installer/manifest.json 中 pet_model 组件的 install_target 保持同一口径。
+PET_MODEL_REL_PATH = os.path.join("data", "pet", "cx-open.vrm")
+
+
+def pet_model_path() -> str:
+    """推导悬浮桌宠默认 VRM 模型的绝对路径：``<app_root>/data/pet/cx-open.vrm``。
+
+    根目录经 :func:`lite.config.paths.app_root`（frozen-aware）解析——开发态＝项目根，
+    打包态＝便携根；**禁止**用 ``__file__`` 逐级上溯（PyInstaller onedir 冻结态下
+    ``__file__`` 落在 ``runtime/backend/_internal/lite/...``，推导会指向
+    ``_internal/data`` 而非便携根 ``data/``，真实模型装载必然失败）。
+
+    :return: str 模型文件绝对路径（不保证存在，调用方需处理缺失）。
+    """
+    return os.path.join(app_root(), PET_MODEL_REL_PATH)
 
 
 def _resolve_data_dir(data_dir=None) -> str:
@@ -403,7 +483,7 @@ def make_handler(
     store, pipeline, manager=None, remote=None,
     computer=None, authorizer=None, bridge=None, config=None,
     registry=None, distiller=None, voice=None, cxfc=None, chat_cloud=None,
-    download_manager=None,
+    chat_fallback=None, download_manager=None,
 ):
     """基于指定依赖构建处理器类（闭包绑定 store / pipeline / manager / remote / computer，便于测试隔离）。
 
@@ -424,6 +504,10 @@ def make_handler(
             端点使用）。缺省按 config 构建默认 CloudAdapter（构造期零失败，
             CloudConfigError / CloudUnavailableError 延迟到 chat 调用时抛出，
             由端点兜底为离线文案）；测试注入内存 mock 以避免真实网络。
+        chat_fallback: 可选离线兜底管理器（Task C3 接线；供 /api/chat/message
+            统一在线/离线通道切换）。缺省按 `_chat_cloud` + `build_local_chat_runtime(config)`
+            构建默认 `OfflineFallbackManager`（依赖缺席/装配失败仅告警并置 None，
+            端点退化为旧的直连云端 + 固定离线文案路径）。测试可注入替身。
         download_manager: 可选本地模型后台下载管理器（Task 6；供
             /api/setup/model/* 三端点使用）。缺省按 config 构建
             ``ModelDownloadManager``，并注入**本模块的模块级写锁**
@@ -492,6 +576,25 @@ def make_handler(
     # 无 api_key 的默认配置下端点自然兜底为离线文案。
     if chat_cloud is None:
         chat_cloud = CloudAdapter(config)
+    # Task C3 接线（N8 语义延续）：仅对显式为 None 的离线兜底管理器回落默认装配。
+    # 默认管理器把「云端 ↔ 本地小 LLM」切换收敛为单一入口；本地运行时按 local_llm
+    # 段组装（未启用/依赖缺席/加载失败由 build_local_chat_runtime 静默降级为 None），
+    # 装配异常仅告警并置 None——端点退化为旧的直连云端 + 固定离线文案路径，绝不崩。
+    _resolved_chat_fallback = chat_fallback
+    if _resolved_chat_fallback is None:
+        try:
+            from lite.cloud.fallback import OfflineFallbackManager
+
+            _resolved_chat_fallback = OfflineFallbackManager(
+                cloud=chat_cloud,
+                local_llm=build_local_chat_runtime(config),
+                config=config,
+            )
+        except Exception as exc:  # noqa: BLE001 - 兜底装配失败不得拖垮聊天端点
+            LOGGER.warning(
+                "离线兜底管理器装配失败（%s）：%s", exc.__class__.__name__, exc
+            )
+            _resolved_chat_fallback = None
     # Task 6（N8 语义延续）：仅对显式为 None 的下载管理器回落默认构建。写锁显式传入
     # 本模块的 _CONFIG_WRITE_LOCK——请求线程与下载线程共用同一把，串行化 config.save()。
     if download_manager is None:
@@ -522,6 +625,7 @@ def make_handler(
         _voice = voice
         _cxfc = cxfc
         _chat_cloud = chat_cloud
+        _chat_fallback = _resolved_chat_fallback
         _download_manager = download_manager
 
         # ------------------------------------------------------------ 底层工具
@@ -1134,14 +1238,15 @@ def make_handler(
 
             body {message, agent_id?}：
             - message 必填非空，否则 400；
-            - 走 CloudAdapter 流式调用拼接完整回复，经 EmotionTagParser 解析
-              [emotion:x] 标签后返回 {ok:true, clean_text, mood, raw}
-              （clean_text 已剥离已识别标签、未知标签原文保留；mood 为首个
-              已识别情绪，默认 calm；raw 为云端原始带标签文本）；
-            - 无 api_key（CloudConfigError）/ 云端不可达（CloudUnavailableError，
-              含流式中断）→ 返回 200 {ok:true, clean_text: 固定友好文案,
-              mood:'calm', offline:true}，不抛 5xx——前端把提示文案作为伴侣
-              气泡真实展示（后端真实回传，非前端伪造）。
+            - 走离线兜底管理器（Task C3）：在线透传 CloudAdapter 流式拼接、离线按
+              本地小 LLM 兜底/提示；无兜底管理器时退回直连 CloudAdapter 旧路径。
+              回复经 EmotionTagParser 解析 [emotion:x] 标签后返回
+              {ok:true, clean_text, mood, raw}（clean_text 已剥离已识别标签、未知
+              标签原文保留；mood 为首个已识别情绪，默认 calm；raw 为原始带标签全文）；
+            - 兜底管理器 status != "cloud"（离线提示/本地承接）→ 附带 offline:true；
+              兜底管理器自身抛 CloudConfigError / CloudUnavailableError（保底）→
+              返回 200 固定友好文案 + offline:true，不抛 5xx——前端把提示文案作为
+              伴侣气泡真实展示（后端真实回传，非前端伪造）。
             """
             body = self._read_body_json()
             if body is None:
@@ -1156,9 +1261,15 @@ def make_handler(
                 return
             agent_id = self._sanitize_agent_id(body.get("agent_id"))
             messages = self._build_chat_messages(message, agent_id)
+            # 离线标记：仅当兜底管理器确认非云端承接（离线提示/本地兜底）时为真
+            offline = False
             try:
                 # 流式拼接完整回复（H3 务实落地：后端非流式下发，前端整段渲染）
-                full_text = "".join(self._chat_cloud.chat(messages))
+                if self._chat_fallback is not None:
+                    full_text = "".join(self._chat_fallback.chat(messages))
+                    offline = getattr(self._chat_fallback, "status", "cloud") != "cloud"
+                else:
+                    full_text = "".join(self._chat_cloud.chat(messages))
             except (CloudConfigError, CloudUnavailableError) as exc:
                 LOGGER.warning(
                     "表情聊天云端不可用（%s）：%s", exc.__class__.__name__, exc
@@ -1174,20 +1285,68 @@ def make_handler(
                 )
                 return
             parsed = EmotionTagParser().parse(full_text)
-            self._send_json(
-                {
-                    "ok": True,
-                    "clean_text": parsed["clean_text"],
-                    "mood": parsed["mood"],
-                    "raw": full_text,
-                }
-            )
+            payload = {
+                "ok": True,
+                "clean_text": parsed["clean_text"],
+                "mood": parsed["mood"],
+                "raw": full_text,
+            }
+            # 保持既有成功响应形状：offline 仅在为真时附带，不新增噪声字段
+            if offline:
+                payload["offline"] = True
+            self._send_json(payload)
+
+        # ------------------------------------------------------------ 悬浮桌宠模型分发（20260924_模块0_接入VRM悬浮桌宠）
+        def _handle_pet_model(self):
+            """GET /api/pet/model：分发悬浮桌宠默认 VRM 模型的原始字节。
+
+            为何走 HTTP 而非前端 ``file://`` 直读：Chromium 对 ``file://`` 页面
+            的 ``fetch``/``XHR`` 取本地文件默认拦截（``webSecurity`` 默认开启），
+            打包态（Electron 加载本地页面）会「开发态能跑、装包后白屏」；改由既有
+            回环 HTTP 通道分发，则**开发态与打包态完全同一条加载路径**，也与项目
+            「资产归 ``data/``、由后端服务」的约定一致。
+
+            实现要点：
+            - 路径经 :func:`pet_model_path`（``app_root()`` / frozen-aware）解析
+              为 ``<app_root>/data/pet/cx-open.vrm`` 绝对路径，禁止相对路径；
+            - 一次性读全后单次 ``write``（VRM 约 15MB 量级，回环传输即可）；
+            - 响应头 ``Content-Type: model/gltf-binary`` + 正确 ``Content-Length``，
+              沿用既有 :meth:`_cors_headers`；附 ``Cache-Control: no-store``——
+              用户可把同路径文件替换为自己的 VRM，no-store 避免浏览器/Electron
+              缓存住旧模型导致「换了模型界面不变」；
+            - 文件缺失 → 404 ``pet_model_missing`` + 中文 ``message``（说明期望路径）；
+            - 沿用既有 Host / 令牌闸（不新增豁免端点，本方法在 do_GET 令牌放行后调用）。
+            """
+            path = pet_model_path()
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            except (OSError, ValueError):
+                # 文件缺失 / 不可读：结构化 404，绝不裸抛到连接中断
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "pet_model_missing",
+                        "message": f"未找到桌宠模型文件，期望路径：{path}（可将同名 VRM 放到该路径替换）",
+                    },
+                    404,
+                )
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "model/gltf-binary")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            for key, value in self._cors_headers().items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(data)
 
         # ------------------------------------------------------------ 路由
         def do_GET(self):
-            """处理 GET：health/status/settings/chat 守卫、记忆/Agent/远端/电脑状态、/api/tools。
+            """处理 GET：health/status/settings/chat 守卫、记忆/Agent/远端/电脑状态、/api/tools、/api/pet/model。
 
-            GET /api/health 豁免令牌校验（供 main.js 健康探测与运维探针）。
+            GET /api/health 豁免令牌校验（供 main.js 健康探测与运维探针）；
+            /api/pet/model 分发悬浮桌宠 VRM 原始字节（过 Host / 令牌闸，无豁免）。
             """
             if not self._check_host():
                 self._deny_bad_host()
@@ -1253,6 +1412,10 @@ def make_handler(
 
                 if path == "/api/cxfc/relay/pending":
                     self._handle_relay_pending(query)
+                    return
+
+                if path == "/api/pet/model":
+                    self._handle_pet_model()
                     return
 
                 self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
@@ -1800,9 +1963,9 @@ def make_handler(
         def _handle_voice_transcribe(self):
             """POST /api/voice/transcribe：body {audio_base64, sample_rate?}，ASR 转写。
 
-            base64 解码后送 voice.asr.transcribe；解码失败 400；后端异常 503
-            voice_backend_unavailable。sample_rate 为可选元数据（当前 ASR 门面
-            不消费，透传忽略，保留字段兼容未来采样率感知后端）。
+            base64 解码后送 voice.asr.transcribe（sample_rate 一并透传——桥后端
+            据此重采样到 SenseVoice 期望的 16kHz；缺省 None 时按 16000 处理）；
+            解码失败 400；后端异常 503 voice_backend_unavailable。
             """
             body = self._read_body_json()
             if body is None:
@@ -1822,8 +1985,9 @@ def make_handler(
                     {"ok": False, "error": "bad_request", "message": "audio_base64 不是合法的 base64 编码"}, 400
                 )
                 return
+            sample_rate = body.get("sample_rate")
             try:
-                result = self._voice.asr.transcribe(audio) or {}
+                result = self._voice.asr.transcribe(audio, sample_rate) or {}
             except Exception as exc:  # noqa: BLE001 - 语音后端故障统一 503 兜底
                 self._send_json(
                     {"ok": False, "error": "voice_backend_unavailable", "message": str(exc)[:200]}, 503

@@ -1,34 +1,39 @@
 import React, { useState } from 'react';
-import PetAvatar, { type PetMood } from './PetAvatar';
+import VrmAvatar from './VrmAvatar';
+import { type PetMood } from '../petMood';
 import { PET_ENABLED_KEY } from '../hooks/usePetEnabled';
 import { closePetOverlay } from '../bridge';
 
 /**
- * PetOverlay — Electron 桌宠透明悬浮窗的独立根组件（简化版）。
+ * PetOverlay — Electron 桌宠透明悬浮窗的独立根组件。
  *
- * 复用 PetPage 的 CSS 二次元形象（PetAvatar），提供透明背景、可拖拽区域与
- * 口型 / 表情演示，不含 VRM 等重物理逻辑。
+ * 渲染真实 VRM 模型（VrmAvatar，three + @pixiv/three-vrm，透明背景 canvas）；
+ * 当无 WebGL / 模型接口不可达 / 解析失败时，在窗口内给出「暂时显示不了 3D 桌宠」
+ * 的中文提示（含可读原因），**不回落卡通形象**——回落会让人误以为「根本没做 VRM」
+ * （见 VrmAvatar 的兜底逻辑与 data-vrm-state 状态位）。
  *
  * ======================== 接线说明（Electron 环境生效） ========================
  * 1. main.js 的 createPetOverlayWindow() 创建透明、无边框、置顶、跳过任务栏的
  *    悬浮窗（320×360，transparent:true），由 IPC『pet-overlay:open』触发创建，
  *    『pet-overlay:close』关闭；本组件经独立入口 pet-overlay.html 挂载。
  * 2. 透明开启：BrowserWindow 以 show:false 创建，ready-to-show 后再 show()，
- *    避免部分 Linux 上直接 show 会丢透明。
+ *    避免部分 Linux 上直接 show 会丢透明；VRM canvas 亦以 alpha+setClearAlpha(0) 保证透明。
  * 3. 关闭链路：点击「关闭」→ bridge.closePetOverlay()（IPC）让主进程关窗；
  *    同时写 localStorage 记录关闭状态，主窗口内 usePetEnabled 经 storage
  *    事件同步收敛开关显示。开后必有窗、关后必无窗，断链不再出现。
  * 4. 拖拽：本组件底部 .pet-overlay-drag 区域设 -webkit-app-region: drag，
- *    关闭按钮设 no-drag，保证既能拖动又能点击。
+ *    关闭按钮设 no-drag，保证既能拖动又能点击。VRM canvas 承载层设 pointer-events:none
+ *    （不抢占命中测试），拖动经上层 drag 区域生效，不影响拖窗。
  * ======================== 鼠标穿透说明 ========================
- * 本占位未做整窗镂空穿透。要「区域外点击穿透到桌面」时，可：
+ * 本组件未做整窗镂空穿透。要「区域外点击穿透到桌面」时，可：
  *   - 交互区（拖拽把手 / 关闭按钮）保留 pointer-events:auto；
  *   - 非交互展示区设 pointer-events:none；
  *   - 并在 BrowserWindow 侧配合 setIgnoreMouseEvents(true, { forward: true })。
  * 当前简单起见整窗保留可拖拽，穿透作为后续扩展点。
  */
 export default function PetOverlay() {
-  const [mood, setMood] = useState<PetMood>('happy');
+  // 默认「平静」：neutral 表情为睁眼常态，避免直接进 happy 的笑眼被误读成「眼睛没睁开」
+  const [mood, setMood] = useState<PetMood>('calm');
   const [talking, setTalking] = useState(false);
 
   // 关闭按钮：优先经 IPC 桥让主进程关闭悬浮窗；localStorage 写入保留作状态记录
@@ -49,7 +54,7 @@ export default function PetOverlay() {
       <style>{PET_OVERLAY_CSS}</style>
 
       <div className="pet-overlay-drag" data-mood={mood}>
-        <PetAvatar mood={mood} talking={talking} size={150} />
+        <VrmAvatar mood={mood} talking={talking} size={286} />
       </div>
 
       <div className="pet-overlay-tools">
@@ -72,7 +77,7 @@ export default function PetOverlay() {
         </button>
       </div>
 
-      <p className="pet-overlay-note">拖动移动 · 这里可做鼠标穿透扩展</p>
+      <p className="pet-overlay-note">拖动可移动</p>
     </div>
   );
 }

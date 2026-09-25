@@ -7,10 +7,10 @@
     {
       "name": "llama.cpp",
       "key": "llama_cpp",
-      "size_estimate": "约 80 MB",
-      "status": "builtin",
+      "size_estimate": "约 184 MB",
+      "status": "runtime",
       "install_target": "runtime/llama",
-      "notes": "本地推理运行时（GCGUF 加载 / 向量嵌入）。"
+      "notes": "本地推理运行时（预编译二进制：llama-cli.exe + ggml-cuda.dll 等，经语音桥 chat op 子进程推理，见 20260925_模块0_接入llama本地推理.md）。status=runtime：不进便携 zip、不参与 bundled 拷贝，由 installer.iss [Files] 从 bundled/llama_cpp 直接落位 runtime/llama；本地小 LLM 模型不在本组件内（由首启向导按档位下载）。"
     },
     {
       "name": "qwen3-embedding:0.6b (GGUF)",
@@ -39,10 +39,18 @@
     {
       "name": "SenseVoice",
       "key": "sensevoice",
-      "size_estimate": "约 300 MB",
-      "status": "builtin",
+      "size_estimate": "约 896 MB",
+      "status": "runtime",
       "install_target": "data/SenseVoiceSmall",
-      "notes": "语音识别模型（对齐 config.asr.engine）；落位与 lite/audio/asr.py SenseVoiceBackend 的默认 model_path 回退路径一致（M-13）。"
+      "notes": "语音识别模型（对齐 config.asr.engine）；由独立安装程序在安装期直接落位（bundled/sensevoice → data/SenseVoiceSmall），不进便携 zip（便携形态无运行时环境，收录纯属无效体积）。落位与 lite/audio/asr.py SenseVoiceBackend 的默认 model_path 回退路径一致（M-13）。"
+    },
+    {
+      "name": "默认桌宠模型（VRM）",
+      "key": "pet_model",
+      "size_estimate": "约 15 MB",
+      "status": "builtin",
+      "install_target": "data/pet/cx-open.vrm",
+      "notes": "悬浮桌宠默认 VRM 模型（CX-OPEN）；文件型组件，重装时不覆盖用户已替换的模型。"
     },
     {
       "name": "本地小 LLM（可选）",
@@ -51,6 +59,22 @@
       "status": "optional",
       "install_target": "data/local_llm/llm",
       "notes": "可选组件：默认不下载，由 C2 下载引导按需拉取（HF / 魔塔双源）。"
+    },
+    {
+      "name": "内置 Miniconda 运行时",
+      "key": "miniconda_installer.exe",
+      "size_estimate": "约 126 MB",
+      "status": "runtime",
+      "install_target": "runtime/conda",
+      "notes": "运行时组件（不参与 bundled 拷贝）：由 installer/conda_runtime.install_conda 以 NSIS 静默方式装到 runtime/conda，作为语音 sidecar 环境基座。"
+    },
+    {
+      "name": "语音侧车环境（conda）",
+      "key": "voice_env",
+      "size_estimate": "约 5~8 GB（GPU 版）",
+      "status": "runtime",
+      "install_target": "runtime/voice",
+      "notes": "运行时组件：conda create -p runtime/voice python=3.10（3.12 上 tokenizers<0.14 无轮子）+ MeloTTS/SenseVoice/llama-cpp-python（GPU 自动探测分叉，报告落 data/install_report.json）。"
     }
   ]
 }

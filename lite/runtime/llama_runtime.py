@@ -60,6 +60,16 @@ GPU_LAYERS_CPU = 0
 #: GPU 卸载层数——device="gpu" 且未显式配置 n_gpu_layers 时使用（-1 = 尽量全部层卸载）
 GPU_LAYERS_ALL = -1
 
+#: 外部路径：llama.cpp 预编译二进制相对便携根的落点（规划 §四-15 替代路线——
+#: llama-cpp-python 因长路径墙装不上，改经 ``llama-cli.exe`` 子进程推理）。
+EXTERNAL_LLAMA_CLI_REL = ("runtime", "llama", "llama-cli.exe")
+
+#: 外部路径单次请求超时（秒）——含模型冷加载；与前端 300s 请求口径一致。
+EXTERNAL_CHAT_TIMEOUT_S = 300
+
+#: 离线对话经外部路径生成时的采样温度（与 2026-09-25 实测口径一致）。
+OFFLINE_CHAT_TEMPERATURE = 0.7
+
 #: 「是否回复」判定提示词（中文，要求只答 是/否）
 JUDGE_PROMPT_TEMPLATE = (
     "你是本助手的「是否应当回复」判定器。\n"
@@ -149,7 +159,7 @@ class LlamaRuntime:
     3. 加载失败与依赖缺失时按降级策略处理，保证主进程不崩溃。
     """
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, root=None):
         """初始化运行时，读取配置意向但不加载任何模型。
 
         Args:
@@ -157,13 +167,19 @@ class LlamaRuntime:
                 - ``None``：使用默认配置意向；
                 - ``dict``：形如 ``{"embedding": {...}, "local_llm": {...}}`` 的嵌套字典；
                 - ``ConfigManager`` 实例（具备 ``get(section, key, default)`` 接口）。
+            root: 便携根覆盖（外部 llama-cli 路径推导用）；缺省经
+                ``lite.config.paths.app_root()`` 推导（frozen-aware 单一真相源）。
         """
+        #: 便携根覆盖（None 时按 app_root() 推导；测试可显式注入）
+        self._root_override = root
         #: 嵌入模型配置意向（标识/文件名，非已加载实例）
         self._emb_model_name = self._read_cfg(config, "embedding", "model", DEFAULT_EMBEDDING_MODEL)
         #: 本地小 LLM 是否启用
         self._llm_enabled = bool(self._read_cfg(config, "local_llm", "enabled", False))
         #: 本地小 LLM 模型文件路径
         self._llm_path = self._read_cfg(config, "local_llm", "model_path", "") or ""
+        #: 本地小 LLM 设备意图串（cpu/gpu/auto；外部桥客户端透传用）
+        self._llm_device = str(self._read_cfg(config, "local_llm", "device", "cpu") or "cpu")
         #: 本地小 LLM 上下文窗口（可选 n_ctx 覆盖键，缺省 DEFAULT_LLM_N_CTX；非法值回退默认）
         raw_n_ctx = self._read_cfg(config, "local_llm", "n_ctx", None)
         try:
@@ -183,6 +199,10 @@ class LlamaRuntime:
         self._llm = None
         #: 本地小 LLM 是否就绪
         self._llm_ready = False
+        #: 外部路径：语音桥客户端（llama-cli 子进程推理），未启用为 None
+        self._external_client = None
+        #: 外部路径的 GGUF 模型路径（逐次请求透传给桥）
+        self._external_model_path = ""
         #: 加载过程中的降级提示（与 ConfigManager.warnings 语义一致）
         self.warnings = []
         #: 离线对话可拼接的最大历史消息条数
@@ -340,17 +360,33 @@ class LlamaRuntime:
     def load_local_llm(self, path) -> bool:
         """加载本地小 LLM（embedding=False，n_ctx 建议 2048）。
 
+        双路径（规划 §四-15）：
+        - **in-process**：llama-cpp-python 可用时按原口径构造 ``Llama`` 实例；
+        - **外部**：llama-cpp-python 缺席（不可安装）时改试外部预编译二进制
+          （``<root>/runtime/llama/llama-cli.exe`` + 语音桥 sidecar，见
+          :meth:`_try_load_external_llm`）——就绪后 ``_external_client`` 非空。
+        两条路径都不可用才抛 RuntimeError（提示安装指引）。
+
         Args:
             path: GGUF 模型文件绝对路径。
         Returns:
             bool: 成功加载返回 True；文件缺失 / 加载异常返回 False（不崩溃，
                 置 ``_llm_ready=False`` 并在 ``warnings`` 记录降级提示）。
         Raises:
-            RuntimeError: 当 llama-cpp-python 未安装（导入失败）时抛出。
+            RuntimeError: 当 llama-cpp-python 缺失**且**外部 llama-cli 路径不可用时抛出。
         """
         if not os.path.exists(path):
             return self._record_load_failure("llm", f"本地小 LLM 文件不存在：{path}（配置意向：{self._llm_path}）")
-        llama_cls = _import_llama()  # 导入失败抛 RuntimeError（提示安装）
+        try:
+            llama_cls = _import_llama()  # 导入失败抛 RuntimeError（提示安装）
+        except RuntimeError as exc:
+            # llama-cpp-python 缺席：改走外部预编译二进制路径（规划 §四-15）
+            if self._try_load_external_llm(path):
+                return True
+            raise RuntimeError(
+                f"{exc}；外部 llama-cli 路径亦不可用（需 <root>/runtime/llama/llama-cli.exe "
+                f"与语音 sidecar 同时就位）。"
+            ) from exc
         try:
             self._llm = llama_cls(
                 model_path=path,
@@ -374,6 +410,76 @@ class LlamaRuntime:
             self._llm_ready = False
             self._llm = None
         return False
+
+    # ------------------------------------------------------------------ #
+    # 外部路径（llama.cpp 预编译二进制 + 语音桥，规划 §四-15）            #
+    # ------------------------------------------------------------------ #
+
+    def _app_root(self):
+        """便携根（root 覆盖优先；否则经 frozen-aware 的 app_root()）。"""
+        if self._root_override:
+            return self._root_override
+        from lite.config.paths import app_root
+
+        return app_root()
+
+    def _try_load_external_llm(self, path) -> bool:
+        """尝试外部 llama-cli 路径（预编译二进制 + 语音桥 sidecar）。
+
+        就位条件：``<root>/runtime/llama/llama-cli.exe`` 存在，且语音桥可用
+        （sidecar 解释器与分发落点 ``runtime/voice_bridge/bridge.py`` 同时就位）。
+        缺一即返回 False，由调用方回落既有路径（llama-cpp-python 缺席则维持
+        RuntimeError）。
+
+        :param path: GGUF 模型文件路径（逐次请求透传给桥）
+        :return: 就绪返回 True 并置 ``_llm_ready``；否则 False（不改状态）
+        """
+        root = self._app_root()
+        cli = os.path.join(root, *EXTERNAL_LLAMA_CLI_REL)
+        if not os.path.isfile(cli):
+            return False
+        try:
+            from lite.audio.voice_bridge_client import VoiceBridgeClient
+        except Exception:  # noqa: BLE001 - 桥模块不可用按外部不可用处理
+            return False
+        client = VoiceBridgeClient(
+            root=root, device=self._llm_device, timeout=EXTERNAL_CHAT_TIMEOUT_S
+        )
+        if not client.available():
+            return False
+        self._external_client = client
+        self._external_model_path = str(path)
+        self._llm_ready = True
+        return True
+
+    def _llm_available(self) -> bool:
+        """本地小 LLM 是否可用（in-process 实例或外部桥二者之一就绪）。"""
+        return bool(
+            self._llm_ready and (self._external_client is not None or self._llm is not None)
+        )
+
+    def _external_generate(self, prompt, max_tokens, temperature) -> str:
+        """经外部桥（llama-cli）生成一次文本。
+
+        :raises LlamaNotReady: 外部路径未就绪（防御性）
+        :raises VoiceBridgeError: 桥侧失败（超时 / 解析失败等中文错误）向上抛出，
+            由调用方的降级出口（OfflineFallbackManager / judge 统一出口）兜底。
+        """
+        if self._external_client is None:
+            raise LlamaNotReady("外部 llama-cli 路径未就绪。")
+        header, _payload = self._external_client.request(
+            {
+                "op": "chat",
+                "model": self._external_model_path,
+                "prompt": str(prompt),
+                "max_tokens": int(max_tokens),
+                "n_ctx": int(self._n_ctx),
+                "n_gpu_layers": int(self._llm_n_gpu_layers),
+                "temperature": float(temperature),
+            },
+            timeout=EXTERNAL_CHAT_TIMEOUT_S,
+        )
+        return str(header.get("text") or "")
 
     # ------------------------------------------------------------------ #
     # 嵌入（EmbeddingProvider 语义）                                     #
@@ -466,19 +572,22 @@ class LlamaRuntime:
         """本地小 LLM 判定：用户是否在对本助手说话、是否应当回复。
 
         使用中文提示词（见 ``JUDGE_PROMPT_TEMPLATE``）要求模型只答 是/否，
-        解析结果首词/首字（是/yes/y/true）命中即判为 True。
+        解析结果首词/首字（是/yes/y/true）命中即判为 True。in-process 与
+        外部（llama-cli 桥）两条路径共用同一提示词与解析口径。
 
         Args:
             user_text: 用户刚说的话。
         Returns:
             bool: True 表示应当回复；False 表示不回复（自言自语）。
         Raises:
-            LlamaNotReady: 本地小 LLM 未就绪时抛出。
+            LlamaNotReady: 本地小 LLM 未就绪（两条路径均不可用）时抛出。
         """
-        if not self._llm_ready or self._llm is None:
+        if not self._llm_available():
             raise LlamaNotReady("本地小 LLM 未就绪：请先调用 load_local_llm 加载模型后再进行「是否回复」判定。")
         prompt = JUDGE_PROMPT_TEMPLATE.format(user_text=str(user_text).strip() or "（空输入）")
         prompt = self._fit_prompt(prompt, JUDGE_MAX_TOKENS)
+        if self._external_client is not None:
+            return self._parse_yes(self._external_generate(prompt, JUDGE_MAX_TOKENS, 0.0))
         result = self._llm(prompt, max_tokens=JUDGE_MAX_TOKENS, temperature=0.0)
         return self._parse_yes(self._extract_text(result))
 
@@ -489,15 +598,19 @@ class LlamaRuntime:
             messages: list[dict]，形如 ``[{"role": "system", "content": ...},
                 {"role": "user", "content": ...}]``。
         Returns:
-            str: 本地小 LLM 生成的纯文本回复。
+            str: 本地小 LLM 生成的纯文本回复（in-process 或外部桥路径）。
         Raises:
-            LlamaNotReady: 本地小 LLM 未就绪时抛出。
+            LlamaNotReady: 本地小 LLM 未就绪（两条路径均不可用）时抛出。
         """
-        if not self._llm_ready or self._llm is None:
+        if not self._llm_available():
             raise LlamaNotReady("本地小 LLM 未就绪：请先调用 load_local_llm 加载模型后再进行离线对话。")
         prompt = self._fit_prompt(
             self._format_messages(messages), OFFLINE_CHAT_MAX_TOKENS, messages=messages
         )
+        if self._external_client is not None:
+            return self._external_generate(
+                prompt, OFFLINE_CHAT_MAX_TOKENS, OFFLINE_CHAT_TEMPERATURE
+            ).strip()
         result = self._llm(prompt, max_tokens=OFFLINE_CHAT_MAX_TOKENS)
         return self._extract_text(result).strip()
 

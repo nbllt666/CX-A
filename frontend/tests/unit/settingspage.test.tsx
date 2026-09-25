@@ -203,7 +203,7 @@ describe('SettingsPage：PUT 失败 → 内联错误提示', () => {
       expect(window.localStorage.getItem('cx-a.computer.authorized')).toBe('1');
     });
     // 降级离线：授权卡描述切到离线文案（computerOnline=false 的直接证据）
-    expect(screen.getByText(/后端还没连上/)).toBeInTheDocument();
+    expect(screen.getByText(/还没连上 TA/)).toBeInTheDocument();
     // 配置桶的音色错误提示不受授权失败影响
     expect(screen.getByText(VOICE_ERROR)).toBeInTheDocument();
   });

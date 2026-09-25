@@ -311,6 +311,19 @@ def assemble(electron_dist, backend_dist, portable_root):
     backend_target = os.path.join(portable_root, "runtime", "backend")
     _copytree_contents(backend_dist, backend_target)
 
+    # 语音桥脚本 -> runtime/voice_bridge/bridge.py
+    # 客户端（lite/audio/voice_bridge_client.py::_resolve_script）**仅认该分发落点**，
+    # 单一真相源为 lite/audio/voice_bridge.py（sidecar 内运行、禁止 import lite.*），
+    # 此处为分发复制，勿在此处改内容。
+    bridge_src = os.path.join(PROJECT_ROOT, "lite", "audio", "voice_bridge.py")
+    if os.path.isfile(bridge_src):
+        bridge_dir = os.path.join(portable_root, "runtime", "voice_bridge")
+        os.makedirs(bridge_dir, exist_ok=True)
+        shutil.copy2(bridge_src, os.path.join(bridge_dir, "bridge.py"))
+        _log_info("语音桥脚本已落位：runtime/voice_bridge/bridge.py")
+    else:
+        _log_warn(f"语音桥脚本源缺失：{bridge_src}（打包态语音将降级）")
+
     # 数据目录 + 内置模型组件落位 + 默认 config（复用 bootstrap，幂等）
     from installer import bootstrap
 
@@ -410,6 +423,100 @@ def zip_portable(portable_root, release_dir):
 # CLI 编排                                                            #
 # ------------------------------------------------------------------ #
 
+def _app_version():
+    """读取应用版本号（单一真相源 ``lite.__version__``）；读取失败回落 0.1.0。"""
+    try:
+        import lite
+
+        return str(getattr(lite, "__version__", "0.1.0")) or "0.1.0"
+    except Exception:  # noqa: BLE001 - 版本读取失败不阻断打包
+        return "0.1.0"
+
+
+def find_iscc():
+    """查找 Inno Setup 编译器（ISCC.exe）。
+
+    候选顺序：Program Files (x86) → Program Files → 用户级安装目录
+    （``winget install JRSoftware.InnoSetup`` 默认落用户目录）。
+
+    :return: ISCC.exe 绝对路径；未安装返回 None。
+    """
+    candidates = [
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                     "Inno Setup 6", "ISCC.exe"),
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     "Inno Setup 6", "ISCC.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Inno Setup 6", "ISCC.exe"),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def build_installer(portable_root, release_dir, version=None):
+    """步骤6：编译独立安装程序（Inno Setup）——载荷展开 + 安装期一次性装配运行时。
+
+    非阻断口径（与既有工具探测一致）：ISCC 未安装、运行时源缺失或编译失败时
+    仅告警，不阻断主链路（便携根与 zip 产物不受影响）。
+
+    :param portable_root: 本次组装的便携根（载荷来源）。
+    :param release_dir: 安装程序输出目录。
+    :param version: 版本号；缺省读 :func:`_app_version`。
+    :return: str 安装程序 exe 路径；跳过/失败时返回 None。
+    """
+    _log_info("步骤6：编译独立安装程序（Inno Setup）…")
+    iscc = find_iscc()
+    if iscc is None:
+        _log_warn(
+            "未检测到 Inno Setup 编译器（ISCC.exe），跳过安装程序编译。"
+            "如需产出安装程序：winget install JRSoftware.InnoSetup"
+        )
+        return None
+
+    # 随包运行时源齐备性：缺失会让 ISCC 直接报错，故先行检查并明确跳过原因
+    required_sources = {
+        "Miniconda 安装器": os.path.join(BUNDLED_DIR, "miniconda_installer.exe"),
+        "MeloTTS 源码": os.path.join(BUNDLED_DIR, "melotts_src"),
+        "nltk 数据": os.path.join(BUNDLED_DIR, "nltk_data"),
+        "SenseVoice 模型": os.path.join(BUNDLED_DIR, "sensevoice"),
+    }
+    missing = [name for name, path in required_sources.items() if not os.path.exists(path)]
+    if missing:
+        _log_warn(
+            "随包运行时源缺失（" + "、".join(missing) + "），跳过安装程序编译"
+            "（便携包产物不受影响；填充 installer/bundled/ 后重跑即可）"
+        )
+        return None
+
+    script = os.path.join(_INSTALLER_DIR, "installer.iss")
+    app_version = version or _app_version()
+    cmd = [
+        iscc,
+        f"/DPayloadDir={portable_root}",
+        f"/DBundledDir={BUNDLED_DIR}",
+        f"/DOutputDir={release_dir}",
+        f"/DAppVersion={app_version}",
+        script,
+    ]
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=1800,
+        encoding="utf-8", errors="replace",
+    )
+    if proc.returncode != 0:
+        print(proc.stdout[-2000:])
+        print(proc.stderr[-2000:])
+        _log_warn("安装程序编译失败（不阻断主链路）：见上方 ISCC 输出")
+        return None
+    exe_path = os.path.join(release_dir, f"CX-A-Setup-{app_version}.exe")
+    if not os.path.isfile(exe_path):
+        _log_warn(f"安装程序编译完成但产物缺失：{exe_path}")
+        return None
+    size_mb = os.path.getsize(exe_path) / (1024 * 1024)
+    _log_info(f"独立安装程序已产出：{exe_path}（{size_mb:.1f} MB）")
+    return exe_path
+
+
 def main(argv=None):
     """CLI 入口：解析 --skip-* 与 --output，顺序执行全流程。"""
     parser = argparse.ArgumentParser(prog="installer.build", description="CX-A 便携包一键打包编排")
@@ -417,6 +524,7 @@ def main(argv=None):
     parser.add_argument("--skip-electron", action="store_true", help="跳过 Electron 壳打包（复用 win-unpacked）")
     parser.add_argument("--skip-backend", action="store_true", help="跳过后端打包（复用已有 runtime/backend）")
     parser.add_argument("--skip-zip", action="store_true", help="只组装便携目录，不压缩 zip")
+    parser.add_argument("--skip-installer", action="store_true", help="跳过独立安装程序编译（Inno Setup）")
     parser.add_argument("--output", default=RELEASE_DIR, help="产物输出目录（默认 <项目>/release）")
     args = parser.parse_args(argv)
 
@@ -450,6 +558,9 @@ def main(argv=None):
 
     if not args.skip_zip:
         zip_portable(portable_root, args.output)
+
+    if not args.skip_installer:
+        build_installer(portable_root, args.output)
 
     _log_info(f"全流程完成。便携根：{portable_root}")
     return portable_root

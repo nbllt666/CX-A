@@ -96,7 +96,7 @@ def test_install_gpu_dependencies_guided_report(tmp_path):
     assert result["recommend"] == "cuda"
     assert result["installed"] is False
     assert result["timestamp"]
-    assert len(result["pending_commands"]) == 4  # 注释 + 3 条 pip 命令
+    assert len(result["pending_commands"]) == 5  # 注释 + 4 条 pip 命令（含 torchaudio）
 
     # 报告落盘且与返回值一致
     assert os.path.isfile(report_path)
@@ -123,6 +123,7 @@ def test_install_gpu_dependencies_cpu_report_default_path(tmp_path, monkeypatch)
     assert result["recommend"] == "cpu"
     assert result["pending_commands"] == [
         "pip install torch --index-url https://download.pytorch.org/whl/cpu",
+        "pip install torchaudio --index-url https://download.pytorch.org/whl/cpu",
         "pip install onnxruntime",
     ]
     assert os.path.isfile(report_path)
@@ -151,13 +152,13 @@ def test_install_gpu_dependencies_auto_install_failure_no_raise(tmp_path):
     # 不抛错即达成本断言；结论字段校验
     assert result["gpu_vendor"] == "nvidia"
     assert result["installed"] is False
-    # 3 条 pip 命令全部失败并留痕（注释条目不计入）
-    assert len(result["errors"]) == 3
+    # 4 条 pip 命令全部失败并留痕（注释条目不计入；含 torchaudio，2026-09-25 新增）
+    assert len(result["errors"]) == 4
     assert all(err["returncode"] == 1 for err in result["errors"])
     assert all(err["command"].startswith("pip install") for err in result["errors"])
     assert all("simulated pip failure" in err["output"] for err in result["errors"])
-    # 检测调用 1 次 + 安装调用 3 次（注释条目被跳过）
-    assert len([c for c in calls if c.startswith("pip install")]) == 3
+    # 检测调用 1 次 + 安装调用 4 次（注释条目被跳过）
+    assert len([c for c in calls if c.startswith("pip install")]) == 4
     assert not any(c.startswith("#") for c in calls)
 
 
@@ -178,11 +179,11 @@ def test_install_gpu_dependencies_auto_install_success(tmp_path):
 
     assert result["installed"] is True
     assert result["errors"] == []
-    assert len(executed) == 3
+    assert len(executed) == 4  # 含 torchaudio（2026-09-25 新增）
 
 
 def test_install_gpu_dependencies_auto_install_rocm_skips_notes(tmp_path):
-    """rocm 分支自动安装：3 条可执行命令被执行，# 说明条目仅打印不执行。"""
+    """rocm 分支自动安装：可执行命令全部执行，# 说明条目仅打印不执行。"""
     report_path = os.path.join(str(tmp_path), "data", "install_report.json")
     executed = []
     detect_report = {
@@ -204,10 +205,10 @@ def test_install_gpu_dependencies_auto_install_rocm_skips_notes(tmp_path):
 
     assert result["recommend"] == "rocm"
     assert result["installed"] is True
-    # rocm 清单 3 条可执行命令（torch rocm / onnxruntime-directml）中
-    # 可执行条目全部执行；1 条注释说明被跳过
+    # rocm 清单可执行命令（torch rocm / torchaudio rocm / onnxruntime-directml）
+    # 全部执行；说明性注释被跳过
     executable = [c for c in result["pending_commands"] if not c.startswith("#")]
-    assert len(executable) == 2
+    assert len(executable) == 3
     assert set(executed) == set(executable)
 
 

@@ -29,6 +29,19 @@ import lite.server.api_server as api_server_module
 from lite.server.api_server import build_deps, create_app, make_handler
 
 
+@pytest.fixture(autouse=True)
+def _isolate_voice_bridge(monkeypatch):
+    """隔离内置语音 sidecar 探测：服务测试稳定落到 Mock 语音后端。
+
+    宿主开发机可能已安装运行时（``runtime/voice`` + ``runtime/voice_bridge``），
+    统一屏蔽以避免测试真启动桥进程（加载模型导致超时）；sidecar 接线本身由
+    ``tests/test_voice_bridge.py`` 专项覆盖。
+    """
+    import lite.audio as lite_audio
+
+    monkeypatch.setattr(lite_audio, "_try_voice_bridge", lambda *args, **kwargs: None)
+
+
 @pytest.fixture()
 def computer_env(tmp_path):
     """L3 测试用电脑控制依赖：fake 键盘后端 + authorizer + bridge 起服，返回 (base, authorizer, keyboard)。"""
@@ -1703,6 +1716,95 @@ def test_setup_endpoints_require_token_in_token_mode(api_server, monkeypatch):
         status, body = http_post(f"{base}{path}", payload)
         assert status == 403, f"{path} 无令牌应 403"
         assert body["error"] == "unauthorized_client"
+
+
+# ---------------------------------------------------------------- 悬浮桌宠模型分发（20260924_模块0_接入VRM悬浮桌宠）
+@contextmanager
+def pet_model_server(tmp_path, monkeypatch, root, model_bytes=None):
+    """起服把 ``app_root()`` 指向临时根（可选写入模型文件），产出 ``base_url``。
+
+    生产代码经 ``app_root()``（frozen-aware）解析 ``<app_root>/data/pet/cx-open.vrm``；
+    测试态 ``sys.frozen`` 为假、``app_root()`` 恒指项目根，故用 monkeypatch 精确替换
+    模块级 ``app_root`` 可调用对象——这是唯一干净注入点，**不为测试在生产代码里加钩子**。
+    """
+    root = str(root)
+    monkeypatch.setattr(api_server_module, "app_root", lambda: root)
+    if model_bytes is not None:
+        model_path = os.path.join(root, "data", "pet", "cx-open.vrm")
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        with open(model_path, "wb") as fh:
+            fh.write(model_bytes)
+    _store, _pipeline, handler = create_app(data_dir=str(tmp_path))
+    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_pet_model_returns_raw_vrm_bytes(tmp_path, monkeypatch):
+    """GET /api/pet/model：200 原始字节，Content-Type=model/gltf-binary 且 Content-Length 一致。"""
+    payload = b"CXA-FAKE-VRM"
+    with pet_model_server(tmp_path, monkeypatch, tmp_path / "approot", payload) as base:
+        req = urllib.request.Request(
+            f"{base}/api/pet/model", headers={"Origin": "http://localhost:5173"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read()
+            assert resp.status == 200
+            assert resp.headers.get("Content-Type") == "model/gltf-binary"
+            assert int(resp.headers.get("Content-Length")) == len(payload)
+            # 用户可替换同路径模型 → no-store 避免旧模型被缓存
+            assert resp.headers.get("Cache-Control") == "no-store"
+            # 沿用既有 CORS 头（允许源回显 ACAO）
+            assert resp.headers.get("Access-Control-Allow-Origin") == "http://localhost:5173"
+        # 响应体逐字节等于写入内容
+        assert body == payload
+        # 冻结契约：只实现 GET，POST 不新增路由
+        status, post_body = http_post(f"{base}/api/pet/model", {})
+        assert status == 404
+        assert post_body["error"] == "not_found"
+
+
+def test_pet_model_missing_returns_404(tmp_path, monkeypatch):
+    """GET /api/pet/model：文件缺失 → 404 pet_model_missing + 中文 message（含期望路径）。"""
+    root = tmp_path / "approot"
+    with pet_model_server(tmp_path, monkeypatch, root) as base:
+        status, body = http_get_json(f"{base}/api/pet/model")
+    assert status == 404
+    assert body["ok"] is False
+    assert body["error"] == "pet_model_missing"
+    assert "未找到" in body["message"]
+    assert os.path.join(str(root), "data", "pet", "cx-open.vrm") in body["message"]
+
+
+def test_pet_model_requires_token_in_token_mode(tmp_path, monkeypatch):
+    """令牌模式下 /api/pet/model 无令牌 → 403；带正确令牌 → 200 原始字节。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
+    with pet_model_server(
+        tmp_path, monkeypatch, tmp_path / "approot", b"CXA-FAKE-VRM"
+    ) as base:
+        status, body = http_get_json(f"{base}/api/pet/model")
+        assert status == 403
+        assert body == {"ok": False, "error": "unauthorized_client"}
+
+        req = urllib.request.Request(
+            f"{base}/api/pet/model", headers={"X-Client-Token": "unit-test-token"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+            assert resp.read() == b"CXA-FAKE-VRM"
+
+
+def test_pet_model_documented_in_tools_usage(api_server):
+    """GET /api/tools 的端点自述清单已同步登记 /api/pet/model（文档不漂移）。"""
+    _store, _pipeline, base = api_server
+    _status, body, _raw = http_get(f"{base}/api/tools")
+    assert "GET /api/pet/model" in body["usage"]
 
 
 

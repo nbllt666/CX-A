@@ -152,7 +152,7 @@ describe('首启向导（SetupWizard / App 门控）', () => {
     expect(screen.queryByText(/还没有聊天记录/)).not.toBeInTheDocument();
   });
 
-  it('App 门控降级：status 请求失败 → 放行主界面并本地记「已跳过向导」', async () => {
+  it('App 门控降级：status 请求失败 → 本次会话放行主界面，且下次启动仍会重新询问', async () => {
     fetchSetupStatusMock.mockRejectedValue(new Error('ECONNREFUSED: backend not running'));
     // 主界面 ChatPage 不主动联网；仍兜底 stub fetch，避免其它组件触发未 mock 网络
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
@@ -162,8 +162,14 @@ describe('首启向导（SetupWizard / App 门控）', () => {
     // 放行主界面：聊天页空态可见（无空白页 / 无永久 loading）
     expect(await screen.findByText(/还没有聊天记录/)).toBeInTheDocument();
     expect(screen.queryByText('欢迎来到 CX-A')).not.toBeInTheDocument();
-    // 本地记录「已跳过」
-    expect(window.localStorage.getItem('cx-a.setup.skipped')).toBe('1');
+    // 降级只作用于本次会话：不得持久化「已跳过」标记（否则后端慢一拍会让向导永久消失）
+    expect(window.localStorage.getItem('cx-a.setup.skipped')).toBeNull();
+    // 且下次挂载仍会重新询问后端（后端恢复后向导照常出现）
+    expect(fetchSetupStatusMock).toHaveBeenCalledTimes(1);
+    cleanup();
+    fetchSetupStatusMock.mockResolvedValue(STATUS_REQUIRED);
+    render(<App />);
+    expect(await screen.findByText('欢迎来到 CX-A')).toBeInTheDocument();
   });
 
   it('推荐加载成功 → 展示中文推荐结论与理由，并可自己挑档位', async () => {
