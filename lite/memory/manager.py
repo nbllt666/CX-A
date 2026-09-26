@@ -8,12 +8,16 @@
 再激活加成与衰减（DecayCalculator）；升降级阈值按重要性分档与再激活次数自定义合理默认。
 """
 
+import logging
 from datetime import datetime
 
 from .decay import DecayCalculator
 from .scoring import _get_weights, score_memories
 from .storage import MemoryStore
 from .vector_store import InMemoryVectorStore
+
+# 原生日志记录器（20260926_模块0_真实嵌入与向量持久化：向量写入失败告警留痕）
+LOGGER = logging.getLogger(__name__)
 
 # 分层阈值（对齐 CX-O permaneent_threshold=0.95 与再激活语义）
 LONG_TERM_PROMOTE_IMPORTANCE = 0.60  # importance 达到该分数升 long_term
@@ -84,7 +88,7 @@ def tokenize_text(text) -> set:
 class MemoryManager:
     """记忆管理器门面：存储 + 衰减 + 三维打分 + 去重 + 分层升降级。"""
 
-    def __init__(self, store=None, vector_store=None, db_path=None, permanent_threshold=None, dedup_threshold=None):
+    def __init__(self, store=None, vector_store=None, db_path=None, permanent_threshold=None, dedup_threshold=None, embed_fn=None):
         """初始化内存管理器。
 
         Args:
@@ -97,6 +101,9 @@ class MemoryManager:
             dedup_threshold: 内容相似去重阈值（默认 0.85，对齐 config.memory.dedup
                 与 CX-O DeduplicationEngine 语义；None 回落模块级常量
                 DEDUP_THRESHOLD）。
+            embed_fn: 可选**缺省嵌入函数**（content -> 向量）。add_memory 未显式
+                传 embed_fn 时用本缺省值写向量（20260926_模块0_真实嵌入与向量持久化：
+                工具 / 蒸馏等写入口由此统一获得向量化）；None/非可调用时不写向量。
         """
         self.store = store or MemoryStore(db_path=db_path)
         self.vector_store = vector_store or InMemoryVectorStore()
@@ -111,6 +118,8 @@ class MemoryManager:
         self.dedup_threshold = (
             float(dedup_threshold) if dedup_threshold is not None else DEDUP_THRESHOLD
         )
+        # 缺省嵌入（写入口统一向量化用）：非可调用一律归 None（等价于不写向量）
+        self._embed_fn = embed_fn if callable(embed_fn) else None
         self.store.create_table()
 
     # -------------------------------------------------------- 工具
@@ -169,7 +178,8 @@ class MemoryManager:
             importance: 重要性等级（1~5）。
             importance_score: 重要性分数（0~1，缺省按 importance/5.0 折算）。
             decay_type: 衰减类型（ebbinghaus_opt / two_stage 等）。
-            embed_fn: 可选的嵌入函数（content -> 向量）；提供则同步向量化写入向量库。
+            embed_fn: 可选的嵌入函数（content -> 向量）；提供则同步向量化写入向量库
+                （缺省用构造注入的缺省嵌入，二者皆无则不写向量）。
         Returns:
             int|None: 新记忆 id；因去重跳过返回 None。
         Raises:
@@ -197,9 +207,23 @@ class MemoryManager:
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
             }
         )
-        if embed_fn is not None:
-            vector = embed_fn(content)
-            self.vector_store.upsert(str(memory_id), vector, metadata={"memory_id": memory_id, "agent_id": agent_id})
+        # 写向量（20260926_模块0_真实嵌入与向量持久化）：显式 embed_fn 优先，否则用
+        # 构造时注入的缺省嵌入——工具 / 蒸馏等未显式传 embed_fn 的写入口由此统一
+        # 获得向量化。向量写入失败不影响记忆落库（检索侧相应降级为关键词）。
+        effective_embed = embed_fn if embed_fn is not None else self._embed_fn
+        if effective_embed is not None:
+            try:
+                vector = effective_embed(content)
+                self.vector_store.upsert(
+                    str(memory_id),
+                    vector,
+                    metadata={"memory_id": memory_id, "agent_id": agent_id},
+                )
+            except Exception as exc:  # noqa: BLE001 - 嵌入不可用时记忆仍须落库
+                LOGGER.warning(
+                    "记忆 %s 向量写入失败（记忆已落库，检索侧降级关键词）：%s",
+                    memory_id, exc,
+                )
         return memory_id
 
     def soft_delete(self, memory_id):

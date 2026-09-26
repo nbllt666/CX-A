@@ -17,6 +17,10 @@
 - **懒加载**：``__init__`` 仅读取配置意向，不立即加载任何模型。
 - **与 A5 检索管线衔接**：``LlamaEmbeddingProvider`` 包装 ``LlamaRuntime.embed``，
   语义与 ``EmbeddingProvider`` 一致，可直接替换 ``LiteEmbeddingProvider`` 桩。
+- **嵌入外部路径**（20260926_模块0_真实嵌入与向量持久化）：``load_embedding_model``
+  在 llama-cpp-python 缺席时回落 ``llama-server.exe`` 常驻子进程（
+  ``lite.runtime.llama_server.LlamaServerEmbedder``），与 chat 的外部路径同构；
+  模型路径解析统一走 ``resolve_embedding_model_path``（配置 → 约定目录）。
 - 本模块不 import 任何未实现模块。
 """
 
@@ -67,6 +71,27 @@ EXTERNAL_LLAMA_CLI_REL = ("runtime", "llama", "llama-cli.exe")
 #: 外部路径单次请求超时（秒）——含模型冷加载；与前端 300s 请求口径一致。
 EXTERNAL_CHAT_TIMEOUT_S = 300
 
+# ------------------------------------------------------------------ #
+# 外部嵌入路径（20260926_模块0_真实嵌入与向量持久化）                  #
+# ------------------------------------------------------------------ #
+
+#: 外部嵌入路径：llama-server 预编译二进制相对便携根的落点（主进程直管常驻
+#: 子进程 + 本机回环 HTTP /v1/embeddings；实测 dim=1024、冷加载约 3s）。
+EXTERNAL_LLAMA_SERVER_REL = ("runtime", "llama", "llama-server.exe")
+
+#: 嵌入模型约定落点（安装器 [Files] 直落目标，与 manifest install_target 一致）：
+#: ``<root>/data/local_llm/qwen3-embedding-0.6b/*.gguf``。
+EMBEDDING_MODEL_DIR_REL = ("data", "local_llm", "qwen3-embedding-0.6b")
+
+#: 嵌入服务上下文窗口（token）：记忆文本远短于该值；固定值避免配置面膨胀。
+EMBEDDING_SERVER_N_CTX = 2048
+
+#: 外部嵌入服务就绪等待上限（秒）——0.6B Q8 实测冷加载 2.5~3.5s，放宽覆盖慢盘。
+EXTERNAL_EMBED_READY_TIMEOUT_S = 120
+
+#: 外部嵌入单次请求超时（秒）——含批量 32 条（实测 1.55s@CPU）。
+EXTERNAL_EMBED_REQUEST_TIMEOUT_S = 120
+
 #: 离线对话经外部路径生成时的采样温度（与 2026-09-25 实测口径一致）。
 OFFLINE_CHAT_TEMPERATURE = 0.7
 
@@ -86,6 +111,44 @@ class LlamaNotReady(Exception):
     当所请求的模型（嵌入模型或本地小 LLM）尚未成功加载、或调用时不可使用时抛出，
     用于提示调用方先调用 ``load_embedding_model`` / ``load_local_llm`` 完成加载。
     """
+
+
+def resolve_embedding_model_path(config=None, root=None) -> str:
+    """解析嵌入模型 GGUF 路径（单一真相源：配置优先 → 约定目录扫描）。
+
+    顺序（20260926_模块0_真实嵌入与向量持久化）：
+    1) ``embedding.model_path`` 非空：绝对路径原样返回；相对路径按 ``root`` 拼接；
+    2) 约定目录 ``<root>/data/local_llm/qwen3-embedding-0.6b/`` 下的 ``*.gguf``
+       （按文件名排序取首个；存在含 ``q8_0`` 的文件时优先取它）；
+    3) 都没有 → 返回空串（调用方按"嵌入不可用"降级为桩嵌入）。
+
+    :param config: 配置来源（None / dict / ConfigManager，语义同 ``_read_cfg``）。
+    :param root: 应用根覆盖（None 经 frozen-aware 的 ``app_root()`` 推导）。
+    :return: str 模型文件绝对路径；未找到返回 ""。
+    """
+    if root is None:
+        from lite.config.paths import app_root
+
+        root = app_root()
+    configured = str(
+        LlamaRuntime._read_cfg(config, "embedding", "model_path", "") or ""
+    ).strip()
+    if configured:
+        if os.path.isabs(configured):
+            return configured
+        # 相对路径按根拼接并归一化分隔符（配置里写正斜杠也得到规范 Windows 路径）
+        return os.path.normpath(os.path.join(root, configured))
+    model_dir = os.path.join(root, *EMBEDDING_MODEL_DIR_REL)
+    try:
+        candidates = sorted(
+            name for name in os.listdir(model_dir) if name.lower().endswith(".gguf")
+        )
+    except OSError:
+        return ""
+    if not candidates:
+        return ""
+    preferred = [name for name in candidates if "q8_0" in name.lower()]
+    return os.path.join(model_dir, (preferred or candidates)[0])
 
 
 def _import_llama():
@@ -195,6 +258,11 @@ class LlamaRuntime:
         self._emb_model = None
         #: 嵌入模型是否就绪
         self._emb_ready = False
+        #: 外部嵌入服务（llama-server 常驻子进程客户端），未启用为 None
+        #: （20260926_模块0_真实嵌入与向量持久化：冻结态 llama-cpp-python 缺席时的真实路径）
+        self._external_emb = None
+        #: 嵌入向量维度（外部路径启动时探针确定；未确定为 None）
+        self.emb_dim = None
         #: 已加载的本地小 LLM 实例（Llama），未加载为 None
         self._llm = None
         #: 本地小 LLM 是否就绪
@@ -333,7 +401,13 @@ class LlamaRuntime:
     # ------------------------------------------------------------------ #
 
     def load_embedding_model(self, path) -> bool:
-        """加载 qwen3-embedding 嵌入模型。
+        """加载 qwen3-embedding 嵌入模型（in-process 优先，缺席回落外部 llama-server）。
+
+        双路径（20260926_模块0_真实嵌入与向量持久化，与 chat 外部路径同构）：
+        - **in-process**：llama-cpp-python 可用时按原口径构造 ``Llama`` 实例；
+        - **外部**：llama-cpp-python 缺席（冻结产物常态）时拉起
+          ``<root>/runtime/llama/llama-server.exe`` 常驻子进程（就绪 + dim 探针），
+          就绪后 ``_external_emb`` 非空。
 
         Args:
             path: GGUF 模型文件绝对路径。
@@ -341,12 +415,20 @@ class LlamaRuntime:
             bool: 成功加载返回 True；文件缺失 / 加载异常返回 False（进程不崩溃，
                 置 ``_emb_ready=False`` 并在 ``warnings`` 记录降级提示）。
         Raises:
-            RuntimeError: 当 llama-cpp-python 未安装（导入失败）时抛出，
-                提示先执行 pip install llama-cpp-python。
+            RuntimeError: 当 llama-cpp-python 未安装**且**外部 llama-server 路径不可用时抛出。
         """
         if not os.path.exists(path):
             return self._record_load_failure("emb", f"嵌入模型文件不存在：{path}（配置意向：{self._emb_model_name}）")
-        llama_cls = _import_llama()  # 导入失败抛 RuntimeError（提示安装）
+        try:
+            llama_cls = _import_llama()  # 导入失败抛 RuntimeError（提示安装）
+        except RuntimeError as exc:
+            # llama-cpp-python 缺席：改走外部 llama-server 路径（冻结态主路径）
+            if self._try_load_external_embedding(path):
+                return True
+            raise RuntimeError(
+                f"{exc}；外部 llama-server 嵌入路径亦不可用"
+                f"（需 <root>/runtime/llama/llama-server.exe 与嵌入模型 GGUF 同时就位）。"
+            ) from exc
         try:
             self._emb_model = llama_cls(
                 model_path=path, embedding=True, n_gpu_layers=self._emb_n_gpu_layers
@@ -354,6 +436,43 @@ class LlamaRuntime:
         except Exception as exc:  # noqa: BLE001 - 加载异常按降级处理，不崩溃
             self._emb_model = None
             return self._record_load_failure("emb", f"嵌入模型加载失败：{exc}")
+        self._emb_ready = True
+        return True
+
+    def _try_load_external_embedding(self, path) -> bool:
+        """尝试外部 llama-server 嵌入路径（预编译二进制 + 本机回环 HTTP）。
+
+        就位条件：``<root>/runtime/llama/llama-server.exe`` 存在且服务就绪
+        （``ensure_started`` 轮询 /health 至 ok）+ dim 探针成功。任一环节失败仅记录
+        ``warnings`` 并返回 False，由调用方决定抛错或降级。
+
+        :param path: 嵌入模型 GGUF 路径。
+        :return: 就绪返回 True（置 ``_external_emb`` / ``_emb_ready`` / ``emb_dim``）；
+            否则 False（不改就绪状态）。
+        """
+        root = self._app_root()
+        exe = os.path.join(root, *EXTERNAL_LLAMA_SERVER_REL)
+        if not os.path.isfile(exe):
+            self.warnings.append(f"外部嵌入路径不可用：llama-server 不存在（{exe}）")
+            return False
+        try:
+            # 函数内延迟导入：外部嵌入客户端模块仅在实际走该路径时进入导入链
+            from lite.runtime.llama_server import LlamaServerEmbedder
+
+            embedder = LlamaServerEmbedder(
+                exe,
+                str(path),
+                n_gpu_layers=int(self._emb_n_gpu_layers),
+                n_ctx=EMBEDDING_SERVER_N_CTX,
+                ready_timeout=EXTERNAL_EMBED_READY_TIMEOUT_S,
+                request_timeout=EXTERNAL_EMBED_REQUEST_TIMEOUT_S,
+            )
+            embedder.ensure_started()  # 未就绪/进程夭折/超时均抛 RuntimeError
+            self.emb_dim = int(embedder.dim())
+        except Exception as exc:  # noqa: BLE001 - 外部路径失败仅告警，不改动内嵌状态
+            self.warnings.append(f"外部 llama-server 嵌入路径不可用：{exc}")
+            return False
+        self._external_emb = embedder
         self._emb_ready = True
         return True
 
@@ -486,7 +605,7 @@ class LlamaRuntime:
     # ------------------------------------------------------------------ #
 
     def embed(self, texts: list) -> list:
-        """批量文本嵌入（记忆检索用）。
+        """批量文本嵌入（记忆检索用，in-process 与外部 llama-server 同接口）。
 
         Args:
             texts: 文本列表（list[str]）。
@@ -494,11 +613,24 @@ class LlamaRuntime:
             list[list[float]]: 与输入等长的向量列表，维度固定（由模型决定）。
         Raises:
             LlamaNotReady: 嵌入模型未就绪时抛出。
+            RuntimeError: 外部路径服务失败（重启重试后仍失败）时抛出（中文）。
         """
+        if self._external_emb is not None:
+            return self._external_emb.embed(list(texts))
         if not self._emb_ready or self._emb_model is None:
             raise LlamaNotReady("嵌入模型未就绪：请先调用 load_embedding_model 加载模型后再进行文本嵌入。")
         result = self._emb_model.create_embedding(input=list(texts))
         return self._extract_embeddings(result)
+
+    def close(self):
+        """回收外部嵌入服务进程（幂等；in-process 模型无需显式回收）。"""
+        embedder = self._external_emb
+        self._external_emb = None
+        if embedder is not None:
+            try:
+                embedder.close()
+            except Exception:  # noqa: BLE001 - 回收失败不抛（进程随系统回收）
+                pass
 
     def embed_texts(self, texts: list) -> list:
         """embed 的显式别名，便于调用方按语义命名。"""

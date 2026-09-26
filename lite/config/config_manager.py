@@ -61,8 +61,20 @@ DEFAULTS = {
     #: 首启向导状态（首启向导 spec「首次向导状态与升级兼容」）：completed=False 时
     #: 前端展示向导；completed_at 记录完成时刻（ISO 风格字符串，空串表示未完成）。
     "setup": {"completed": False, "completed_at": ""},
-    "embedding": {"model": "qwen3-embedding:0.6b", "runtime": "llama.cpp", "device": "cpu"},
-    "vector": {"backend": "lancedb", "path": "data/lancedb"},
+    #: 嵌入运行时（20260926_模块0_真实嵌入与向量持久化）：model=模型标识；
+    #: model_path=GGUF 路径（绝对路径或相对应用根；空串时按约定目录
+    #: <root>/data/local_llm/qwen3-embedding-0.6b/*.gguf 解析）；
+    #: device=cpu/gpu（gpu 经 embedding.n_gpu_layers 高级键覆盖，缺省 -1 全层卸载）。
+    "embedding": {
+        "model": "qwen3-embedding:0.6b",
+        "runtime": "llama.cpp",
+        "device": "cpu",
+        "model_path": "",
+    },
+    #: 向量库后端（20260926 起默认 sqlite：<data>/memories.db 内持久向量表，
+    #: 检索口径与 InMemoryVectorStore 逐位一致（cosine））；path 仅在
+    #: backend=lancedb（保留旧口径，要求环境装有 lancedb）时作为 LanceDB 目录。
+    "vector": {"backend": "sqlite", "path": "data/lancedb"},
     # device：推理设备开关（"cpu"(默认)/"gpu"）。gpu 时按各引擎能力切 GPU，
     # CUDA 不可用自动回落 cpu（llama 侧全层卸载、torch 侧 resolve_torch_device）。
     "tts": {"engine": "melotts", "voice": "cx-open", "device": "cpu"},

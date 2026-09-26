@@ -74,8 +74,10 @@ LiteCXFC 内部 Event 在调用方线程承载，不占用 HTTP 线程（Task H1
 """
 
 import argparse
+import atexit
 import base64
 import hmac
+import importlib.util
 import json
 import logging
 import os
@@ -269,7 +271,7 @@ if _PROJECT_ROOT not in sys.path:
 from lite.memory.embedding import LiteEmbeddingProvider  # noqa: E402
 from lite.memory.pipeline import MemoryRetrievalPipeline  # noqa: E402
 from lite.memory.storage import MemoryStore  # noqa: E402
-from lite.memory.vector_store import InMemoryVectorStore  # noqa: E402
+from lite.memory.vector_store import InMemoryVectorStore, SQLiteVectorStore  # noqa: E402
 from lite import __version__ as LITE_VERSION  # noqa: E402
 from lite.management.local_agents import AgentManager, AgentNotFound  # noqa: E402
 from lite.management.remote import (  # noqa: E402
@@ -338,6 +340,124 @@ def _resolve_data_dir(data_dir=None) -> str:
     return data_dir or DEFAULT_DATA_DIR
 
 
+def _build_embedding_provider(config):
+    """装配嵌入提供者：真实（llama-server 外部路径）优先，失败降级 64 维哈希桩。
+
+    20260926_模块0_真实嵌入与向量持久化：模型路径经
+    ``resolve_embedding_model_path`` 解析（``embedding.model_path`` 配置优先，
+    否则约定目录 ``<root>/data/local_llm/qwen3-embedding-0.6b/*.gguf``）。真实路径
+    不可用（模型缺失 / llama-server 不可用 / 启动失败）时中文告警并回落桩嵌入——
+    后端启动绝不因此失败。桩嵌入下向量库走内存（哈希向量无持久价值）。
+
+    Args:
+        config: ConfigManager 实例。
+
+    Returns:
+        tuple[EmbeddingProvider, str, dict]: (提供者, 标识 ``"llama"``/``"stub"``,
+            元信息 ``{"dim": int|None, "model_tag": str}``)——元信息供持久向量库
+            ``prepare()`` 校准（换模型 / 换维度时重置索引表）。
+    """
+    # 函数内延迟导入：llama_runtime 导入链不进入本模块顶层导入路径
+    # （与 build_local_chat_runtime 同口径）
+    from lite.runtime.llama_runtime import (
+        LlamaEmbeddingProvider,
+        LlamaRuntime,
+        resolve_embedding_model_path,
+    )
+
+    model_path = resolve_embedding_model_path(config)
+    if not model_path:
+        LOGGER.warning(
+            "未找到嵌入模型 GGUF（embedding.model_path 为空且约定目录 "
+            "<root>/data/local_llm/qwen3-embedding-0.6b/*.gguf 下无文件），"
+            "已降级为哈希桩嵌入（64 维：语义召回退化为词面近似）"
+        )
+        return LiteEmbeddingProvider(dim=64), "stub", {"dim": None, "model_tag": "stub-64"}
+
+    runtime = LlamaRuntime(config=config)
+    try:
+        ready = runtime.load_embedding_model(model_path)
+    except RuntimeError as exc:
+        LOGGER.warning("真实嵌入不可用，已降级为哈希桩嵌入：%s", exc)
+        return LiteEmbeddingProvider(dim=64), "stub", {"dim": None, "model_tag": "stub-64"}
+    if not ready:
+        LOGGER.warning(
+            "真实嵌入模型加载失败（%s），已降级为哈希桩嵌入：%s",
+            model_path, "; ".join(runtime.warnings) or "未知原因",
+        )
+        return LiteEmbeddingProvider(dim=64), "stub", {"dim": None, "model_tag": "stub-64"}
+
+    # 优雅退出回收：llama-server 为常驻子进程（PyInstaller 冻结态无 atexit 保障的
+    # 硬终止路径由 Electron 壳的进程树回收兜底，见 frontend/src/main/main.js）。
+    atexit.register(runtime.close)
+    model_name = str(config.get("embedding", "model", DEFAULTS["embedding"]["model"]) or "")
+    model_tag = f"{model_name}|{os.path.basename(model_path)}"
+    # 运行期可见的就绪证据（本项目未配置 logging handler，INFO 级默认不显示；
+    # 与 [LiteAudio] 同口径用 print 输出，便于装机实跑核对"真嵌入已生效"）
+    print(
+        f"[LiteMemory][INFO] 真实嵌入就绪：llama-server + {os.path.basename(model_path)}"
+        f"（dim={runtime.emb_dim}）"
+    )
+    return (
+        LlamaEmbeddingProvider(runtime),
+        "llama",
+        {"dim": runtime.emb_dim, "model_tag": model_tag},
+    )
+
+
+def _build_vector_store(config, data_dir, embed_kind, embed_meta):
+    """装配向量库：真实嵌入 → SQLite 持久库（默认）；桩嵌入 → 内存库。
+
+    - ``backend=sqlite``（默认）：``SQLiteVectorStore``（与 memories.db 同库，
+      cosine 口径与 InMemoryVectorStore 逐位一致，跨重启持久）；
+    - ``backend=lancedb`` 且依赖可用（仅开发态可选）：``LanceVectorStore``
+      （排序语义为 L2 归一，与生产 cosine 口径不同轨，按显式配置启用）；
+    - ``backend=lancedb`` 但依赖缺失：中文告警后按嵌入类型降级
+      （真实嵌入 → SQLite 持久 / 桩嵌入 → 内存）。
+
+    Args:
+        config: ConfigManager 实例。
+        data_dir: 数据目录（memories.db 所在）。
+        embed_kind: 嵌入标识（``"llama"``/``"stub"``，见 _build_embedding_provider）。
+        embed_meta: 嵌入元信息 ``{"dim", "model_tag"}``（持久库 prepare 校准用）。
+
+    Returns:
+        VectorStore: 向量存储实例（SQLite 路径已完成 prepare 校准；不匹配时已重置）。
+    """
+    backend = str(
+        config.get("vector", "backend", DEFAULTS["vector"]["backend"]) or ""
+    ).strip().lower()
+    if backend == "lancedb":
+        if importlib.util.find_spec("lancedb") is None:
+            if embed_kind == "llama":
+                LOGGER.warning("配置指定 LanceDB 但当前环境不可用，已降级为 SQLite 持久向量库")
+            else:
+                LOGGER.warning("配置指定 LanceDB 但当前环境不可用，已降级为内存向量库")
+        else:
+            try:
+                from lite.memory.vector_store import LanceVectorStore
+
+                store = LanceVectorStore(db_path=os.path.join(data_dir, "lancedb"))
+                LOGGER.warning(
+                    "向量后端按配置使用 LanceDB（开发态可选）：排序语义为 L2 归一，"
+                    "与生产 cosine 口径不同轨"
+                )
+                return store
+            except Exception as exc:  # noqa: BLE001 - 初始化失败降级不阻断启动
+                LOGGER.warning("LanceDB 初始化失败（%s），已降级", exc)
+    if embed_kind == "llama":
+        store = SQLiteVectorStore(
+            db_path=os.path.join(data_dir, "memories.db"),
+            model_tag=str(embed_meta.get("model_tag", "")),
+            dim=embed_meta.get("dim"),
+        )
+        result = store.prepare()
+        if result["action"] == "reset":
+            LOGGER.warning("嵌入模型标识已变化，向量索引已重置（将由启动预热按新模型重建）")
+        return store
+    return InMemoryVectorStore()
+
+
 def build_deps(data_dir=None, config_path=None):
     """组装服务依赖。
 
@@ -360,25 +480,11 @@ def build_deps(data_dir=None, config_path=None):
     # pipeline 内部会把 dedup/permanent_threshold 透传给其持有的 MemoryManager
     config = ConfigManager(config_path=config_path or os.path.join(data_dir, "config.json"))
     store = MemoryStore(db_path=os.path.join(data_dir, "memories.db"))
-    embed = LiteEmbeddingProvider(dim=64)
-    # 批次E（降级透明化，最小面）：读取 vector.backend 配置——InMemoryVectorStore
-    # 为当前装配兜底不变；配置指定 lancedb 但当前环境缺失该依赖（frozen 产物
-    # excludes lancedb 的常规形态）时中文告警，消除静默降级。探测用
-    # find_spec 无副作用（不触发 lancedb 真实导入/连接）；lancedb 实际接线
-    # 属后续装配升级范畴（64 维桩嵌入下切换 LanceDB 会改变检索排序语义）。
-    vector_backend = str(
-        config.get("vector", "backend", DEFAULTS["vector"]["backend"]) or ""
-    ).strip().lower()
-    if vector_backend == "lancedb":
-        import importlib.util
-
-        if importlib.util.find_spec("lancedb") is None:
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "配置指定 LanceDB 但当前环境不可用，已降级为内存向量库"
-            )
-    vector_store = InMemoryVectorStore()
+    # 20260926_模块0_真实嵌入与向量持久化：生产装配＝真实嵌入（llama-server 外部
+    # 路径）+ SQLite 持久向量库；任一环节不可用自动降级（桩嵌入 + 内存向量库），
+    # 后端启动绝不因此失败。
+    embed, embed_kind, embed_meta = _build_embedding_provider(config)
+    vector_store = _build_vector_store(config, data_dir, embed_kind, embed_meta)
     pipeline = MemoryRetrievalPipeline(
         store=store,
         vector_store=vector_store,
@@ -389,6 +495,12 @@ def build_deps(data_dir=None, config_path=None):
             config.get("memory", "permanent_threshold", DEFAULTS["memory"]["permanent_threshold"])
         ),
     )
+    # 持久向量库启动预热（有界，见 pipeline.warmup_vectors）：补建"有记忆无向量"
+    # 条目 + 清理孤儿向量；剩余条目留待下次启动 / 后续写入继续，不长时间阻塞启动。
+    if embed_kind == "llama":
+        stats = pipeline.warmup_vectors()
+        if stats.get("supported") is False:
+            LOGGER.warning("向量库未实现 vector_ids，已跳过启动预热（不影响检索）")
     manager = AgentManager(path=os.path.join(data_dir, "agents.json"))
     #: 遥控控制器：config 驱动（remote.enabled 默认 false），不主动发起真实网络
     remote = RemoteController(config=config)

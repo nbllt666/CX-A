@@ -139,11 +139,24 @@ function waitForBackendHealth() {
   });
 }
 
-/** 回收后端子进程（幂等）。 */
+/**
+ * 回收后端子进程及其后代进程树（幂等）。
+ *
+ * Windows：用 `taskkill /T /F` 结束整棵进程树——后端会拉起常驻
+ * llama-server（记忆嵌入服务，约 600 MB 内存），Node 的 kill() 只终止直接
+ * 子进程，会把它留成孤儿进程（持续占用内存）。
+ * 非 Windows：回落 kill()。
+ */
 function stopBackend() {
   if (!backendProcess) return;
   try {
-    backendProcess.kill();
+    if (process.platform === 'win32' && backendProcess.pid) {
+      spawn('taskkill', ['/pid', String(backendProcess.pid), '/T', '/F'], {
+        windowsHide: true,
+      });
+    } else {
+      backendProcess.kill();
+    }
   } catch {
     /* 进程已退出时忽略 */
   }

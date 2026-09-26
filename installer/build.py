@@ -480,6 +480,12 @@ def build_installer(portable_root, release_dir, version=None):
         "MeloTTS 源码": os.path.join(BUNDLED_DIR, "melotts_src"),
         "nltk 数据": os.path.join(BUNDLED_DIR, "nltk_data"),
         "SenseVoice 模型": os.path.join(BUNDLED_DIR, "sensevoice"),
+        # llama.cpp 运行时（G-12 补检）：installer.iss [Files] 引用 bundled\llama_cpp，
+        # 缺失同样应跳过编译（与"嵌入模型"同口径，避免产出"装完无本地推理"的残缺包）
+        "llama.cpp 运行时": os.path.join(BUNDLED_DIR, "llama_cpp"),
+        # 嵌入模型（20260926_模块0_真实嵌入与向量持久化）：记忆检索真实语义嵌入，
+        # 缺失即跳过安装器编译（避免产出"装完无嵌入"的静默残缺包）
+        "嵌入模型": os.path.join(BUNDLED_DIR, "embedding_model"),
     }
     missing = [name for name, path in required_sources.items() if not os.path.exists(path)]
     if missing:

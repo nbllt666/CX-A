@@ -260,3 +260,169 @@ def test_explicit_top_k_zero_clamped_to_one(tmp_path):
     assert spy.search_top_ks == [2]  # cand_n = max(1, 0) = 1 → 召回 2 条
     pipe.retrieve("probe")
     assert spy.search_top_ks[-1] == 40  # 缺省 20 → 召回 40 条
+
+
+# ---------------------------------------------------------------- 20260926_模块0_真实嵌入与向量持久化
+class _BrokenEmbed(EmbeddingProvider):
+    """抛错嵌入桩：模拟嵌入服务不可用（llama-server 未就绪 / 服务端错误）。"""
+
+    def embed(self, texts):
+        raise RuntimeError("嵌入服务不可用（测试替身）")
+
+
+def test_retrieve_degrades_to_keyword_when_embed_fails(tmp_path):
+    """查询嵌入失败时降级为纯关键词检索：不抛错、词面命中仍可召回、vector_score 全 0。"""
+    pipe = MemoryRetrievalPipeline(
+        store=MemoryStore(db_path=str(tmp_path / "memories.db")),
+        vector_store=InMemoryVectorStore(),
+        embed=LiteEmbeddingProvider(dim=64),
+    )
+    pipe.add("apple fruit sweet")
+    pipe.embed = _BrokenEmbed()  # 装配后嵌入服务掉线
+    res = pipe.retrieve("apple fruit", top_k=5)
+    assert res["memories"], "嵌入失败时应靠关键词召回（旧行为会整链抛错）"
+    assert all(m["vector_score"] == 0.0 for m in res["memories"])
+    assert res["memories"][0]["keyword_score"] > 0
+
+
+def test_add_keeps_memory_when_embed_fails(tmp_path):
+    """写入口嵌入失败不影响记忆落库（仅跳过向量写入，manager 缺省 embed_fn 路径）。"""
+    pipe = MemoryRetrievalPipeline(
+        store=MemoryStore(db_path=str(tmp_path / "memories.db")),
+        vector_store=InMemoryVectorStore(),
+        embed=_BrokenEmbed(),
+    )
+    mem_id = pipe.add("embedding down but memory must persist")
+    assert mem_id is not None
+    assert pipe.store.get(mem_id)["content"] == "embedding down but memory must persist"
+    assert pipe.vector_store.vector_ids() == set()
+
+
+def test_manager_write_path_vectorized_without_explicit_embed_fn(tmp_path):
+    """工具 / 蒸馏写入口（manager.add_memory 未显式传 embed_fn）自动获得向量。"""
+    pipe = MemoryRetrievalPipeline(
+        store=MemoryStore(db_path=str(tmp_path / "memories.db")),
+        vector_store=InMemoryVectorStore(),
+        embed=LiteEmbeddingProvider(dim=64),
+    )
+    mem_id = pipe.manager.add_memory(
+        content="tool write path memory", type="long_term", importance=3
+    )
+    assert mem_id is not None
+    assert str(mem_id) in pipe.vector_store.vector_ids()
+
+
+def test_warmup_backfills_missing_and_prunes_orphans(tmp_path):
+    """预热：补建"有记忆无向量"条目 + 清理孤儿向量；回填后向量检索可用。"""
+    pipe = MemoryRetrievalPipeline(
+        store=MemoryStore(db_path=str(tmp_path / "memories.db")),
+        vector_store=InMemoryVectorStore(),
+        embed=LiteEmbeddingProvider(dim=64),
+    )
+    first = pipe.add("first memory for warmup")
+    second = pipe.add("second memory for warmup")
+    # 模拟"重启后向量丢失 + 遗留孤儿向量"：清空向量并塞入一个已删记忆的残留
+    pipe.vector_store._vectors.clear()
+    pipe.vector_store._metas.clear()
+    pipe.vector_store.upsert("999999", [0.0] * 64)
+
+    stats = pipe.warmup_vectors()
+    assert stats["supported"] is True
+    assert stats["pruned"] == 1
+    assert stats["indexed"] == 2
+    assert stats["remaining"] == 0
+    assert pipe.vector_store.vector_ids() == {str(first), str(second)}
+    assert pipe.retrieve("first memory", top_k=5)["memories"]
+
+
+def test_warmup_budget_zero_stops_before_embedding(tmp_path):
+    """预算耗尽（budget_s=0）时不嵌入：indexed=0、remaining 如实计数（留待下次）。"""
+    store = MemoryStore(db_path=str(tmp_path / "memories.db"))
+    store.create_table()
+    store.add({"type": "long_term", "content": "未向量化的记忆一"})
+    store.add({"type": "long_term", "content": "未向量化的记忆二"})
+    pipe = MemoryRetrievalPipeline(
+        store=store, vector_store=InMemoryVectorStore(), embed=LiteEmbeddingProvider(dim=64)
+    )
+    stats = pipe.warmup_vectors(budget_s=0)
+    assert stats["indexed"] == 0
+    assert stats["remaining"] == 2
+    assert pipe.vector_store.vector_ids() == set()
+
+
+def test_warmup_embed_failure_records_error(tmp_path):
+    """预热中嵌入失败：该批跳过并记 error（W-3 后不再中断整轮），成果保留（不抛错）。"""
+    store = MemoryStore(db_path=str(tmp_path / "memories.db"))
+    store.create_table()
+    store.add({"type": "long_term", "content": "待回填记忆"})
+    pipe = MemoryRetrievalPipeline(
+        store=store, vector_store=InMemoryVectorStore(), embed=_BrokenEmbed()
+    )
+    stats = pipe.warmup_vectors()
+    assert stats["indexed"] == 0
+    assert stats["skipped"] == 1
+    assert stats["remaining"] == 1
+    assert stats["error"] and "嵌入服务不可用" in stats["error"]
+
+
+class _FlakyBatchEmbed(EmbeddingProvider):
+    """按批文本内容选择失败：命中 ``poison`` 的批抛错，其余正常返回（W-3 隔离演练）。"""
+
+    def embed(self, texts):
+        if any("poison" in str(t) for t in texts):
+            raise RuntimeError("模拟坏批（含 poison 条目）")
+        return [[1.0, 0.0] for _ in texts]
+
+
+def test_warmup_skips_bad_batch_and_continues(tmp_path):
+    """W-3：单批失败只跳过该批，后续批继续回填（"一条坏数据毒害整轮"消除）。"""
+    store = MemoryStore(db_path=str(tmp_path / "memories.db"))
+    store.create_table()
+    store.add({"type": "long_term", "content": "good-1"})
+    store.add({"type": "long_term", "content": "poison-bad"})
+    store.add({"type": "long_term", "content": "good-3"})
+    pipe = MemoryRetrievalPipeline(
+        store=store, vector_store=InMemoryVectorStore(), embed=_FlakyBatchEmbed()
+    )
+    stats = pipe.warmup_vectors(batch_size=1)
+    assert stats["indexed"] == 2          # good-1 与 good-3 均回填
+    assert stats["skipped"] == 1          # poison-bad 批被跳过
+    assert stats["remaining"] == 1
+    assert pipe.vector_store.vector_ids() == {"1", "3"}
+
+
+def test_warmup_aborts_after_consecutive_failures(tmp_path):
+    """W-3：连续失败达上限（3 批）才中断——服务整体不可用时不空转。"""
+    from lite.memory.pipeline import WARMUP_MAX_CONSECUTIVE_FAILURES
+
+    store = MemoryStore(db_path=str(tmp_path / "memories.db"))
+    store.create_table()
+    for i in range(10):
+        store.add({"type": "long_term", "content": f"mem-{i}"})
+    pipe = MemoryRetrievalPipeline(
+        store=store, vector_store=InMemoryVectorStore(), embed=_BrokenEmbed()
+    )
+    stats = pipe.warmup_vectors(batch_size=1)
+    assert stats["indexed"] == 0
+    assert stats["skipped"] == WARMUP_MAX_CONSECUTIVE_FAILURES  # 中断前仅尝试 3 批
+    assert stats["remaining"] == 10
+
+
+class _NoIdsStore(InMemoryVectorStore):
+    """未实现 vector_ids 的向量库（模拟可选能力缺失，如 Lance 表不可读）。"""
+
+    def vector_ids(self):
+        return None
+
+
+def test_warmup_unsupported_vector_store_skips(tmp_path):
+    """向量库未实现 vector_ids → supported=False，跳过预热（不影响检索）。"""
+    pipe = MemoryRetrievalPipeline(
+        store=MemoryStore(db_path=str(tmp_path / "memories.db")),
+        vector_store=_NoIdsStore(),
+        embed=LiteEmbeddingProvider(dim=64),
+    )
+    pipe.add("some memory")
+    stats = pipe.warmup_vectors()
+    assert stats["supported"] is False
+    assert stats["indexed"] == 0

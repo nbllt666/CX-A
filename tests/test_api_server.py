@@ -1124,12 +1124,20 @@ def test_build_deps_lancedb_degrade_warning(tmp_path, monkeypatch, caplog):
 
     monkeypatch importlib.util.find_spec 使 "lancedb" 探测为缺失（对应 frozen
     产物 excludes lancedb 形态），验证 build_deps 降级路径：告警可见 +
-    InMemoryVectorStore 兜底不变。
+    InMemoryVectorStore 兜底不变（桩嵌入：哈希向量无持久价值，走内存）。
+
+    20260926_模块0_真实嵌入与向量持久化：默认后端已改为 sqlite，本用例显式写
+    config.json 指定 lancedb 以触发降级分支。
     """
     import importlib.util
     import logging
 
     from lite.memory.vector_store import InMemoryVectorStore
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"vector": {"backend": "lancedb", "path": "data/lancedb"}}),
+        encoding="utf-8",
+    )
 
     real_find_spec = importlib.util.find_spec
 
@@ -1805,6 +1813,89 @@ def test_pet_model_documented_in_tools_usage(api_server):
     _store, _pipeline, base = api_server
     _status, body, _raw = http_get(f"{base}/api/tools")
     assert "GET /api/pet/model" in body["usage"]
+
+
+# ---------------------------------------------------------------- 20260926_模块0_真实嵌入与向量持久化
+class _FakeRealEmbed:
+    """假"真实嵌入"提供者：固定 4 维确定性向量（装配选择断言用，不触真服务）。"""
+
+    def embed(self, texts):
+        return [[1.0, float(len(str(t)) % 5), 0.5, 0.25] for t in texts]
+
+
+def _seed_memories(db_path, contents):
+    """预置若干"历史记忆"（无向量，模拟旧库/换模型后待预热状态）。"""
+    from lite.memory.storage import MemoryStore
+
+    store = MemoryStore(db_path=db_path)
+    store.create_table()
+    for content in contents:
+        store.add({"type": "long_term", "content": content, "agent_id": "default"})
+    store.close()
+
+
+def test_build_deps_real_embedding_uses_sqlite_store_and_warmup(tmp_path, monkeypatch):
+    """真实嵌入可用时：装配 SQLite 持久向量库，且启动预热回填既有记忆向量。"""
+    import lite.server.api_server as api
+    from lite.memory.vector_store import SQLiteVectorStore
+
+    _seed_memories(str(tmp_path / "memories.db"), ["历史记忆一", "历史记忆二"])
+
+    def _fake_builder(config):
+        return _FakeRealEmbed(), "llama", {"dim": 4, "model_tag": "fake|model.gguf"}
+
+    monkeypatch.setattr(api, "_build_embedding_provider", _fake_builder)
+    _store, pipeline, _manager, _remote = api.build_deps(data_dir=str(tmp_path))
+
+    assert isinstance(pipeline.vector_store, SQLiteVectorStore)
+    # 预热已把两条历史记忆回填进持久向量库
+    assert pipeline.vector_store.vector_ids() == {"1", "2"}
+    res = pipeline.retrieve("历史记忆一", top_k=5)
+    assert res["memories"], "预热回填后向量检索应可召回"
+
+
+def test_build_deps_stub_embedding_uses_memory_store(tmp_path, monkeypatch, caplog):
+    """真实嵌入模型缺失（路径解析为空）时：中文告警 + 桩嵌入 + 内存向量库，不阻断启动。"""
+    import logging
+
+    import lite.runtime.llama_runtime as llama_runtime
+    import lite.server.api_server as api
+    from lite.memory.embedding import LiteEmbeddingProvider
+    from lite.memory.vector_store import InMemoryVectorStore
+
+    monkeypatch.setattr(llama_runtime, "resolve_embedding_model_path", lambda *a, **k: "")
+    with caplog.at_level(logging.WARNING, logger="lite.server.api_server"):
+        _store, pipeline, _manager, _remote = api.build_deps(data_dir=str(tmp_path))
+    assert isinstance(pipeline.vector_store, InMemoryVectorStore)
+    assert isinstance(pipeline.embed, LiteEmbeddingProvider)
+    assert any("已降级为哈希桩嵌入" in rec.getMessage() for rec in caplog.records)
+
+
+def test_build_deps_lancedb_degrade_to_sqlite_for_real_embedding(tmp_path, monkeypatch, caplog):
+    """真实嵌入 + 显式 lancedb 且依赖缺失：告警"已降级为 SQLite 持久向量库"。"""
+    import importlib.util
+    import logging
+
+    import lite.server.api_server as api
+    from lite.memory.vector_store import SQLiteVectorStore
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"vector": {"backend": "lancedb", "path": "data/lancedb"}}),
+        encoding="utf-8",
+    )
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util, "find_spec",
+        lambda name, *a, **k: None if name == "lancedb" else real_find_spec(name, *a, **k),
+    )
+    monkeypatch.setattr(
+        api, "_build_embedding_provider",
+        lambda config: (_FakeRealEmbed(), "llama", {"dim": 4, "model_tag": "fake|model.gguf"}),
+    )
+    with caplog.at_level(logging.WARNING, logger="lite.server.api_server"):
+        _store, pipeline, _manager, _remote = api.build_deps(data_dir=str(tmp_path))
+    assert any("已降级为 SQLite 持久向量库" in rec.getMessage() for rec in caplog.records)
+    assert isinstance(pipeline.vector_store, SQLiteVectorStore)
 
 
 

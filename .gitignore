@@ -28,7 +28,8 @@ dist/
 build/
 
 # ===== 开发态运行时环境（便携根布局：runtime/conda、runtime/voice，本地重建） =====
-runtime/
+# 注意：必须锚定为 /runtime/（仅根目录）——未锚定的 runtime/ 会连 lite/runtime/ 一并吞掉（20260926 修复）
+/runtime/
 
 # ===== 测试缓存 =====
 .pytest_cache/

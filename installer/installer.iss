@@ -76,6 +76,11 @@ Source: "{#BundledDir}\sensevoice\*"; DestDir: "{app}\data\SenseVoiceSmall"; Fla
 ; 直接落位最终路径（运行时按 <root>/runtime/llama/llama-cli.exe 推导；见
 ; 20260925_模块0_llama二进制随包分发.md），不进便携 zip；本地小 LLM 模型不由本安装集携带。
 Source: "{#BundledDir}\llama_cpp\*"; DestDir: "{app}\runtime\llama"; Flags: recursesubdirs createallsubdirs ignoreversion
+; 嵌入模型（约 609 MB，Qwen3-Embedding-0.6B-Q8_0.gguf，1024 维）：记忆检索真实语义嵌入
+; （主进程拉起 runtime/llama/llama-server.exe 常驻子进程经 /v1/embeddings 取向量），
+; 直接落位最终路径（运行时按 <root>/data/local_llm/qwen3-embedding-0.6b/*.gguf 解析；
+; 见 .trae/documents/20260926_模块0_真实嵌入与向量持久化.md），不进便携 zip。
+Source: "{#BundledDir}\embedding_model\*"; DestDir: "{app}\data\local_llm\qwen3-embedding-0.6b"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

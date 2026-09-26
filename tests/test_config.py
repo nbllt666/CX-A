@@ -59,12 +59,16 @@ def test_defaults_values():
         "source": "modelscope",
         "device": "cpu",
     }
+    # embedding/vector（20260926_模块0_真实嵌入与向量持久化）：新增 model_path
+    # 覆盖键（空串＝按约定目录解析）；向量后端默认由 lancedb 改为 sqlite（持久
+    # 向量表落 memories.db，cosine 口径与 InMemory 一致；lancedb 为保留旧口径）
     assert DEFAULTS["embedding"] == {
         "model": "qwen3-embedding:0.6b",
         "runtime": "llama.cpp",
         "device": "cpu",
+        "model_path": "",
     }
-    assert DEFAULTS["vector"] == {"backend": "lancedb", "path": "data/lancedb"}
+    assert DEFAULTS["vector"] == {"backend": "sqlite", "path": "data/lancedb"}
     assert DEFAULTS["tts"] == {"engine": "melotts", "voice": "cx-open", "device": "cpu"}
     assert DEFAULTS["asr"] == {"engine": "sensevoice", "device": "cpu"}
     assert DEFAULTS["vad"] == {"mode": "webrtc"}

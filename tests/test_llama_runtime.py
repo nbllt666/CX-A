@@ -574,3 +574,172 @@ def test_external_priority_only_when_llama_cpp_missing(tmp_path, monkeypatch, ll
     rt = LlamaRuntime(config=None, root=str(root))
     assert rt.load_local_llm(llm_model) is True
     assert rt._llm is not None and rt._external_client is None
+
+
+# ------------------------------------------------------------------ #
+# 6. 外部嵌入路径（20260926_模块0_真实嵌入与向量持久化）               #
+# ------------------------------------------------------------------ #
+
+from lite.runtime.llama_runtime import EMBEDDING_SERVER_N_CTX  # noqa: E402
+
+
+class _StubServerEmbedder:
+    """假 llama-server 嵌入器：记录构造参数与调用，可切"启动失败"模式。"""
+
+    instances = []
+    start_value = True
+
+    def __init__(self, exe_path, model_path, **kwargs):
+        self.exe_path = exe_path
+        self.model_path = model_path
+        self.kwargs = kwargs
+        self.closed = False
+        self.embed_calls = []
+        _StubServerEmbedder.instances.append(self)
+
+    def ensure_started(self):
+        """按类级开关决定就绪或抛错（不触真实进程）。"""
+        if not _StubServerEmbedder.start_value:
+            raise RuntimeError("就绪超时（测试替身）")
+
+    def dim(self, probe_text="ping"):
+        """固定维度探针。"""
+        return 4
+
+    def embed(self, texts):
+        """返回固定 4 维向量并按输入保序。"""
+        self.embed_calls.append(list(texts))
+        return [[1.0, 0.5, 0.25, 0.0] for _ in texts]
+
+    def close(self):
+        """记录关闭（幂等断言用）。"""
+        self.closed = True
+
+
+@pytest.fixture
+def external_embed_env(tmp_path, monkeypatch):
+    """外部嵌入环境：llama-server 落位 + 替身嵌入器 + llama_cpp 缺席（确定性）。"""
+    import lite.runtime.llama_runtime as llama_mod
+    import lite.runtime.llama_server as llama_server_mod
+
+    root = tmp_path / "portable"
+    (root / "runtime" / "llama").mkdir(parents=True)
+    (root / "runtime" / "llama" / "llama-server.exe").write_bytes(b"stub-server")
+    model = root / "embedding.gguf"
+    model.write_bytes(b"stub-model")
+
+    monkeypatch.setattr(llama_server_mod, "LlamaServerEmbedder", _StubServerEmbedder)
+
+    def _missing_llama():
+        raise RuntimeError("llama-cpp-python 未安装：请先执行 pip install llama-cpp-python")
+
+    monkeypatch.setattr(llama_mod, "_import_llama", _missing_llama)
+    _StubServerEmbedder.instances = []
+    _StubServerEmbedder.start_value = True
+    return root, model
+
+
+def test_external_embedding_path_loads_and_embeds(external_embed_env):
+    """llama_cpp 缺席时嵌入走外部 llama-server：就绪置位、dim 探针、embed 保序透传。"""
+    root, model = external_embed_env
+    rt = LlamaRuntime(config={"embedding": {"device": "gpu"}}, root=str(root))
+    assert rt.load_embedding_model(str(model)) is True
+    assert rt._external_emb is not None and rt._emb_model is None
+    assert rt.emb_dim == 4
+
+    vecs = rt.embed(["你好", "世界"])
+    assert len(vecs) == 2 and all(len(v) == 4 for v in vecs)
+    embedder = rt._external_emb
+    assert embedder.embed_calls[-1] == ["你好", "世界"]
+    assert embedder.exe_path.endswith("llama-server.exe")
+    assert embedder.model_path == str(model)
+    assert embedder.kwargs["n_gpu_layers"] == GPU_LAYERS_ALL  # device=gpu 推导 -1
+    assert embedder.kwargs["n_ctx"] == EMBEDDING_SERVER_N_CTX
+
+
+def test_external_embedding_close_releases_server(external_embed_env):
+    """close 回收外部嵌入服务（幂等：重复调用不抛错）。"""
+    root, model = external_embed_env
+    rt = LlamaRuntime(config=None, root=str(root))
+    assert rt.load_embedding_model(str(model)) is True
+    embedder = rt._external_emb
+    rt.close()
+    assert embedder.closed is True
+    assert rt._external_emb is None
+    rt.close()  # 幂等
+
+
+def test_external_embedding_start_failure_raises_runtime_error(external_embed_env):
+    """外部服务启动失败且 in-process 不可用：维持 RuntimeError 且不误置就绪。"""
+    root, model = external_embed_env
+    _StubServerEmbedder.start_value = False
+    rt = LlamaRuntime(config=None, root=str(root))
+    with pytest.raises(RuntimeError) as ei:
+        rt.load_embedding_model(str(model))
+    assert "外部 llama-server 嵌入路径亦不可用" in str(ei.value)
+    assert rt._external_emb is None and rt._emb_ready is False
+    assert any("外部 llama-server 嵌入路径不可用" in w for w in rt.warnings)
+
+
+def test_external_embedding_missing_binary_raises_runtime_error(tmp_path, monkeypatch, external_embed_env):
+    """llama_cpp 缺席且 llama-server 不在位：维持 RuntimeError（不静默降级）。"""
+    _root, model = external_embed_env
+    empty_root = tmp_path / "no-binaries"
+    empty_root.mkdir()
+    rt = LlamaRuntime(config=None, root=str(empty_root))
+    with pytest.raises(RuntimeError) as ei:
+        rt.load_embedding_model(str(model))
+    assert "外部 llama-server 嵌入路径亦不可用" in str(ei.value)
+
+
+def test_external_embedding_priority_only_when_llama_cpp_missing(tmp_path, monkeypatch, emb_model, fake_llama_cpp):
+    """llama_cpp 可用时优先 in-process（外部嵌入路径不抢占）：既有行为不受宿主二进制影响。"""
+    import lite.runtime.llama_server as llama_server_mod
+
+    root = tmp_path / "portable"
+    (root / "runtime" / "llama").mkdir(parents=True)
+    (root / "runtime" / "llama" / "llama-server.exe").write_bytes(b"stub-server")
+    monkeypatch.setattr(llama_server_mod, "LlamaServerEmbedder", _StubServerEmbedder)
+
+    rt = LlamaRuntime(config=None, root=str(root))
+    assert rt.load_embedding_model(emb_model) is True
+    assert rt._emb_model is not None and rt._external_emb is None
+
+
+# ------------------------------------------------------------------ #
+# 7. 嵌入模型路径解析（resolve_embedding_model_path）                  #
+# ------------------------------------------------------------------ #
+
+
+def test_resolve_embedding_model_path_config_wins(tmp_path):
+    """配置 model_path 优先：绝对路径原样、相对路径按根拼接。"""
+    from lite.runtime.llama_runtime import resolve_embedding_model_path
+
+    root = tmp_path / "root"
+    root.mkdir()
+    abs_target = tmp_path / "abs-model.gguf"
+    assert resolve_embedding_model_path(
+        {"embedding": {"model_path": str(abs_target)}}, root=str(root)
+    ) == str(abs_target)
+    assert resolve_embedding_model_path(
+        {"embedding": {"model_path": "installer/bundled/model.gguf"}}, root=str(root)
+    ) == str(root / "installer" / "bundled" / "model.gguf")
+
+
+def test_resolve_embedding_model_path_convention_dir_prefers_q8(tmp_path):
+    """约定目录扫描：多个 gguf 时优先含 q8_0 的文件。"""
+    from lite.runtime.llama_runtime import resolve_embedding_model_path
+
+    model_dir = tmp_path / "data" / "local_llm" / "qwen3-embedding-0.6b"
+    model_dir.mkdir(parents=True)
+    (model_dir / "Qwen3-Embedding-0.6B-f16.gguf").write_bytes(b"stub")
+    (model_dir / "Qwen3-Embedding-0.6B-Q8_0.gguf").write_bytes(b"stub")
+    resolved = resolve_embedding_model_path(None, root=str(tmp_path))
+    assert resolved.endswith("Qwen3-Embedding-0.6B-Q8_0.gguf")
+
+
+def test_resolve_embedding_model_path_missing_returns_empty(tmp_path):
+    """约定目录不存在 / 无 gguf：返回空串（调用方按不可用降级）。"""
+    from lite.runtime.llama_runtime import resolve_embedding_model_path
+
+    assert resolve_embedding_model_path(None, root=str(tmp_path)) == ""

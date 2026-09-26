@@ -1,8 +1,8 @@
 {
   "schema": "cxa-installer-manifest/v1",
   "version": "0.1.0",
-  "generated_at": "2026-08-26",
-  "description": "CX-A 安装器组件清单——记录内置组件（builtin）与可选组件（optional）的安装态映射。Electron 壳与 Python 后端由 build.py 组装流程直接落位，不在本清单登记。真实二进制当前为开发态，由安装器做结构初始化 + 引导流程。",
+  "generated_at": "2026-09-26",
+  "description": "CX-A 安装器组件清单——记录内置组件（builtin）与可选/运行时组件（optional/runtime）的安装态映射。Electron 壳与 Python 后端由 build.py 组装流程直接落位，不在本清单登记。runtime 类组件（llama.cpp / 嵌入模型 / SenseVoice / conda 与语音侧车）由 installer.iss [Files] 在安装期直落最终路径；builtin 类组件在组装期由 bundled/ 拷入便携根并随 zip 分发。",
   "components": [
     {
       "name": "llama.cpp",
@@ -14,19 +14,19 @@
     },
     {
       "name": "qwen3-embedding:0.6b (GGUF)",
-      "key": "qwen3_embedding",
-      "size_estimate": "约 400 MB",
-      "status": "builtin",
+      "key": "embedding_model",
+      "size_estimate": "约 609 MB",
+      "status": "runtime",
       "install_target": "data/local_llm/qwen3-embedding-0.6b",
-      "notes": "本地嵌入模型，对齐 config.embedding.model。"
+      "notes": "记忆检索嵌入模型 Qwen3-Embedding-0.6B-Q8_0.gguf（1024 维，对齐 config.embedding.model）。status=runtime：不进便携 zip、不参与 bundled 拷贝，由 installer.iss [Files] 从 bundled/embedding_model 直接落位 data/local_llm/qwen3-embedding-0.6b（装机即用，无需联网下载）；运行时由主进程拉起 runtime/llama/llama-server.exe 常驻子进程经本机 HTTP /v1/embeddings 取向量（见 .trae/documents/20260926_模块0_真实嵌入与向量持久化.md）。"
     },
     {
       "name": "LanceDB",
       "key": "lancedb",
       "size_estimate": "约 50 MB",
-      "status": "builtin",
+      "status": "optional",
       "install_target": "data/lancedb",
-      "notes": "向量数据库后端（对齐 config.vector.backend）。"
+      "notes": "可选向量后端（开发态）。20260926_模块0_真实嵌入与向量持久化 起，生产装配默认使用 SQLite 持久向量库（config.vector.backend=sqlite，向量表落 memories.db，cosine 口径与内存实现一致）；本组件不随安装包分发，仅在显式配置 backend=lancedb 且环境装有 lancedb 时启用（其排序语义为 L2 归一，与生产口径不同轨）。"
     },
     {
       "name": "MeloTTS + CX-OPEN 音色",

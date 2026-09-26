@@ -98,69 +98,85 @@ def test_verify_components_after_ensure_reduces_warnings(tmp_path):
 
 
 def test_verify_components_requires_nonempty_dir(tmp_path):
-    """HP1：目录型组件须非空才算已安装——空占位目录不应误判为已装。"""
+    """HP1：目录型组件须非空才算已安装——空占位目录不应误判为已装。
+
+    20260926_模块0_真实嵌入与向量持久化：lancedb 组件已改 optional（生产后端改
+    SQLite 持久向量库），本用例改用 melotts（builtin 目录型组件，落位
+    data/voices/cx-open）验证同一口径。
+    """
     root = str(tmp_path)
     bootstrap.ensure_dirs(root)
 
-    # data/lancedb 为空目录：LanceDB 组件应报"待装态"
+    # data/voices/cx-open 为空目录：MeloTTS 组件应报"待装态"
     problems = bootstrap.verify_components(root)
-    assert any("lancedb" in p and "待装态" in p for p in problems)
+    assert any("data/voices/cx-open" in p and "待装态" in p for p in problems)
 
     # 放入一个文件后视为已安装，该组件不再报待装态
-    with open(os.path.join(root, "data", "lancedb", "vectors-0001.lance"), "w", encoding="utf-8") as fh:
-        fh.write("user-vector-data")
+    voice_dir = os.path.join(root, "data", "voices", "cx-open")
+    os.makedirs(voice_dir, exist_ok=True)
+    with open(os.path.join(voice_dir, "config.json"), "w", encoding="utf-8") as fh:
+        fh.write("{}")
     problems_after = bootstrap.verify_components(root)
-    assert not any("data/lancedb" in p for p in problems_after)
+    assert not any("data/voices/cx-open" in p for p in problems_after)
 
 
 # ------------------------------------------------------------------ #
 # HP1：install() 不得擦除既有运行数据                                  #
 # ------------------------------------------------------------------ #
 
-def test_install_preserves_existing_nonempty_lancedb(tmp_path, monkeypatch, capsys):
-    """预置非空 data/lancedb 后重跑 install()：既有向量库数据不被清空、内置源不覆盖进去。"""
+def test_install_preserves_existing_nonempty_voice_dir(tmp_path, monkeypatch, capsys):
+    """预置非空 data/voices/cx-open 后重跑 install()：既有音色数据不被清空、内置源不覆盖进去。
+
+    20260926_模块0_真实嵌入与向量持久化：lancedb 组件已改 optional（不再参与
+    bundled 拷贝），本用例改用 melotts（builtin 目录型组件）验证"运行数据保护"口径。
+    """
     root = str(tmp_path / "instroot")
     os.makedirs(root)
     bootstrap.ensure_dirs(root)
 
-    lancedb_dir = os.path.join(root, "data", "lancedb")
-    user_table = os.path.join(lancedb_dir, "vectors-0001.lance")
-    with open(user_table, "w", encoding="utf-8") as fh:
-        fh.write("user-vector-data")
+    voice_dir = os.path.join(root, "data", "voices", "cx-open")
+    os.makedirs(voice_dir, exist_ok=True)
+    user_ckpt = os.path.join(voice_dir, "ckpt.txt")
+    with open(user_ckpt, "w", encoding="utf-8") as fh:
+        fh.write("user-voice-data")
 
     # 构造假的内置组件源并替换 BUNDLED_DIR：验证"有源可拷"时同样跳过覆盖
     bundled_root = tmp_path / "bundled"
-    fake_lancedb_src = bundled_root / "lancedb"
-    fake_lancedb_src.mkdir(parents=True)
-    (fake_lancedb_src / "lancedb.bin").write_text("builtin-payload", encoding="utf-8")
+    fake_src = bundled_root / "melotts"
+    fake_src.mkdir(parents=True)
+    (fake_src / "melotts.bin").write_text("builtin-payload", encoding="utf-8")
     monkeypatch.setattr(bootstrap, "BUNDLED_DIR", str(bundled_root))
 
     bootstrap.install(root)
 
     # 用户数据原样保留，内置载荷未被写入
-    assert os.path.exists(user_table)
-    with open(user_table, encoding="utf-8") as fh:
-        assert fh.read() == "user-vector-data"
-    assert not os.path.exists(os.path.join(lancedb_dir, "lancedb.bin"))
+    assert os.path.exists(user_ckpt)
+    with open(user_ckpt, encoding="utf-8") as fh:
+        assert fh.read() == "user-voice-data"
+    assert not os.path.exists(os.path.join(voice_dir, "melotts.bin"))
     # 告警提示已输出
     assert "检测到已有运行数据" in capsys.readouterr().out
 
 
 def test_install_fresh_empty_data_dir_still_receives_assets(tmp_path, monkeypatch):
-    """普通全新落位行为不变：空 data/lancedb 重跑 install() 后内置组件正常落位。"""
+    """普通全新落位行为不变：空 data/voices/cx-open 重跑 install() 后内置组件正常落位。
+
+    20260926_模块0_真实嵌入与向量持久化：lancedb 组件已改 optional，本用例改用
+    melotts（builtin 目录型组件）验证同一落位口径。
+    """
     root = str(tmp_path / "freshroot")
     os.makedirs(root)
-    bootstrap.ensure_dirs(root)  # 预建空的 data/lancedb 占位
+    bootstrap.ensure_dirs(root)  # 预建空的 data/voices（cx-open 由本用例预建为空占位）
 
     bundled_root = tmp_path / "bundled"
-    fake_src = bundled_root / "lancedb"
+    fake_src = bundled_root / "melotts"
     fake_src.mkdir(parents=True)
-    (fake_src / "lancedb.bin").write_text("builtin-payload", encoding="utf-8")
+    (fake_src / "melotts.bin").write_text("builtin-payload", encoding="utf-8")
     monkeypatch.setattr(bootstrap, "BUNDLED_DIR", str(bundled_root))
 
     bootstrap.install(root)
 
-    assert os.path.isfile(os.path.join(root, "data", "lancedb", "lancedb.bin"))
+    assert os.path.isfile(os.path.join(root, "data", "voices", "cx-open", "melotts.bin"))
     assert not any(p.suffix == ".tmp" for p in (tmp_path / "freshroot").rglob("*"))
 
 
@@ -664,6 +680,10 @@ def test_build_skip_electron_rejects_incomplete_artifacts(tmp_path, monkeypatch)
     os.makedirs(work_dist, exist_ok=True)
     with open(os.path.join(work_dist, "backend.exe"), "wb") as fh:
         fh.write(b"fake-backend")
+    # 20260926：本用例只校验便携根组装结果，安装器编译为副作用——若走真实 ISCC
+    # 会对 installer/bundled 全量资产做分钟级 lzma 编译（本轮起还含 649MB 嵌入模型）。
+    # 屏蔽编译器探测，让安装器步骤按"未检测到编译器"路径快速跳过（产物断言不受影响）。
+    monkeypatch.setattr(build_mod, "find_iscc", lambda: None)
     build_mod.main([
         "--skip-frontend", "--skip-electron", "--skip-backend", "--skip-zip",
         "--output", alt_out,
@@ -1242,6 +1262,9 @@ def test_build_installer_compiles_with_defines(tmp_path, monkeypatch):
     (bundled / "melotts_src").mkdir()
     (bundled / "nltk_data").mkdir()
     (bundled / "sensevoice").mkdir()
+    # 20260926：随包运行时源清单新增"嵌入模型"与"llama.cpp 运行时"（缺失即跳过编译）
+    (bundled / "embedding_model").mkdir()
+    (bundled / "llama_cpp").mkdir()
     iscc = tmp_path / "ISCC.exe"
     iscc.write_bytes(b"fake")
     monkeypatch.setattr(build_mod, "find_iscc", lambda: str(iscc))
