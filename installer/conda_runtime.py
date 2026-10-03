@@ -302,10 +302,22 @@ VOICE_MELOTTS_PACKAGES = (
     "g2pkk>=0.1.1",
     "gruut[de,es,fr]==2.2.3",
     "six",
+    # —— TTS ORT 加速（2026-10-01）：``ml_dtypes==0.5.4`` 钉版兼容 numpy 1.26.4
+    #    （0.6.x 要求 numpy>=2，会诱发 resolver 升级 numpy）。
+    #    ORT 变体包（onnxruntime / -gpu / -directml）**不再硬编码**于此——改由
+    #    ``bootstrap.resolve_ort_package`` 按加速画像分叉装配（有核显 → DirectML；
+    #    无核显 N 卡 → GPU；无核显 A/Intel → DirectML；无 GPU → CPU）。
+    #    见 20261001_模块0_全组件加速双模式.md §2.1 ——
+    "ml_dtypes==0.5.4",
 )
 #: ASR 引擎本体（SenseVoice 经 funasr 调用）。版本对齐试装环境实测线（1.4.16）；
 #: 其运行依赖 torch / torchaudio（由 GPU 依赖链先行装好，此处不再重复钉版本）。
 VOICE_ASR_PACKAGES = ("funasr==1.4.16",)
+#: ASR ONNX 运行时（20261002 批 B：SenseVoice ONNX 优先路径，torch 回退）。
+#: 版本对齐试装环境实测线（0.4.3）；其依赖 onnxruntime 由 ORT 变体分叉装配
+#: 先行提供（同一 import 名互斥，此处不重复钉），kaldi-native-fbank 由 pip
+#: 自动解析（镜像可拉）。
+VOICE_ASR_ONNX_PACKAGES = ("funasr-onnx==0.4.3",)
 #: sidecar **不装**的包：Windows 长路径墙导致 llama-cpp-python 必然安装失败
 #: （规划 §四-15），本地推理改走 llama.cpp 预编译二进制（llama-cli / llama-server）。
 VOICE_SKIPPED_PACKAGES = ("llama-cpp-python",)
@@ -331,13 +343,16 @@ def rewrite_pip_command(command_line, env_python):
     return None
 
 
-def install_voice_dependencies(root, recommend, cuda_version=None, channel=None, runner=None):
+def install_voice_dependencies(root, recommend, cuda_version=None, channel=None, runner=None,
+                               has_igpu=None, profile=None):
     """在 sidecar 环境内安装推理依赖（GPU 探测分叉）与语音引擎依赖（MeloTTS 链路）。
 
     命令装配保持单一真相源：推理依赖复用
     ``bootstrap.build_gpu_dependency_commands``（cuda → torch / llama-cpp cu128 链；
-    cpu → CPU 轮子；探测失败由调用方降级传入 ``cpu``），语音链路追加
-    :data:`VOICE_MELOTTS_PACKAGES` 与随包 MeloTTS 源码（``--no-deps`` 安装）。
+    cpu → CPU 轮子；探测失败由调用方降级传入 ``cpu``），**ORT 变体包按加速画像
+    分叉装配**（有核显 → DirectML；无核显 N 卡 → GPU；无核显 A/Intel → DirectML；
+    无 GPU → CPU——同一 import 名互斥，不再随 cuda 分支捆绑 ``onnxruntime-gpu``）；
+    语音链路追加 :data:`VOICE_MELOTTS_PACKAGES` 与随包 MeloTTS 源码（``--no-deps``）。
 
     逐条执行、失败仅告警（不抛、不阻断，与既有安装口径一致）。
 
@@ -348,8 +363,10 @@ def install_voice_dependencies(root, recommend, cuda_version=None, channel=None,
         经镜像追加索引；torch / llama-cpp-python 专用源不受影响（Task 9 口径）。
         缺省 ``None`` 时回落 :data:`bootstrap.DEFAULT_CHANNEL`（镜像）。
     :param runner: 命令执行器注入（测试 mock 入口）；缺省 :func:`default_runner`。
+    :param has_igpu: 是否含核显（画像显式传入）；与 ``profile`` 二选一。
+    :param profile: 硬件画像 dict（优先于 ``has_igpu``）。
     :return: dict —— installed / skipped / reason / commands（已执行命令清单）/
-        errors（失败条目列表）。
+        errors（失败条目列表）/ ort_package（本次分叉装配的 ORT 变体）。
     """
     from installer import bootstrap  # 延迟导入：避免与 bootstrap 的潜在循环依赖
 
@@ -359,13 +376,27 @@ def install_voice_dependencies(root, recommend, cuda_version=None, channel=None,
         _log_warn("语音 sidecar 环境不存在，跳过语音依赖安装（不影响主安装）")
         return {
             "installed": False, "skipped": True, "reason": "env-missing",
-            "commands": [], "errors": [],
+            "commands": [], "errors": [], "ort_package": None,
         }
+
+    # ORT 分叉画像：显式入参优先；未提供时仅在无注入 runner（生产默认链）时真实探测，
+    # 注入 runner（测试替身）时按无核显保守继续，避免污染注入通道。
+    ort_profile = profile
+    if not isinstance(ort_profile, dict):
+        if has_igpu is not None:
+            ort_profile = {"recommend": recommend, "has_igpu": bool(has_igpu)}
+        elif runner is None:
+            detected_igpu, _dgpu_vendor = _detect_gpu_inventory(None)
+            ort_profile = {"recommend": recommend, "has_igpu": detected_igpu}
+        else:
+            ort_profile = {"recommend": recommend, "has_igpu": False}
 
     resolved_channel = channel if channel is not None else bootstrap.DEFAULT_CHANNEL
     index_url = bootstrap.pip_index_url(resolved_channel)
     commands = []
-    for line in bootstrap.build_gpu_dependency_commands(recommend, cuda_version, channel=channel):
+    for line in bootstrap.build_gpu_dependency_commands(
+        recommend, cuda_version, channel=channel, profile=ort_profile
+    ):
         # sidecar 跳过 llama-cpp-python（必然失败的已知墙，见 VOICE_SKIPPED_PACKAGES）
         if not line.startswith("#") and any(pkg in line for pkg in VOICE_SKIPPED_PACKAGES):
             _log_info(f"[语音依赖] 跳过 {line.split()[2]}（改走 llama.cpp 预编译二进制，见规划 §四-15）")
@@ -384,6 +415,12 @@ def install_voice_dependencies(root, recommend, cuda_version=None, channel=None,
         commands.append(f"pip install {asr_packages} -i {index_url}")
     else:
         commands.append(f"pip install {asr_packages}")
+    # ASR ONNX 运行时（20261002 批 B）：SenseVoice ONNX 优先路径（torch 回退）
+    asr_onnx_packages = " ".join(VOICE_ASR_ONNX_PACKAGES)
+    if index_url:
+        commands.append(f"pip install {asr_onnx_packages} -i {index_url}")
+    else:
+        commands.append(f"pip install {asr_onnx_packages}")
     melotts_src = find_bundled_source(root, MELOTTS_SRC_DIR_NAME)
     if melotts_src and os.path.isdir(melotts_src):
         suffix = f" -i {index_url}" if index_url else ""
@@ -418,6 +455,7 @@ def install_voice_dependencies(root, recommend, cuda_version=None, channel=None,
         "installed": installed, "skipped": False,
         "reason": "" if installed else ("partial-failure" if executed else "no-commands"),
         "commands": executed, "errors": errors,
+        "ort_package": bootstrap.resolve_ort_package(ort_profile),
     }
 
 
@@ -607,6 +645,138 @@ def _detect_gpu(runner=None):
     )
 
 
+def _detect_gpu_inventory(runner=None):
+    """检测 GPU 画像增量，返回 ``(has_igpu, dgpu_vendor)``；任何异常降级无核显。
+
+    探测核心为 ``lite.runtime.hardware_profile.probe_gpu_inventory``（唯一真相源，
+    经 :mod:`installer.gpu_detect` 薄适配的增量方法），与首启向导同一实现。
+    """
+    try:
+        from installer.gpu_detect import GpuDetector
+    except ImportError:  # pragma: no cover - CLI 直跑 / 冻结态包上下文差异兜底
+        from gpu_detect import GpuDetector
+
+    try:
+        summary = GpuDetector(runner=runner).detect_inventory()
+    except Exception as exc:  # noqa: BLE001 - 枚举失败按无核显保守继续
+        _log_warn(f"GPU 清单枚举失败（按无核显继续）：{type(exc).__name__}: {exc}")
+        return False, None
+    return bool(summary.get("has_igpu")), summary.get("dgpu_vendor")
+
+
+#: 方案落盘的目标键：``accel_plan`` 产出的点分键 → ``config.json`` 的 (段, 键)。
+#: （20261002 批 A：追加 local_llm.backend / embedding.backend 两键。）
+_ACCEL_PLAN_KEYS = (
+    ("accel.mode", ("accel", "mode")),
+    ("tts.accel", ("tts", "accel")),
+    ("tts.accel_device", ("tts", "accel_device")),
+    ("asr.device", ("asr", "device")),
+    ("local_llm.device", ("local_llm", "device")),
+    ("local_llm.backend", ("local_llm", "backend")),
+    ("embedding.device", ("embedding", "device")),
+    ("embedding.backend", ("embedding", "backend")),
+)
+
+
+def apply_accel_plan(root, profile=None, config_path=None):
+    """把加速方案（模式 + 各组件落点）**保守**写入 ``<root>/config.json``。
+
+    口径（spec「安装链」/ 变更文档 §2.2）：**裸 JSON 保守读改**——
+
+    - 文件不存在 → 跳过并告警（不新建）；
+    - 键已存在 → 不覆盖（尊重用户 / 向导显式配置）；
+    - 读取 / 写入异常 → 仅告警不阻断（写入走临时文件 + ``os.replace`` 原子替换）。
+
+    决策复用 :func:`lite.runtime.hardware_profile.accel_plan` /
+    :func:`~lite.runtime.hardware_profile.derive_default_mode`（唯一真相源）。
+
+    :param root: 安装根（便携根）。
+    :param profile: 硬件画像 dict；缺省（None）表示无画像，跳过落盘。
+    :param config_path: 目标配置文件绝对路径；缺省 ``<root>/config.json``。
+    :return: dict —— applied（已写入键）/ existing（键已存在跳过）/ plan（决策产物）/
+        mode / path / applied_ok / reason。
+    """
+    root = root or PROJECT_ROOT
+    path = config_path or os.path.join(root, "config.json")
+    result = {
+        "applied": [], "existing": [], "plan": {}, "mode": None,
+        "path": path, "applied_ok": False, "reason": "",
+    }
+    if not isinstance(profile, dict):
+        result["reason"] = "profile-missing"
+        _log_warn("加速方案落盘跳过：缺少硬件画像（不影响主安装）")
+        return result
+
+    try:
+        from lite.runtime.hardware_profile import accel_plan, derive_default_mode
+    except Exception as exc:  # noqa: BLE001 - 方案器不可用则跳过，不阻断
+        result["reason"] = "planner-unavailable"
+        _log_warn(f"加速方案器不可用（跳过落盘）：{type(exc).__name__}: {exc}")
+        return result
+
+    try:
+        mode = derive_default_mode(profile)
+        plan = accel_plan(profile, mode)
+    except Exception as exc:  # noqa: BLE001 - 决策异常仅告警
+        result["reason"] = "plan-failed"
+        _log_warn(f"加速方案决策失败（跳过落盘）：{type(exc).__name__}: {exc}")
+        return result
+    result["mode"] = mode
+    result["plan"] = plan
+
+    if not os.path.isfile(path):
+        result["reason"] = "config-missing"
+        _log_warn(f"config.json 不存在（跳过加速方案落盘）：{path}")
+        return result
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            raise ValueError("config.json 顶层不是对象")
+    except Exception as exc:  # noqa: BLE001 - 读取失败仅告警
+        result["reason"] = "config-unreadable"
+        _log_warn(f"config.json 读取失败（跳过加速方案落盘）：{type(exc).__name__}: {exc}")
+        return result
+
+    try:
+        for plan_key, (section, key) in _ACCEL_PLAN_KEYS:
+            if plan_key not in plan:
+                continue
+            node = data.get(section)
+            if not isinstance(node, dict):
+                node = {}
+                data[section] = node
+            if key in node:
+                result["existing"].append(plan_key)  # 键已存在：不覆盖（尊重显式配置）
+                continue
+            node[key] = plan[plan_key]
+            result["applied"].append(plan_key)
+    except Exception as exc:  # noqa: BLE001 - 组装异常仅告警
+        result["reason"] = "apply-failed"
+        _log_warn(f"加速方案组装失败（跳过落盘）：{type(exc).__name__}: {exc}")
+        return result
+
+    if not result["applied"]:
+        result["applied_ok"] = True  # 无需写入（相关键均已存在）
+        _log_info("加速方案未改动 config.json（相关键均已存在，尊重显式配置）")
+        return result
+
+    try:
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+        result["applied_ok"] = True
+        _log_info(
+            f"加速方案已写入 config.json：{', '.join(result['applied'])}（模式 {mode}）"
+        )
+    except Exception as exc:  # noqa: BLE001 - 写入失败仅告警不阻断
+        result["reason"] = "write-failed"
+        _log_warn(f"config.json 写入失败（仅告警不阻断）：{type(exc).__name__}: {exc}")
+    return result
+
+
 #: 运行时装配的磁盘预检下限（GB）：conda 基座（~0.6）+ sidecar 环境（~5~8，GPU 版）
 #: + MeloTTS/HF 预热缓存（~1.5）+ nltk 数据与安装余量；不足时告警并跳过装配（不阻断）。
 PROVISION_MIN_DISK_GB = 12.0
@@ -634,8 +804,10 @@ def provision_runtime(root=None, runner=None, log_path=None, channel=None):
     由独立安装程序在展开载荷后调用（``backend.exe --provision-runtime``）。口径：
 
     - **一次性装完**（人类裁决③）：conda 静默安装 → sidecar 环境（Python 3.10）→
-      推理/语音依赖（GPU 自动探测分叉）→ nltk 数据预置 → **TTS 权重预热**
-      （MeloTTS 中文链路约 1.5GB 提前下载，消除首次合成超过前端 300s 超时的风险）；
+      推理/语音依赖（GPU 自动探测分叉：torch 链 + 按画像装配的 ORT 变体）→
+      nltk 数据预置 → **加速方案落盘**（保守写 ``config.json``）→ **TTS 权重预热**
+      （MeloTTS 中文链路约 1.5GB 提前下载，消除首次合成超过前端 300s 超时的风险；
+      设备**固定 CPU**，隔离 melo torch-GPU 风险路径）；
     - **磁盘预检**（规划 §四-4 / 独立安装程序 §四-2）：装配前探测安装盘可用空间，
       低于 :data:`PROVISION_MIN_DISK_GB` 时告警并**整链跳过**（不阻断主安装）；
     - **任何一步失败不阻断主安装**：全程只 [WARN] 不抛错，返回值如实记录各步结果，
@@ -648,8 +820,8 @@ def provision_runtime(root=None, runner=None, log_path=None, channel=None):
     :param log_path: 装配日志路径；缺省 ``<root>/runtime/provision.log``。
     :param channel: 统一下载源通道（``"mirror"`` / ``"official"``）；缺省读安装根
         配置（无配置时回落 :data:`bootstrap.DEFAULT_CHANNEL`）。
-    :return: dict —— recommend / cuda_version / gpu_vendor / skipped_reason /
-        conda / voice_env / dependencies / nltk / report_path。
+    :return: dict —— recommend / cuda_version / gpu_vendor / has_igpu / skipped_reason /
+        conda / voice_env / dependencies / nltk / accel / warmup / report_path。
     """
     root = root or PROJECT_ROOT
     path = log_path or os.path.join(root, PROVISION_LOG_REL)
@@ -669,6 +841,16 @@ def provision_runtime(root=None, runner=None, log_path=None, channel=None):
             _log_info("==== 运行时装配开始（内置 conda + 语音 sidecar 环境） ====")
             recommend, cuda_version, vendor = _detect_gpu(runner)
             _log_info(f"GPU 检测：{vendor} → 推荐 {recommend}（CUDA 版本：{cuda_version or '不适用'}）")
+            # 画像增量（核显识别）：供 ORT 分叉与加速方案落盘
+            has_igpu, dgpu_vendor = _detect_gpu_inventory(runner)
+            _log_info(f"核显识别：{'检测到核显' if has_igpu else '未检测到核显'}（ORT 变体按此分叉）")
+            accel_profile = {
+                "recommend": recommend,
+                "cuda_version": cuda_version,
+                "gpu_vendor": vendor,
+                "has_igpu": has_igpu,
+                "dgpu_vendor": dgpu_vendor,
+            }
             # 磁盘预检（规划 §四-4）：可用空间不足时整链跳过，避免半装坏环境
             disk_free_gb = _probe_disk_free_gb(root)
             skipped_reason = None
@@ -680,7 +862,8 @@ def provision_runtime(root=None, runner=None, log_path=None, channel=None):
                 _log_warn(skipped_reason + "（应用仍可启动，语音与本地推理自动降级）")
             # 各步自身均「失败不抛」，此处的兜底只防装配链自身的意外异常
             # （口径：安装器不因运行时装配失败而中断主安装）
-            conda_result, env_result, deps_result, nltk_result, warmup_result = {}, {}, {}, {}, {}
+            conda_result, env_result, deps_result, nltk_result = {}, {}, {}, {}
+            accel_result, warmup_result = {}, {}
             report_path = os.path.join(root, "data", "install_report.json")
             if skipped_reason is None:
                 try:
@@ -690,10 +873,11 @@ def provision_runtime(root=None, runner=None, log_path=None, channel=None):
                         root, recommend, cuda_version, channel=resolved_channel, runner=runner
                     )
                     nltk_result = provision_nltk_data(root)
-                    # 预热放在依赖安装之后：MeloTTS 需已在 sidecar 环境内可导入
-                    warmup_result = warmup_voice_models(
-                        root, "cuda" if recommend == "cuda" else "cpu", runner=runner
-                    )
+                    # 加速方案落盘（保守读改）：写 accel.mode 与各组件落点
+                    accel_result = apply_accel_plan(root, profile=accel_profile)
+                    # 预热放在依赖安装之后：MeloTTS 需已在 sidecar 环境内可导入；
+                    # 设备固定 CPU（隔离 melo torch-GPU 风险路径，spec 强制口径）
+                    warmup_result = warmup_voice_models(root, "cpu", runner=runner)
                 except Exception as exc:  # noqa: BLE001 - 装配链异常仅告警，不阻断安装
                     _log_warn(f"运行时装配出现未预期异常（已忽略，主安装不受影响）：{type(exc).__name__}: {exc}")
 
@@ -701,10 +885,13 @@ def provision_runtime(root=None, runner=None, log_path=None, channel=None):
                 "gpu_vendor": vendor,
                 "cuda_version": cuda_version,
                 "recommend": recommend,
+                "has_igpu": has_igpu,
                 "conda_installed": bool(conda_result.get("installed")),
                 "voice_env_created": bool(env_result.get("created") or env_result.get("skipped")),
                 "dependencies_installed": bool(deps_result.get("installed")),
                 "nltk_provisioned": bool(nltk_result.get("provisioned")),
+                "accel_mode": (accel_result.get("mode") if isinstance(accel_result, dict) else None),
+                "accel_plan": (accel_result.get("plan") if isinstance(accel_result, dict) else None),
                 "tts_warmed": bool(warmup_result.get("warmed")),
                 "channel": resolved_channel,
                 "errors": list(deps_result.get("errors") or []),
@@ -722,11 +909,13 @@ def provision_runtime(root=None, runner=None, log_path=None, channel=None):
         "recommend": recommend,
         "cuda_version": cuda_version,
         "gpu_vendor": vendor,
+        "has_igpu": has_igpu,
         "skipped_reason": skipped_reason,
         "conda": conda_result,
         "voice_env": env_result,
         "dependencies": deps_result,
         "nltk": nltk_result,
+        "accel": accel_result,
         "warmup": warmup_result,
         "report_path": report_path,
     }

@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Bot, Mic, User, Volume2 } from 'lucide-react';
 import type { ChatMessage } from '../mock';
-import { sendChatMessage, synthesizeSpeech, transcribeAudio } from '../api';
+import { sendChatMessage, synthesizeSpeechStream, transcribeAudio } from '../api';
 import { startRecording, type RecordingSession } from '../audioRecorder';
 import Toggle from '../components/Toggle';
 
@@ -35,6 +35,11 @@ export default function ChatPage() {
   const [autoSpeak, setAutoSpeak] = useState(false);
   const [speakingId, setSpeakingId] = useState<string | null>(null);
   const playerRef = useRef<HTMLAudioElement | null>(null);
+  /** 流式朗读：中断控制器 + 音频队列 + 播放中标记 + 流结束标记 */
+  const abortRef = useRef<AbortController | null>(null);
+  const queueRef = useRef<string[]>([]);
+  const playingRef = useRef(false);
+  const streamDoneRef = useRef(false);
 
   // F-7（第三轮体检批次6）：消息变化后自动滚动到底部——修复前 listRef 为
   // 死引用，消息超一屏后新气泡（尤其伴侣回复）出现在视口外。
@@ -99,13 +104,27 @@ export default function ChatPage() {
     );
   }
 
-  /** 停止当前朗读（若有）。 */
+  /** 停止当前朗读（中断流式请求 + 清空队列 + 停当前播放器）。 */
   function stopSpeaking() {
+    const abort = abortRef.current;
+    abortRef.current = null;
+    if (abort) {
+      try {
+        abort.abort();
+      } catch {
+        /* ignore */
+      }
+    }
+    queueRef.current = [];
+    playingRef.current = false;
+    streamDoneRef.current = false;
     const player = playerRef.current;
     playerRef.current = null;
     setSpeakingId(null);
     if (player) {
       try {
+        player.onended = null;
+        player.onerror = null;
         player.pause();
       } catch {
         /* 忽略：播放器已结束或不可暂停 */
@@ -113,24 +132,54 @@ export default function ChatPage() {
     }
   }
 
-  /** 朗读指定消息（先停当前播放；失败仅记日志，不影响聊天链路）。 */
+  /** 播放队列中下一段音频（队列为空且流已结束则清 speakingId）。 */
+  function playNext() {
+    const next = queueRef.current.shift();
+    if (!next) {
+      playingRef.current = false;
+      if (streamDoneRef.current) {
+        setSpeakingId(null);
+      }
+      return;
+    }
+    const player = new Audio(`data:audio/wav;base64,${next}`);
+    playerRef.current = player;
+    playingRef.current = true;
+    player.onended = () => playNext();
+    player.onerror = () => playNext();
+    void player.play().catch(() => playNext());
+  }
+
+  /** 朗读指定消息（流式：按标点切分逐句合成，收到首句即开始播放）。 */
   async function speak(messageId: string, text: string) {
     stopSpeaking();
     if (!text.trim()) return;
     setSpeakingId(messageId);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    streamDoneRef.current = false;
     try {
-      const result = await synthesizeSpeech(text);
-      if (result?.ok !== true || !result.audio_base64) {
-        throw new Error(result?.message || '朗读服务暂不可用');
-      }
-      const player = new Audio(
-        `data:${result.mime || 'audio/wav'};base64,${result.audio_base64}`,
+      await synthesizeSpeechStream(
+        text,
+        (chunk) => {
+          if (chunk.audio_base64) {
+            queueRef.current.push(chunk.audio_base64);
+            if (!playingRef.current) {
+              playNext();
+            }
+          }
+          // error 帧：忽略该句，继续等待后续帧
+        },
+        () => {
+          streamDoneRef.current = true;
+          if (!playingRef.current && queueRef.current.length === 0) {
+            setSpeakingId(null);
+          }
+        },
+        controller.signal,
       );
-      playerRef.current = player;
-      player.onended = () => setSpeakingId(null);
-      player.onerror = () => setSpeakingId(null);
-      await player.play();
     } catch (err) {
+      if (controller.signal.aborted) return;
       console.error('[Chat] 朗读失败:', err);
       setSpeakingId(null);
     }
@@ -176,8 +225,9 @@ export default function ChatPage() {
         </label>
       </div>
 
-      {/* 连接状态提示条：style 对齐 MemoriesPage 离线横幅；直到确认真连通才隐藏 */}
-      {channel !== 'connected' && (
+      {/* 连接状态提示条：仅在最近一次发送真实不可达时显示（unknown=尚未发过消息，
+          不做任何断言——本地优先用户没配云端也能正常聊，常驻"连不上"会误导） */}
+      {channel === 'unavailable' && (
         <div className="mb-3 rounded-xl border border-[var(--glass-border)] bg-[rgba(124,216,255,0.08)] px-3 py-2 text-xs text-[var(--text-secondary)]">
           现在连不上 TA，消息暂时送不到哦～等连接恢复后就能正常聊天了
         </div>
@@ -238,7 +288,7 @@ export default function ChatPage() {
           type="button"
           onClick={() => void send()}
           disabled={sending}
-          className="h-10 shrink-0 rounded-xl bg-gradient-to-r from-[var(--color-secondary)] to-[var(--color-primary)] px-5 text-sm font-medium text-white transition-all duration-200 hover:opacity-90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-60"
+          className="h-10 shrink-0 rounded-full bg-gradient-to-r from-[var(--color-secondary)] to-[var(--color-primary)] px-5 text-sm font-medium text-white transition-all duration-200 hover:opacity-90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-60"
         >
           {sending ? '发送中…' : '发送'}
         </button>

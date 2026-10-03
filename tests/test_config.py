@@ -53,23 +53,37 @@ def test_defaults_values():
         "model": "",
     }
     # device 为 GPU 开关键（cpu 默认 / gpu），打通 llama.cpp CPU/GPU 推理切换
+    # backend 为 llama.cpp 后端构建键（20261002 批 A："" 默认 / cuda / vulkan，
+    # 既有断言变更留痕：local_llm 段精确比较追加 backend 键）
     assert DEFAULTS["local_llm"] == {
         "enabled": False,
         "model_path": "",
         "source": "modelscope",
         "device": "cpu",
+        "backend": "",
     }
     # embedding/vector（20260926_模块0_真实嵌入与向量持久化）：新增 model_path
     # 覆盖键（空串＝按约定目录解析）；向量后端默认由 lancedb 改为 sqlite（持久
     # 向量表落 memories.db，cosine 口径与 InMemory 一致；lancedb 为保留旧口径）
+    # backend 为 llama.cpp 后端构建键（20261002 批 A 追加，既有断言变更留痕）
     assert DEFAULTS["embedding"] == {
         "model": "qwen3-embedding:0.6b",
         "runtime": "llama.cpp",
         "device": "cpu",
         "model_path": "",
+        "backend": "",
     }
     assert DEFAULTS["vector"] == {"backend": "sqlite", "path": "data/lancedb"}
-    assert DEFAULTS["tts"] == {"engine": "melotts", "voice": "cx-open", "device": "cpu"}
+    # 全组件加速双模式 spec：tts 段新增 accel（默认 auto）与 accel_device（默认 ""）
+    assert DEFAULTS["tts"] == {
+        "engine": "melotts",
+        "voice": "cx-open",
+        "device": "cpu",
+        "accel": "auto",
+        "accel_device": "",
+    }
+    # 加速模式段（静态默认 performance；画像推导在安装/首启期完成）
+    assert DEFAULTS["accel"] == {"mode": "performance"}
     assert DEFAULTS["asr"] == {"engine": "sensevoice", "device": "cpu"}
     assert DEFAULTS["vad"] == {"mode": "webrtc"}
     assert DEFAULTS["memory"] == {"max_memories": 30, "dedup": 0.85, "permanent_threshold": 0.95}
@@ -382,3 +396,77 @@ def test_reloadable_download(tmp_path):
     cfg = _make_manager(tmp_path)
     assert cfg.reloadable("download") is True
     assert "download" in HOT_RELOAD_SECTIONS
+
+
+# ------------------------------------------------------------------ #
+# 10. 全组件加速双模式：accel.mode / tts.accel / tts.accel_device     #
+# ------------------------------------------------------------------ #
+
+def test_accel_defaults_values(tmp_path):
+    """全新配置：accel.mode=performance、tts.accel=auto、tts.accel_device=""，且 accel 可热更新。"""
+    cfg = _make_manager(tmp_path)
+    assert cfg.get("accel", "mode") == "performance"
+    assert cfg.get("tts", "accel") == "auto"
+    assert cfg.get("tts", "accel_device") == ""
+    assert cfg.reloadable("accel") is True
+    assert "accel" in HOT_RELOAD_SECTIONS
+    assert "accel" not in NEED_RESTART_SECTIONS
+
+
+def test_accel_missing_key_and_section_autofill(tmp_path):
+    """缺省补全：tts 段缺 accel/accel_device 逐键补齐；缺整段 accel 整段补齐。"""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"tts": {"voice": "cx-custom"}}), encoding="utf-8"
+    )
+    cfg = _make_manager(tmp_path)
+    # 已有值保留
+    assert cfg.get("tts", "voice") == "cx-custom"
+    # tts 段缺失键补齐
+    assert cfg.get("tts", "accel") == "auto"
+    assert cfg.get("tts", "accel_device") == ""
+    # 缺失整段 accel 从默认补齐
+    assert cfg.get("accel", "mode") == "performance"
+
+
+def test_env_override_accel_mode(monkeypatch, tmp_path):
+    """CXA_ACCEL_MODE 覆盖 accel.mode（新增段名可被环境变量机制解析）。"""
+    monkeypatch.setenv("CXA_ACCEL_MODE", "eco")
+    cfg = _make_manager(tmp_path)
+    assert cfg.get("accel", "mode") == "eco"
+
+
+def test_env_override_tts_accel_device(monkeypatch, tmp_path):
+    """CXA_TTS_ACCEL / CXA_TTS_ACCEL_DEVICE 覆盖 tts 段新增键。"""
+    monkeypatch.setenv("CXA_TTS_ACCEL", "dml")
+    monkeypatch.setenv("CXA_TTS_ACCEL_DEVICE", "igpu")
+    cfg = _make_manager(tmp_path)
+    assert cfg.get("tts", "accel") == "dml"
+    assert cfg.get("tts", "accel_device") == "igpu"
+
+
+# ------------------------------------------------------------------ #
+# 11. llama.cpp 后端构建键（20261002 批 A）：local_llm/embedding.backend #
+# ------------------------------------------------------------------ #
+
+def test_backend_defaults_values(tmp_path):
+    """backend 两键默认 ""（老配置零修改行为不变），归一非法值靠运行时层。"""
+    cfg = _make_manager(tmp_path)
+    assert cfg.get("local_llm", "backend") == ""
+    assert cfg.get("embedding", "backend") == ""
+    assert DEFAULTS["local_llm"]["backend"] == ""
+    assert DEFAULTS["embedding"]["backend"] == ""
+
+
+def test_backend_missing_key_and_section_autofill(tmp_path):
+    """缺省补全：local_llm / embedding 段缺 backend 逐键补齐为 ""；缺整段整段补齐。"""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"local_llm": {"device": "gpu"}, "embedding": {"device": "gpu"}}),
+        encoding="utf-8",
+    )
+    cfg = _make_manager(tmp_path)
+    # 既有值保留
+    assert cfg.get("local_llm", "device") == "gpu"
+    assert cfg.get("embedding", "device") == "gpu"
+    # 缺失 backend 键从默认补齐
+    assert cfg.get("local_llm", "backend") == ""
+    assert cfg.get("embedding", "backend") == ""

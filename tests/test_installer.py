@@ -808,9 +808,13 @@ def test_t9_build_commands_none_and_official_keep_legacy_output(recommend):
 
 @pytest.mark.parametrize("recommend", ["cpu", "cuda", "rocm"])
 def test_t9_build_commands_mirror_only_touches_plain_pip_packages(recommend):
-    """mirror 通道：仅普通 pip 包追加镜像索引；torch / llama-cpp-python 逐字不变。"""
-    legacy = bootstrap.build_gpu_dependency_commands(recommend, "12.4")
-    mirrored = bootstrap.build_gpu_dependency_commands(recommend, "12.4", "mirror")
+    """mirror 通道：仅普通 pip 包追加镜像索引；torch / llama-cpp-python 逐字不变。
+
+    Task 3：ORT 包已与 torch 链解耦，须显式传画像才会出现在清单中（普通 pip 包）。
+    """
+    profile = {"has_igpu": False, "recommend": recommend}
+    legacy = bootstrap.build_gpu_dependency_commands(recommend, "12.4", profile=profile)
+    mirrored = bootstrap.build_gpu_dependency_commands(recommend, "12.4", "mirror", profile=profile)
 
     assert len(mirrored) == len(legacy)
     plain = ("onnxruntime", "onnxruntime-gpu", "onnxruntime-directml")
@@ -966,7 +970,8 @@ def test_t9_first_run_official_derives_huggingface(tmp_path, monkeypatch):
     root = str(tmp_path)
     bootstrap.ensure_dirs(root)
     _t9_stub_hardware(monkeypatch)
-    driver, _outputs = _t9_driver(root, ["", "", "official"])
+    # 输入序列：provider 留空；api_key 留空；运行偏好留空→默认；线路选 official
+    driver, _outputs = _t9_driver(root, ["", "", "", "official"])
 
     result = driver.run()
 
@@ -1039,7 +1044,8 @@ def test_t9_first_run_downloader_injected_and_called(tmp_path, monkeypatch):
     bootstrap.ensure_dirs(root)
     _t9_stub_hardware(monkeypatch)
     fake = _T9FakeDownloader()
-    driver, outputs = _t9_driver(root, ["", "", "mirror", "y"], downloader=fake)
+    # 输入序列：provider 留空；api_key 留空；运行偏好留空→默认；线路 mirror；下载 y
+    driver, outputs = _t9_driver(root, ["", "", "", "mirror", "y"], downloader=fake)
 
     result = driver.run()
 
@@ -1074,7 +1080,8 @@ def test_t9_first_run_downloader_failure_does_not_break_flow(tmp_path, monkeypat
     bootstrap.ensure_dirs(root)
     _t9_stub_hardware(monkeypatch)
     fake = _T9FakeDownloader(fail=True)
-    driver, outputs = _t9_driver(root, ["", "", "mirror", "y"], downloader=fake)
+    # 输入序列：provider 留空；api_key 留空；运行偏好留空→默认；线路 mirror；下载 y
+    driver, outputs = _t9_driver(root, ["", "", "", "mirror", "y"], downloader=fake)
 
     result = driver.run()
 
@@ -1134,6 +1141,108 @@ def test_t9_model_repo_step_removed_and_no_legacy_endpoint_names():
     assert "HF_MIRROR" not in source
     assert "hf_endpoint" not in source
     assert "魔搭" not in source
+
+
+# ------------------------------------------------------------------ #
+# Task 5：模式询问（省电优先 / 性能优先）+ 口语化加速结论              #
+# ------------------------------------------------------------------ #
+
+#: 无核显 N 卡画像（性能优先 → tts.accel=cuda）。
+_T5_NVIDIA_PROFILE = {
+    "cpu_cores": 8,
+    "ram_gb": 16.0,
+    "gpu_vendor": "nvidia",
+    "vram_gb": 8.0,
+    "cuda_version": "12.4",
+    "disk_free_gb": 200.0,
+    "probe_notes": [],
+    "gpus": [{"vendor": "nvidia", "name": "RTX 4060", "type": "dgpu", "vram_hint": ""}],
+    "has_igpu": False,
+    "dgpu_vendor": "nvidia",
+}
+
+
+def _t5_stub_hardware(monkeypatch, profile):
+    """把 first_run 的探测 / 推荐替换为确定性替身（不触碰真实硬件，不改决策函数）。"""
+    from installer import first_run as first_run_mod
+
+    monkeypatch.setattr(
+        first_run_mod, "detect_profile", lambda root=None, runner=None: dict(profile)
+    )
+    monkeypatch.setattr(
+        first_run_mod,
+        "recommend_for",
+        lambda profile, disk_free_gb=None: {
+            "use_local": True,
+            "device": "cpu",
+            "tier": "1.7B",
+            "config_patch": {"local_llm": {"enabled": True, "device": "cpu"}},
+            "model": None,
+            "reasons": ["测试替身：内存满足本地推理阈值"],
+            "probe_notes": [],
+        },
+    )
+
+
+def test_t5_first_run_default_mode_from_profile_and_zero_jargon(tmp_path, monkeypatch):
+    """无核显 N 卡画像：默认性能优先 → accel.mode=performance、tts.accel=cuda；展示零术语。"""
+    root = str(tmp_path)
+    bootstrap.ensure_dirs(root)
+    _t5_stub_hardware(monkeypatch, _T5_NVIDIA_PROFILE)
+    # 输入：provider 留空；api_key 留空；运行偏好留空→按画像默认；线路留空；不下载
+    outputs = []
+    prompts = []
+    seq = iter(["", "", "", "", "n"])
+    driver = FirstRunDriver(
+        root,
+        input_fn=lambda p: (prompts.append(p), next(seq))[1],
+        output_fn=outputs.append,
+    )
+
+    result = driver.run()
+
+    assert result["accel_mode"] == "performance"
+    assert driver.cm.get("accel", "mode") == "performance"
+    assert driver.cm.get("tts", "accel") == "cuda"
+    assert driver.cm.get("asr", "device") == "gpu"
+    assert driver.cm.get("local_llm", "device") == "gpu"
+    assert driver.cm.get("embedding", "device") == "gpu"
+
+    joined = "\n".join(outputs)
+    assert "已选择：性能优先" in joined  # 选择结论
+    assert "加速方案" in joined  # 口语化结论展示出现
+    # 询问文案出现（提示经 input_fn 下发）
+    assert any("省电优先 / 性能优先" in p for p in prompts), "运行偏好询问应出现"
+    # 零术语：结论 / 询问文案不得出现技术术语
+    for jargon in ("ORT", "DirectML", "CUDA", "ROCm", "DML", "onnxruntime", "ExecutionProvider"):
+        assert jargon not in joined, f"向导文案不得出现术语 {jargon}"
+        assert all(jargon not in p for p in prompts), f"询问文案不得出现术语 {jargon}"
+
+
+def test_t5_first_run_explicit_eco_with_igpu_writes_plan(tmp_path, monkeypatch):
+    """有核显画像 + 显式选省电优先 → accel.mode=eco、tts.accel=dml、accel_device=igpu。"""
+    root = str(tmp_path)
+    bootstrap.ensure_dirs(root)
+    profile = dict(_T5_NVIDIA_PROFILE)
+    profile.update(
+        {
+            "gpus": [
+                {"vendor": "nvidia", "name": "RTX 4060", "type": "dgpu", "vram_hint": ""},
+                {"vendor": "intel", "name": "Intel UHD Graphics", "type": "igpu", "vram_hint": ""},
+            ],
+            "has_igpu": True,
+        }
+    )
+    _t5_stub_hardware(monkeypatch, profile)
+    driver, outputs = _t9_driver(root, ["", "", "省电优先", "", "n"])
+
+    result = driver.run()
+
+    assert result["accel_mode"] == "eco"
+    assert driver.cm.get("tts", "accel") == "dml"
+    assert driver.cm.get("tts", "accel_device") == "igpu"
+    assert driver.cm.get("asr", "device") == "cpu"
+    assert "省电优先" in "\n".join(outputs)
 
 
 # ------------------------------------------------------------------ #
@@ -1265,6 +1374,8 @@ def test_build_installer_compiles_with_defines(tmp_path, monkeypatch):
     # 20260926：随包运行时源清单新增"嵌入模型"与"llama.cpp 运行时"（缺失即跳过编译）
     (bundled / "embedding_model").mkdir()
     (bundled / "llama_cpp").mkdir()
+    # 20261002 批 A：补检表新增 llama.cpp Vulkan 运行时（缺失即跳过编译）
+    (bundled / "llama_cpp_vulkan").mkdir()
     iscc = tmp_path / "ISCC.exe"
     iscc.write_bytes(b"fake")
     monkeypatch.setattr(build_mod, "find_iscc", lambda: str(iscc))
@@ -1299,3 +1410,209 @@ def test_build_installer_compiles_with_defines(tmp_path, monkeypatch):
     assert f"/DOutputDir={tmp_path / 'rel'}" in cmd
     assert "/DAppVersion=9.9.9" in cmd
     assert cmd[-1].endswith("installer.iss")
+
+
+# ------------------------------------------------------------------ #
+# Task 3：ORT 包分叉（四类机器）/ 方案落盘（保守读改）/ 预热固定 CPU     #
+# ------------------------------------------------------------------ #
+
+#: (标签, 画像, 期望 ORT 变体)——四类机器分叉断言表。
+_ORT_FORK_CASES = [
+    ("有核显", {"has_igpu": True, "recommend": "cuda", "dgpu_vendor": "nvidia"},
+     "onnxruntime-directml"),
+    ("无核显 N 卡", {"has_igpu": False, "recommend": "cuda", "gpu_vendor": "nvidia"},
+     "onnxruntime-gpu"),
+    ("无核显 AMD", {"has_igpu": False, "recommend": "rocm", "gpu_vendor": "amd"},
+     "onnxruntime-directml"),
+    ("无 GPU", {"has_igpu": False, "recommend": "cpu", "gpu_vendor": "cpu"},
+     "onnxruntime"),
+]
+
+
+@pytest.mark.parametrize("label,profile,expected", _ORT_FORK_CASES)
+def test_task3_ort_fork_four_classes_mutually_exclusive(label, profile, expected):
+    """四类机器 ORT 分叉正确，且命令清单互斥（只含一个 onnxruntime* 变体）。"""
+    assert bootstrap.resolve_ort_package(profile) == expected
+    assert bootstrap.build_ort_package_command(profile) == f"pip install {expected}"
+
+    commands = bootstrap.build_gpu_dependency_commands(
+        profile["recommend"], "12.4", profile=profile
+    )
+    variants = [c for c in commands if c.startswith("pip install onnxruntime")]
+    assert variants == [f"pip install {expected}"]
+
+    # cuda 分支不捆绑 ORT：有核显的 cuda 机器得到 DirectML，而非 onnxruntime-gpu
+    if profile["recommend"] == "cuda" and profile["has_igpu"]:
+        assert not any("onnxruntime-gpu" in c for c in commands)
+
+
+def _accel_profile_fixture():
+    """构造一份「有核显 + N 卡」画像（性能模式 → tts.accel=dml/dgpu）。"""
+    return {
+        "recommend": "cuda",
+        "gpu_vendor": "nvidia",
+        "dgpu_vendor": "nvidia",
+        "has_igpu": True,
+        "vram_gb": 8.0,
+    }
+
+
+def test_apply_accel_plan_writes_missing_keys(tmp_path):
+    """方案落盘场景1（缺键写入）：缺键写入、既有键保留、报告如实。"""
+    from installer import conda_runtime
+
+    root = str(tmp_path / "portable")
+    os.makedirs(root)
+    config_path = os.path.join(root, "config.json")
+    with open(config_path, "w", encoding="utf-8") as fh:
+        json.dump({"cloud": {"provider": "deepseek"}}, fh)
+
+    result = conda_runtime.apply_accel_plan(root, profile=_accel_profile_fixture())
+
+    assert result["applied_ok"] is True
+    # 20261002 批 A：追加 local_llm.backend / embedding.backend 两键（既有断言变更留痕）
+    assert set(result["applied"]) == {
+        "accel.mode", "tts.accel", "tts.accel_device",
+        "asr.device", "local_llm.device", "local_llm.backend",
+        "embedding.device", "embedding.backend",
+    }
+    assert result["mode"] == "performance"
+    on_disk = json.loads(open(config_path, encoding="utf-8").read())
+    assert on_disk["accel"]["mode"] == "performance"
+    assert on_disk["tts"]["accel"] == "dml"
+    assert on_disk["tts"]["accel_device"] == "dgpu"
+    assert on_disk["asr"]["device"] == "gpu"
+    # N 卡显存满足阈值 → backend=cuda（批 A 新键落盘值）
+    assert on_disk["local_llm"]["device"] == "gpu"
+    assert on_disk["local_llm"]["backend"] == "cuda"
+    assert on_disk["embedding"]["device"] == "gpu"
+    assert on_disk["embedding"]["backend"] == "cuda"
+    assert on_disk["cloud"]["provider"] == "deepseek"  # 既有键不被清除
+
+
+def test_apply_accel_plan_respects_existing_keys(tmp_path):
+    """方案落盘场景2（键存在不覆盖，含显式值）：全部保留，不改动文件。"""
+    from installer import conda_runtime
+
+    root = str(tmp_path / "portable")
+    os.makedirs(root)
+    config_path = os.path.join(root, "config.json")
+    explicit = {
+        "accel": {"mode": "eco"},
+        "tts": {"accel": "off", "accel_device": "igpu"},
+        "asr": {"device": "cpu"},
+        "local_llm": {"device": "cpu"},
+        "embedding": {"device": "cpu"},
+    }
+    with open(config_path, "w", encoding="utf-8") as fh:
+        json.dump(explicit, fh)
+
+    result = conda_runtime.apply_accel_plan(root, profile=_accel_profile_fixture())
+
+    # 20261002 批 A：explicit 未含 backend 键 → 两键新写入（既有断言变更留痕：
+    # 原「applied == [] 全保留」收窄为「既有六键保留 + backend 两键补写」）
+    assert set(result["applied"]) == {"local_llm.backend", "embedding.backend"}
+    assert set(result["existing"]) == {
+        "accel.mode", "tts.accel", "tts.accel_device",
+        "asr.device", "local_llm.device", "embedding.device",
+    }
+    on_disk = json.loads(open(config_path, encoding="utf-8").read())
+    # 显式值一律保留（不被画像决策覆盖）
+    assert on_disk["accel"]["mode"] == "eco"
+    assert on_disk["tts"]["accel"] == "off"
+    assert on_disk["tts"]["accel_device"] == "igpu"
+    assert on_disk["asr"]["device"] == "cpu"
+    # 显式 device=cpu 保留；backend 缺键由方案补写（N 卡 → cuda）
+    assert on_disk["local_llm"]["device"] == "cpu"
+    assert on_disk["local_llm"]["backend"] == "cuda"
+    assert on_disk["embedding"]["device"] == "cpu"
+    assert on_disk["embedding"]["backend"] == "cuda"
+
+
+def test_apply_accel_plan_skips_when_config_missing(tmp_path, capsys):
+    """方案落盘场景3（文件缺失跳过并告警）：不新建文件、不抛错。"""
+    from installer import conda_runtime
+
+    root = str(tmp_path / "portable")
+    os.makedirs(root)
+
+    result = conda_runtime.apply_accel_plan(root, profile=_accel_profile_fixture())
+
+    assert result["applied_ok"] is False
+    assert result["reason"] == "config-missing"
+    assert "config.json 不存在" in capsys.readouterr().out
+    assert not os.path.exists(os.path.join(root, "config.json"))
+
+
+def test_apply_accel_plan_corrupt_config_only_warns(tmp_path, capsys):
+    """方案落盘场景4（异常仅告警不阻断）：坏 JSON 只告警，不抛错。"""
+    from installer import conda_runtime
+
+    root = str(tmp_path / "portable")
+    os.makedirs(root)
+    config_path = os.path.join(root, "config.json")
+    with open(config_path, "w", encoding="utf-8") as fh:
+        fh.write("{不是合法 JSON")
+
+    result = conda_runtime.apply_accel_plan(root, profile=_accel_profile_fixture())
+
+    assert result["applied_ok"] is False
+    assert result["reason"] == "config-unreadable"
+    assert "读取失败" in capsys.readouterr().out
+    # 坏文件未被改写（保守：不覆盖用户内容）
+    with open(config_path, encoding="utf-8") as fh:
+        assert fh.read() == "{不是合法 JSON"
+
+
+def test_apply_accel_plan_without_profile_skips(tmp_path, capsys):
+    """方案落盘：无画像时跳过（不猜测），只告警不抛错。"""
+    from installer import conda_runtime
+
+    root = str(tmp_path / "portable")
+    os.makedirs(root)
+
+    result = conda_runtime.apply_accel_plan(root, profile=None)
+
+    assert result["applied_ok"] is False
+    assert result["reason"] == "profile-missing"
+    assert "缺少硬件画像" in capsys.readouterr().out
+
+
+def test_provision_runtime_warms_tts_on_cpu(tmp_path, monkeypatch):
+    """Task 3：安装期 TTS 预热设备固定 CPU（隔离 melo torch-GPU 风险路径）。
+
+    即便检测结论为 cuda，预热也必须以 CPU 执行。
+    """
+    from installer import conda_runtime
+
+    root = str(tmp_path / "portable")
+    captured = {}
+
+    monkeypatch.setattr(conda_runtime, "_detect_gpu", lambda runner=None: ("cuda", "13.4", "nvidia"))
+    monkeypatch.setattr(conda_runtime, "_detect_gpu_inventory", lambda runner=None: (False, "nvidia"))
+    monkeypatch.setattr(conda_runtime, "install_conda", lambda r, runner=None: {"installed": True})
+    monkeypatch.setattr(conda_runtime, "create_voice_env", lambda r, runner=None: {"created": True})
+    monkeypatch.setattr(
+        conda_runtime, "install_voice_dependencies",
+        lambda r, recommend, cuda, channel=None, runner=None: {"installed": True, "errors": []},
+    )
+    monkeypatch.setattr(conda_runtime, "provision_nltk_data", lambda r: {"provisioned": True})
+    monkeypatch.setattr(
+        conda_runtime, "apply_accel_plan",
+        lambda r, profile=None: {"mode": "performance", "plan": {"accel.mode": "performance"}},
+    )
+    monkeypatch.setattr(
+        conda_runtime, "warmup_voice_models",
+        lambda r, device, runner=None: captured.update(device=device) or {"warmed": True},
+    )
+    monkeypatch.setattr(bootstrap, "resolve_download_channel", lambda root=None: "mirror")
+
+    conda_runtime.provision_runtime(root)
+
+    assert captured["device"] == "cpu"
+    # 报告含画像与决策（spec：报告 SHALL 含画像与决策）
+    report = json.loads(
+        open(os.path.join(root, "data", "install_report.json"), encoding="utf-8").read()
+    )
+    assert report["accel_mode"] == "performance"
+    assert report["accel_plan"] == {"accel.mode": "performance"}

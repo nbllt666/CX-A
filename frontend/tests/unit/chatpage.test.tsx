@@ -236,7 +236,7 @@ describe('ChatPage：语音接线（朗读 + 麦克风）', () => {
     vi.clearAllMocks();
   });
 
-  /** 构造「聊天回复 + 合成音频」双端点替身 fetch。 */
+  /** 构造「聊天回复 + 流式合成音频」双端点替身 fetch。 */
   function stubChatAndSynth(): ReturnType<typeof vi.fn> {
     const mock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
@@ -246,11 +246,20 @@ describe('ChatPage：语音接线（朗读 + 麦克风）', () => {
           headers: { 'Content-Type': 'application/json' },
         });
       }
-      if (url.includes('/voice/synthesize')) {
-        return new Response(
-          JSON.stringify({ ok: true, audio_base64: 'UklGRg==', mime: 'audio/wav' }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
-        );
+      if (url.includes('/voice/synthesize_stream')) {
+        const ndjson =
+          JSON.stringify({ seq: 0, text: '我在呢', audio_base64: 'UklGRg==' }) + '\n' +
+          JSON.stringify({ done: true, total: 1 }) + '\n';
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(ndjson));
+            controller.close();
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'application/x-ndjson' },
+        });
       }
       throw new Error(`unexpected url: ${url}`);
     });
@@ -258,7 +267,7 @@ describe('ChatPage：语音接线（朗读 + 麦克风）', () => {
     return mock;
   }
 
-  it('伴侣回复带朗读按钮：点击请求合成端点并播放', async () => {
+  it('伴侣回复带朗读按钮：点击请求流式合成端点并播放', async () => {
     fetchMock = stubChatAndSynth();
 
     render(<ChatPage />);
@@ -271,7 +280,7 @@ describe('ChatPage：语音接线（朗读 + 麦克风）', () => {
     fireEvent.click(screen.getByRole('button', { name: '朗读' }));
     await vi.waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        API_ENDPOINTS.voice.synthesize,
+        API_ENDPOINTS.voice.synthesizeStream,
         expect.objectContaining({ method: 'POST' }),
       );
       expect(playMock).toHaveBeenCalledTimes(1);

@@ -31,8 +31,16 @@ export const API_ENDPOINTS = {
   voice: {
     /** 文本合成语音（POST {text, voice?} → {ok, audio_base64, mime:'audio/wav'}） */
     synthesize: `${API_BASE}/voice/synthesize`,
+    /** 文本合成语音（流式，POST {text, voice?} → chunked NDJSON） */
+    synthesizeStream: `${API_BASE}/voice/synthesize_stream`,
     /** 语音转文本（POST {audio_base64, sample_rate?} → {ok, text}） */
     transcribe: `${API_BASE}/voice/transcribe`,
+  },
+  voices: {
+    /** 音色包列表（GET → {ok, voices:[{id, path, is_default, size, builtin}]}，首项恒为内置 cx-open） */
+    list: `${API_BASE}/voices`,
+    /** 导入音色包（POST {source_path, name?, overwrite?} → 成功 {ok, voice}；失败 400 {ok:false, error, message(中文)}） */
+    import: `${API_BASE}/voices/import`,
   },
   memories: {
     /** 记忆列表 */
@@ -43,7 +51,7 @@ export const API_ENDPOINTS = {
   settings: {
     /** 用户可读配置视图（GET，不含 API Key） */
     get: `${API_BASE}/settings`,
-    /** 更新可热更配置（PUT，白名单键：cloud.provider / tts.voice / local_llm.enabled） */
+    /** 更新可热更配置（PUT，白名单键：cloud.provider / tts.voice / local_llm.enabled / vision.enabled） */
     update: `${API_BASE}/settings`,
   },
   computer: {
@@ -295,6 +303,83 @@ export async function synthesizeSpeech(
   });
 }
 
+/** 流式合成单帧（/api/voice/synthesize_stream 的 NDJSON 行）。 */
+export interface SpeechStreamChunk {
+  seq?: number;
+  text?: string;
+  audio_base64?: string;
+  error?: string;
+  done?: boolean;
+  total?: number;
+}
+
+/**
+ * 流式文本合成语音（按标点切分 + chunked NDJSON）。
+ *
+ * 每收到一帧调用一次 ``onChunk``；收到 ``done`` 帧时调用 ``onDone``（可选）。
+ * 支持通过 ``signal`` 中断（用于停止朗读时取消未完成的合成）。
+ *
+ * @param text 待合成文本
+ * @param onChunk 每帧回调（含音频 base64 或 error）
+ * @param onDone 结束回调（传入 total 句数）
+ * @param signal AbortSignal，用于中断
+ * @param voice 可选音色标识
+ */
+export async function synthesizeSpeechStream(
+  text: string,
+  onChunk: (chunk: SpeechStreamChunk) => void,
+  onDone?: (total: number) => void,
+  signal?: AbortSignal,
+  voice?: string,
+): Promise<void> {
+  const token = await ensureBackendToken();
+  const headers = new Headers({ 'Content-Type': 'application/json' });
+  if (token) headers.set('X-Client-Token', token);
+  const res = await fetch(API_ENDPOINTS.voice.synthesizeStream, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(voice ? { text, voice } : { text }),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    const msg = await res.text().catch(() => '');
+    throw new Error(`流式合成失败（${res.status}）：${msg.slice(0, 200)}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        let obj: SpeechStreamChunk;
+        try {
+          obj = JSON.parse(line) as SpeechStreamChunk;
+        } catch {
+          continue;
+        }
+        if (obj.done) {
+          onDone?.(obj.total ?? 0);
+          return;
+        }
+        onChunk(obj);
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 /** 语音识别响应（/api/voice/transcribe）。 */
 export interface SpeechTranscriptionResult {
   ok?: boolean;
@@ -318,6 +403,112 @@ export async function transcribeAudio(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ audio_base64: audioBase64, sample_rate: sampleRate }),
   });
+}
+
+/* ==========================================================================
+ * 音色包管理：列表 / 导入（GET/POST /api/voices**）
+ * ========================================================================== */
+
+/** 一个音色包（对应 GET /api/voices 返回项；首项恒为内置 cx-open，builtin:true） */
+export interface VoiceInfo {
+  /** 音色标识（PUT settings tts.voice 的取值） */
+  id: string;
+  /** 音色包在磁盘上的路径 */
+  path: string;
+  /** 是否为默认音色 */
+  is_default: boolean;
+  /** 音色包体积（字节；用于下拉里的人性化大小展示） */
+  size: number;
+  /** 是否内置音色包（true = 随应用自带，false = data/voices/ 下的自定义包） */
+  builtin: boolean;
+}
+
+/**
+ * 拉取音色包列表（GET /api/voices）。
+ * 非 2xx / 网络失败时抛错，由调用方降级（设置页回退演示选项，不弹错）。
+ */
+export async function fetchVoices(): Promise<VoiceInfo[]> {
+  const data = await requestJson<{ ok?: boolean; voices?: VoiceInfo[] }>(API_ENDPOINTS.voices.list);
+  return Array.isArray(data?.voices) ? data.voices : [];
+}
+
+/**
+ * 导入音色包（POST /api/voices/import）。
+ *
+ * 不复用 requestJson 的通用抛错文案：后端失败响应体里带中文 message
+ * （如「文件夹不是有效的音色包」），设置页要把它直接展示给用户；
+ * 故这里单独读体解析——失败抛 Error(message)，后端未给 message 时
+ * 回落通用中文提示；网络不可达同样抛中文错误。
+ *
+ * @param sourcePath 待导入音色包文件夹的绝对路径（Electron pickVoiceFolder 所选）
+ * @param name 可选自定义音色名（缺省由后端按文件夹名派生）
+ * @param overwrite 可选：同名音色已存在时是否覆盖
+ */
+export async function importVoice(
+  sourcePath: string,
+  name?: string,
+  overwrite?: boolean,
+): Promise<VoiceInfo> {
+  // N1：持有启动令牌时自动附带 X-Client-Token 头
+  const token = await ensureBackendToken();
+  const headers = new Headers({ 'Content-Type': 'application/json' });
+  if (token) headers.set('X-Client-Token', token);
+  const payload: Record<string, unknown> = { source_path: sourcePath };
+  if (name !== undefined) payload.name = name;
+  if (overwrite !== undefined) payload.overwrite = overwrite;
+  let res: Response;
+  try {
+    res = await fetch(API_ENDPOINTS.voices.import, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    });
+  } catch {
+    throw new Error('导入音色失败：暂时连不上服务，请稍后再试');
+  }
+  if (!res.ok) {
+    let message = '';
+    try {
+      const err = (await res.json()) as { message?: string };
+      if (typeof err?.message === 'string') message = err.message;
+    } catch {
+      /* 响应体不可读（非 JSON 等）时跳过，走通用提示 */
+    }
+    throw new Error(message || '导入音色失败：这个文件夹可能不是有效的音色包');
+  }
+  const data = (await res.json()) as { ok?: boolean; voice?: VoiceInfo };
+  if (!data?.voice) {
+    throw new Error('导入音色失败：服务没有返回新音色，请稍后再试');
+  }
+  return data.voice;
+}
+
+/** Electron 桥上负责选音色文件夹的最小形状（preload 契约已冻结，浏览器 dev 无此方法） */
+type VoiceFolderPickerBridge = { pickVoiceFolder?: () => Promise<unknown> };
+
+/**
+ * 弹出系统文件夹选择框挑音色包（Electron preload 桥 window.cxaAPI.pickVoiceFolder）。
+ *
+ * 非 Electron 环境（纯浏览器 dev / 单测）桥或方法不存在 → 返回 null；
+ * 用户取消选择（桥返回 null/非字符串）→ 返回 null。调用方按「拿没拿到路径」分流。
+ */
+export async function pickVoiceFolder(): Promise<string | null> {
+  const bridge = (typeof window !== 'undefined' ? window.cxaAPI : undefined) as
+    | VoiceFolderPickerBridge
+    | undefined;
+  const picked = await bridge?.pickVoiceFolder?.();
+  return typeof picked === 'string' && picked.length > 0 ? picked : null;
+}
+
+/**
+ * 当前环境是否具备选音色文件夹能力（Electron 桥上存在 pickVoiceFolder 方法）。
+ * 非 Electron 环境（纯浏览器 dev / 单测）为 false，调用方据此给出「要在桌面应用里用」的引导提示。
+ */
+export function hasVoiceFolderPicker(): boolean {
+  const bridge = (typeof window !== 'undefined' ? window.cxaAPI : undefined) as
+    | VoiceFolderPickerBridge
+    | undefined;
+  return typeof bridge?.pickVoiceFolder === 'function';
 }
 
 /** 拉取记忆列表（可附带 type / agent_id / limit 过滤）。 */
@@ -346,13 +537,51 @@ export async function fetchSearch(
   return requestJson(`${API_ENDPOINTS.memories.search}?${qs.toString()}`);
 }
 
+/** 运行偏好：performance = 性能优先，eco = 省电优先（值域由后端冻结）。 */
+export type AccelMode = 'performance' | 'eco';
+/** TTS 加速后端值域（与后端 config 一致） */
+export type TtsAccel = 'auto' | 'cpu' | 'cuda' | 'dml' | 'rocm' | 'off';
+/** TTS 加速设备提示值域（DirectML 设备选择；''=自动） */
+export type TtsAccelDevice = '' | 'igpu' | 'dgpu';
+
+/**
+ * 加速剖面（后端唯一真相源 accel_plan 产出）：
+ * 模式默认 + 各组件落点 + 中文理由（reasons 含术语，仅作诊断，前端不直接展示）。
+ */
+export interface AccelProfile {
+  mode: AccelMode;
+  tts: { accel: TtsAccel; accel_device: TtsAccelDevice };
+  asr: { device: string };
+  local_llm: { device: string };
+  embedding: { device: string };
+  reasons: string[];
+}
+
+/** 语音桥重建结果（N-6）：needs_restart=true 时明确提示需重启应用（不静默）。 */
+export interface VoiceBackendResult {
+  rebuilt: boolean;
+  needs_restart: boolean;
+  message: string;
+}
+
 /** 用户可读配置视图（对应 GET /api/settings，不含 API Key）。 */
 export interface SettingsView {
   cloud: { provider: string; base_url?: string };
-  tts: { voice: string };
-  local_llm: { enabled: boolean };
+  tts: { voice: string; accel?: TtsAccel; accel_device?: TtsAccelDevice };
+  /** 运行偏好（性能/节能双模式） */
+  accel: { mode: AccelMode };
+  /** ready = 本地小模型是否已下载就绪（设置页据此展示「本地大脑已就绪」徽标） */
+  local_llm: { enabled: boolean; ready?: boolean };
   acp: { enabled: boolean };
   remote: { enabled: boolean };
+  /** 主动视觉开关（视图新增字段；旧后端缺失时前端按关闭处理） */
+  vision?: { enabled: boolean };
+}
+
+/** PUT /api/settings 响应（配置视图 + 可选语音桥重建结果）。 */
+export interface SettingsUpdateResult {
+  config: SettingsView;
+  voice_backend?: VoiceBackendResult;
 }
 
 /** 拉取配置视图（前端设置页首帧对齐后端默认值）。 */
@@ -360,21 +589,27 @@ export async function fetchSettings(): Promise<SettingsView> {
   return requestJson<SettingsView>(API_ENDPOINTS.settings.get);
 }
 
-/** 更新可热更配置（PUT /api/settings，白名单键：cloud.provider / tts.voice / local_llm.enabled）。 */
-export async function updateSettings(patch: Record<string, unknown>): Promise<SettingsView> {
+/**
+ * 更新可热更配置（PUT /api/settings）。
+ *
+ * 白名单键：``cloud.provider`` / ``tts.voice`` / ``local_llm.enabled`` /
+ * ``accel.mode``（运行偏好；保存后后端按新配置重建语音桥，结果见 voice_backend）。
+ */
+export async function updateSettings(patch: Record<string, unknown>): Promise<SettingsUpdateResult> {
   // N1：统一走 requestJson（自动附带 X-Client-Token），保留 config 缺失的显式抛错语义
-  const data = await requestJson<{ config?: SettingsView; error?: string }>(
-    API_ENDPOINTS.settings.update,
-    {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    },
-  );
+  const data = await requestJson<{
+    config?: SettingsView;
+    voice_backend?: VoiceBackendResult;
+    error?: string;
+  }>(API_ENDPOINTS.settings.update, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
   if (!data.config) {
     throw new Error(`配置更新失败: ${data.error ?? '未知错误'}`);
   }
-  return data.config;
+  return { config: data.config, voice_backend: data.voice_backend };
 }
 
 /** 电脑控制授权状态（对应当前 /api/computer/status 与 authorize 的返回）。 */
@@ -480,12 +715,16 @@ export interface HardwareRecommendation {
   } | null;
   reasons: string[];
   probe_notes: string[];
+  /** 加速剖面（性能/节能双模式；模式默认按画像推导） */
+  accel?: AccelProfile;
 }
 
 /** 硬件体检响应（GET /api/setup/recommend） */
 export interface SetupRecommendResult {
   profile: HardwareProfile;
   recommendation: HardwareRecommendation;
+  /** 加速剖面（与 recommendation.accel 同源，顶层直取便于向导渲染） */
+  accel?: AccelProfile;
   tiers: ModelTierInfo[];
   /** 当前线路对应的模型仓库（恒等于线路派生值，前端无需自行推导） */
   suggested_source: string;
@@ -513,11 +752,16 @@ export interface ModelDownloadResult {
 
 /** 向导提交请求体（POST /api/setup/complete） */
 export interface SetupCompletePayload {
-  cloud: { provider: string; api_key?: string };
+  /** 云端段可选：跳过云端（快车道采纳 / 「跳过，先用本地」）时整体省略 */
+  cloud?: { provider: string; api_key?: string };
   /** 用户唯一选择：线路 */
   download: { channel: DownloadChannel };
   /** 模型仓库由下载线路在服务端派生，前端不再提交 source */
   local_llm: { enabled: boolean };
+  /** 运行偏好（省电优先 / 性能优先）：服务端据此展开各组件落点 */
+  accel?: { mode: AccelMode };
+  /** 可选显式覆盖语音加速后端 / 设备提示（缺省由运行偏好推导） */
+  tts?: { accel?: TtsAccel; accel_device?: TtsAccelDevice };
   /** 是否采纳硬件体检给出的推荐 */
   apply_recommended: boolean;
 }

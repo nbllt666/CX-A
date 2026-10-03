@@ -26,6 +26,24 @@
     POST   /api/voice/synthesize    文本合成语音（body {text, voice?}；后端异常 503）
     POST   /api/voice/transcribe    语音转文本（body {audio_base64, sample_rate?}；后端异常 503）
 
+音色管理（Task B「音色自由选」，20261002）：
+    GET    /api/voices              内置默认音色 + data/voices 目录音色包合并列表
+                                    （{ok, voices:[{id, path, size, is_default, builtin}]}；
+                                    目录同名 cx-open 与内置项合并去重，保留目录项 size/path）
+    POST   /api/voices/import       导入本机音色包目录到 data/voices/<name>/
+                                    （body {source_path, name?, overwrite?}；校验链任一失败
+                                    400 中文 message 不产生写入副作用；name 过
+                                    is_unsafe_voice_id 防目标目录逃逸）
+
+主动视觉装配（Task C「主动视觉接线」，20261002）：
+    服务启动时经 make_handler 装配 VisionPipeline（纯标准库 GDI 屏幕后端 +
+    AdaptiveSampler + 云端理解 + 记忆沉淀），daemon tick 线程每拍驱动
+    ``run_once``（整体 try/except，线程永不因异常退出）。``vision.enabled``
+    默认 False：run_once 零开销返回且绝不采样（隐私红线）；经 PUT /api/settings
+    的 ``vision.enabled``（布尔校验，非法入 ignored）热更新开启，下一拍即生效。
+    音色热切换：``/api/voice/synthesize`` 与 ``/api/voice/synthesize_stream``
+    未显式指定音色时现读 config ``tts.voice``（设置页改默认音色即生效，无需重启）。
+
 CXFC relay 前端转接（Task H1，对齐 C:\\CX-O\\docs\\CXFC开发文档.md §2.2）：
     GET    /api/cxfc/relay/pending  取走待执行 relay 调用（?plugin_id= 过滤 &limit= 上限；
                                     at-most-once：取走即从队列移除，未回报最终 RELAY_TIMEOUT）
@@ -33,8 +51,11 @@ CXFC relay 前端转接（Task H1，对齐 C:\\CX-O\\docs\\CXFC开发文档.md �
                                     success, result|error}；命中 {"status":"ok"}；
                                     未知/已超时 request_id 404）
 
-表情聊天（Task H3，对齐 spec「虚拟形象表情优化」）：
-    POST   /api/chat/message        表情聊天（body {message, agent_id?}）：走 CloudAdapter
+表情聊天（Task H3，对齐 spec「虚拟形象表情优化」；本地模式真正本地，20261002）：
+    POST   /api/chat/message        表情聊天（body {message, agent_id?}）：本地模式
+                                    （local_llm.enabled）开启时**本地优先**——不探测
+                                    网络、不连云端，就绪走本地小 LLM、未就绪产中文
+                                    引导提示（绝不静默回落云端）；未开启时走 CloudAdapter
                                     流式调用拼接完整回复，经 EmotionTagParser 解析标签后
                                     返回 {ok, clean_text, mood, raw}；无 api_key / 云端
                                     不可达时返回固定友好文案 + mood=calm（offline:true），
@@ -81,6 +102,7 @@ import importlib.util
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -102,6 +124,24 @@ _CHAT_DEFAULT_SYSTEM = (
     "你是用户的虚拟伴侣，回复请自然、温暖；可在句中插入情绪标签表达当下心情，"
     "格式为 [emotion:情绪]，支持：happy/calm/sad/surprised/angry/sleepy/shy。"
 )
+
+
+def _warm_chat_runtime(runtime):
+    """后台预热常驻 chat 服务（20260930）；失败仅告警，不抛（GN-004 E11）。
+
+    预热失败不阻断装配——首次真实请求会兜底拉起常驻服务（只是首问多等一次
+    冷加载）。此处补一次告警保留可观测性（模型损坏等场景不再静默）。
+
+    :param runtime: 已装配的本地小 LLM 运行时（LlamaRuntime）
+    """
+    try:
+        if not runtime.warm_local_llm():
+            LOGGER.warning(
+                "常驻 chat 服务预热失败（首次真实请求将兜底拉起）：%s",
+                "; ".join(getattr(runtime, "warnings", None) or []) or "未知原因",
+            )
+    except Exception as exc:  # noqa: BLE001 - 预热线程不允许影响主流程
+        LOGGER.warning("常驻 chat 服务预热线程异常：%s", exc)
 
 
 def build_local_chat_runtime(config):
@@ -146,12 +186,119 @@ def build_local_chat_runtime(config):
                 "; ".join(runtime.warnings) or "未知原因",
             )
             return None
+        # 优雅退出回收：常驻 chat 服务为 llama-server 子进程（20260930 常驻化改造；
+        # 冻结态硬终止路径同样由 Electron 壳的进程树回收兜底，见 main.js）
+        atexit.register(runtime.close)
+        # 后台预热常驻 chat 服务（20260930）：规避"应用启动后第一句话"再吃一次模型
+        # 冷加载（实测 8B Q4 GPU 约 5.3~5.5s）；非阻塞、失败仅告警（首次真实请求兜底拉起）
+        threading.Thread(
+            target=_warm_chat_runtime, args=(runtime,), name="chat-warmup", daemon=True
+        ).start()
         return runtime
     except Exception as exc:  # noqa: BLE001 - 依赖缺席 / 加载异常：聊天端点必须可用
         LOGGER.warning(
             "本地小 LLM 运行时装配失败（%s）：%s", exc.__class__.__name__, exc
         )
         return None
+
+
+class _LocalChatRuntimeHolder:
+    """本地聊天运行时持有器（本地模式真正本地，20261002）。
+
+    职责：让 ``OfflineFallbackManager`` 经 ``get``（零参 callable / resolver 形态）
+    在每次 chat 时取得**当前**运行时，使运行中开启本地模式 / 模型后台加载完成
+    无需重启服务即动态生效。
+
+    - ``get()``：返回当前运行时或 None（锁内快照，供 chat 路径现解析）；
+    - ``set_runtime()``：装配期写入启动期加载好的运行时（**启动期去重**：
+      ``make_handler`` 装配时同步调用 ``build_local_chat_runtime`` 一次，其结果
+      存入本持有器复用，禁止同一模型加载两份）；
+    - ``ensure_started(config)``：幂等拉起后台 daemon 线程执行
+      ``build_local_chat_runtime(config)``——已有运行时或已在加载中则直接返回；
+      加载失败仅 LOGGER.warning（结果为 None），可再次触发。**立即返回，不阻塞
+      请求线程，也不持有 ``_CONFIG_WRITE_LOCK``**（模型加载在后台线程进行）；
+    - ``release()``：清空运行时；运行时具备 ``close``（LlamaRuntime.close 为
+      幂等回收常驻子进程，见 llama_runtime.py）则调用之，否则置 None 由 GC 回收；
+    - ``ready()``：当前运行时非 None（/api/settings 的 ``local_llm.ready`` 口径）。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._runtime = None
+        self._loading = False
+        #: 加载代次：release() 会使在途加载线程的结果失效（防止关闭后写回）
+        self._generation = 0
+
+    def get(self):
+        """返回当前本地聊天运行时（None 表示未加载）。零参 callable，可直传
+        ``OfflineFallbackManager(local_llm=...)`` 作 resolver。"""
+        with self._lock:
+            return self._runtime
+
+    def ready(self) -> bool:
+        """本地聊天运行时是否已加载（/api/settings ``local_llm.ready`` 口径）。"""
+        return self.get() is not None
+
+    def set_runtime(self, runtime) -> None:
+        """写入运行时（装配期启动加载结果复用入口；None 亦允许写入）。"""
+        with self._lock:
+            self._runtime = runtime
+
+    def ensure_started(self, config) -> None:
+        """幂等拉起后台加载线程；立即返回，不阻塞请求线程。
+
+        - 已有运行时 → 幂等返回（禁止同一模型加载两份）；
+        - 已在加载中 → 幂等返回；
+        - 否则置 loading 标记并启动 daemon 线程执行
+          ``build_local_chat_runtime(config)``，结果（含失败 None）写回；
+          失败仅告警，不崩，可再次触发。
+        """
+        with self._lock:
+            if self._runtime is not None or self._loading:
+                return
+            self._loading = True
+            self._generation += 1
+            generation = self._generation
+
+        def _load():
+            try:
+                runtime = build_local_chat_runtime(config)
+                if runtime is None:
+                    LOGGER.warning("本地聊天运行时后台加载未成功（详见装配告警），可再次触发")
+            except Exception as exc:  # noqa: BLE001 - 后台加载绝不拖垮服务
+                LOGGER.warning(
+                    "本地聊天运行时后台加载异常（%s）：%s", exc.__class__.__name__, exc
+                )
+                runtime = None
+            with self._lock:
+                # 代次不匹配（加载期间被 release）→ 丢弃结果，不覆盖状态
+                if generation != self._generation:
+                    return
+                # 失败（None）同样写回以清除 loading 标记；下次 PUT true 可重试
+                self._runtime = runtime
+                self._loading = False
+
+        threading.Thread(target=_load, name="local-llm-load", daemon=True).start()
+
+    def release(self) -> None:
+        """释放运行时：具备 ``close``（幂等）则调用，否则置 None 由 GC 回收。
+
+        同时递增加载代次并复位 loading 标记，使在途加载线程的结果被丢弃——
+        用户关闭本地模式后，后台未完成的加载不得在关闭后悄悄生效。
+        """
+        with self._lock:
+            runtime = self._runtime
+            self._runtime = None
+            self._generation += 1
+            self._loading = False
+        if runtime is None:
+            return
+        close = getattr(runtime, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001 - 释放失败不抛（进程随系统回收）
+                LOGGER.warning("本地聊天运行时释放异常（%s）：%s", exc.__class__.__name__, exc)
 
 
 # ------------------------------------------------------------------ 启动令牌鉴权（N1）
@@ -244,7 +391,7 @@ _TOOLS_USAGE = {
         "result": "200 {ok:true, sessions}；未配置云端 400 cloud_not_configured；云端离线 503 cloud_offline",
     },
     "POST /api/voice/synthesize": {
-        "body": {"text": "待合成文本（非空）", "voice": "可选音色，默认 cx-open"},
+        "body": {"text": "待合成文本（非空）", "voice": "可选音色，缺省现读 config tts.voice（热切换）"},
         "result": "200 {ok:true, audio_base64, mime:'audio/wav'}；后端异常 503 voice_backend_unavailable",
     },
     "POST /api/voice/transcribe": {
@@ -301,15 +448,158 @@ from lite.cloud.adapter import CloudAdapter, CloudConfigError, CloudUnavailableE
 from lite.avatar import EmotionTagParser  # noqa: E402
 from lite.memory.distillation import DistillationPaused, MemoryDistiller  # noqa: E402
 from lite.runtime.download_manager import ModelDownloadManager  # noqa: E402
-from lite.runtime.hardware_profile import detect_profile, recommend_for  # noqa: E402
+from lite.runtime.hardware_profile import (  # noqa: E402
+    accel_plan,
+    derive_default_mode,
+    detect_profile,
+    recommend_for,
+)
 from lite.runtime.model_downloader import MODEL_TIERS, DEFAULT_TIER  # noqa: E402
 from lite.tools.builtin_registry import BuiltinToolRegistry  # noqa: E402
 from lite.audio import LiteVoicePipeline, build_default_pipeline  # noqa: E402
+from lite.audio.text_splitter import split_by_punctuation  # noqa: E402
+from lite.audio.voice_manager import DEFAULT_VOICE_ID, VoiceManager, is_unsafe_voice_id  # noqa: E402
 from lite.cxfc import LiteCXFC  # noqa: E402
+from lite.vision.pipeline import VisionPipeline  # noqa: E402
+from lite.vision.sampler import AdaptiveSampler  # noqa: E402
 
 # 云端 provider 白名单（L-8：从 adapter.PROVIDER_BASE_URLS 派生，单一真相源，
 # 新增 provider 无需再同步本文件；置于 lite 包 import 之后——派生依赖其符号）
 CLOUD_PROVIDER_ALLOWLIST = tuple(PROVIDER_BASE_URLS.keys())
+
+# 全组件加速值域白名单（与 lite/config/config_manager.DEFAULTS 对齐；非法值一律入
+# ignored 显式回显，不静默丢弃）。accel.mode = 运行偏好；tts.accel = 语音合成后端；
+# tts.accel_device = 设备提示（""/igpu/dgpu）。
+_ACCEL_MODES = ("performance", "eco")
+_TTS_ACCEL_VALUES = ("auto", "cpu", "cuda", "dml", "rocm", "off")
+_TTS_ACCEL_DEVICE_VALUES = ("", "igpu", "dgpu")
+
+
+def _accel_profile_from_plan(plan):
+    """由 ``accel_plan`` 落点组装加速剖面（与 ``recommend_for`` 的 accel 字段同构）。
+
+    :param plan: :func:`lite.runtime.hardware_profile.accel_plan` 的产出 dict。
+    :return: 加速剖面 dict（mode / tts / asr / local_llm / embedding / reasons）。
+    """
+    plan = plan if isinstance(plan, dict) else {}
+    return {
+        "mode": plan.get("accel.mode"),
+        "tts": {
+            "accel": plan.get("tts.accel"),
+            "accel_device": plan.get("tts.accel_device"),
+        },
+        "asr": {"device": plan.get("asr.device")},
+        "local_llm": {"device": plan.get("local_llm.device")},
+        "embedding": {"device": plan.get("embedding.device")},
+        "reasons": list(plan.get("reasons") or []),
+    }
+
+
+def _apply_accel_plan_to_config(config, plan):
+    """把 ``accel_plan`` 全部落点写入配置（模式 + 各组件设备）。
+
+    落点与安装链 ``conda_runtime.apply_accel_plan`` 共用同一真相源，保证向导 /
+    设置接口 / 安装链三处一致（禁止在调用点各自判断）。
+    """
+    config.set("accel", "mode", plan["accel.mode"])
+    config.set("tts", "accel", plan["tts.accel"])
+    config.set("tts", "accel_device", plan["tts.accel_device"])
+    config.set("asr", "device", plan["asr.device"])
+    config.set("local_llm", "device", plan["local_llm.device"])
+    config.set("embedding", "device", plan["embedding.device"])
+
+
+def _close_voice_backends(voice):
+    """关闭语音编排器持有的 sidecar 常驻进程（幂等、不抛）。
+
+    仅对桥后端有效（``LiteASR.backend.client`` / ``LiteTTS.backend.client``）；
+    进程内后端 / Mock 后端无 ``client`` 属性时静默跳过。
+    """
+    for facade_name in ("asr", "tts"):
+        facade = getattr(voice, facade_name, None)
+        backend = getattr(facade, "backend", None)
+        client = getattr(backend, "client", None)
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 - 关闭失败不阻断重建（进程随系统回收）
+                pass
+
+
+# ------------------------------------------------------------------ 主动视觉装配（Task C「主动视觉接线」）
+#: 视觉管线 tick 线程的循环节拍（秒）：每拍驱动一次 run_once。
+#: ``vision.enabled=False`` 时 run_once 自身零开销返回 None（隐私红线：绝不采样），
+#: 线程空转 sleep 即可；测试可 monkeypatch 本常量加速 tick 节奏。
+_VISION_TICK_INTERVAL_S = 1.0
+
+
+def build_vision_pipeline(config=None, memory_store=None, cloud=None):
+    """装配主动视觉管线（Task C）：屏幕后端 + 自适应采样器 + VisionPipeline。
+
+    - 屏幕后端：Windows 下构建纯标准库 GDI 后端
+      (:class:`~lite.vision.screen_backend.WindowsGrayscaleScreenBackend`)；
+      非 Windows 注入 None 并告警（管线空转告警，可接受——测试/CI 环境多为 Linux）；
+    - 采样间隔读 config ``vision.min_interval_s`` / ``vision.max_interval_s``
+      （缺失回默认 30 / 2）；配置非法（如 min < max 触发 AdaptiveSampler 校验、
+      非数值触发 float 转换失败）时异常向上抛，由调用方 try/except 兜底告警置
+      None（视觉不阻断服务启动）；
+    - ``vision.enabled`` 默认 False：``run_once`` 直接返回 None 且绝不采样
+      （隐私红线），经 PUT /api/settings 的 ``vision.enabled`` 热更新开启
+      （ConfigManager 内存写即时生效，无需重启）。
+
+    Args:
+        config: ConfigManager（settings 同源实例——热更新开关经它即时生效）。
+        memory_store: 记忆存储（理解结果沉淀目标；None 时理解结果告警跳过沉淀）。
+        cloud: CloudAdapter 实例（云端理解通道；None 时走注入 understanding 或
+            理解失败告警隔离）。
+
+    Returns:
+        VisionPipeline: 已接线 queue consumer 的视觉管线实例。
+    """
+    backend = None
+    if sys.platform == "win32":
+        try:
+            # 延迟导入：ctypes/GDI 依赖链不进入非 Windows 平台导入路径
+            from lite.vision.screen_backend import WindowsGrayscaleScreenBackend
+
+            backend = WindowsGrayscaleScreenBackend()
+        except Exception as exc:  # noqa: BLE001 - 后端构建失败降级空转
+            LOGGER.warning("屏幕采样后端构建失败（%s）：%s", exc.__class__.__name__, exc)
+    else:
+        LOGGER.warning("非 Windows 平台：未装配屏幕采样后端，主动视觉管线空转")
+    min_interval_s = float(config.get("vision", "min_interval_s", 30)) if config is not None else 30.0
+    max_interval_s = float(config.get("vision", "max_interval_s", 2)) if config is not None else 2.0
+    sampler = AdaptiveSampler(
+        backend, min_interval_s=min_interval_s, max_interval_s=max_interval_s
+    )
+    return VisionPipeline(
+        sampler=sampler, cloud=cloud, memory_store=memory_store, config=config
+    )
+
+
+def start_vision_tick_thread(pipeline):
+    """启动视觉管线 tick 线程（daemon=True，随进程退出安静消亡）。
+
+    循环体对 ``run_once`` **整体 try/except**——任何异常（含 mock backend
+    capture 抛错、queue 异常）仅 LOGGER.warning，线程永不因异常退出；
+    无需显式 stop 钩子（本服务装配函数无统一关闭链，daemon 线程随进程回收）。
+
+    :param pipeline: :class:`~lite.vision.pipeline.VisionPipeline` 实例。
+    :return: 线程对象（测试断言 is_alive / 运维观测用）。
+    """
+
+    def _tick_loop():
+        while True:
+            try:
+                pipeline.run_once()
+            except Exception as exc:  # noqa: BLE001 - tick 兜底：线程不自灭
+                LOGGER.warning("主动视觉 tick 异常（%s）：%s", exc.__class__.__name__, exc)
+            time.sleep(_VISION_TICK_INTERVAL_S)
+
+    thread = threading.Thread(target=_tick_loop, name="vision-tick", daemon=True)
+    thread.start()
+    return thread
+
 
 # 默认数据目录：项目根目录下 data/（与 storage._default_db_path 的 data/memories.db 一致）
 DEFAULT_DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
@@ -595,7 +885,7 @@ def make_handler(
     store, pipeline, manager=None, remote=None,
     computer=None, authorizer=None, bridge=None, config=None,
     registry=None, distiller=None, voice=None, cxfc=None, chat_cloud=None,
-    chat_fallback=None, download_manager=None,
+    chat_fallback=None, download_manager=None, vision_pipeline=None,
 ):
     """基于指定依赖构建处理器类（闭包绑定 store / pipeline / manager / remote / computer，便于测试隔离）。
 
@@ -617,14 +907,26 @@ def make_handler(
             CloudConfigError / CloudUnavailableError 延迟到 chat 调用时抛出，
             由端点兜底为离线文案）；测试注入内存 mock 以避免真实网络。
         chat_fallback: 可选离线兜底管理器（Task C3 接线；供 /api/chat/message
-            统一在线/离线通道切换）。缺省按 `_chat_cloud` + `build_local_chat_runtime(config)`
-            构建默认 `OfflineFallbackManager`（依赖缺席/装配失败仅告警并置 None，
-            端点退化为旧的直连云端 + 固定离线文案路径）。测试可注入替身。
+            统一在线/离线通道切换）。缺省按 `_chat_cloud` + 本地聊天运行时持有器
+            构建默认 `OfflineFallbackManager`：``local_llm=`` 传持有器 ``get``
+            （零参 callable / resolver 形态，每次 chat 现解析当前运行时），
+            启动期同步调用一次 ``build_local_chat_runtime(config)`` 的结果经
+            ``set_runtime`` 存入持有器复用（启动期去重，禁止同一模型加载两份）；
+            运行中 PUT ``local_llm.enabled`` 经持有器 ``ensure_started`` /
+            ``release`` 动态接线，无需重启。依赖缺席/装配失败仅告警并置 None，
+            端点退化为旧的直连云端 + 固定离线文案路径。测试可注入替身。
         download_manager: 可选本地模型后台下载管理器（Task 6；供
             /api/setup/model/* 三端点使用）。缺省按 config 构建
             ``ModelDownloadManager``，并注入**本模块的模块级写锁**
             ``_CONFIG_WRITE_LOCK``（与请求线程共用，串行化 config.save()）；
             测试可注入替身（``downloader_factory`` 为假下载器，绝不触网）。
+        vision_pipeline: 可选主动视觉管线实例（Task C；daemon tick 线程驱动）。
+            缺省按 config / store / chat_cloud 构建默认管线
+            （:func:`build_vision_pipeline`：Windows 纯标准库 GDI 屏幕后端 +
+            自适应采样器，``vision.enabled`` 默认 False 隐私红线）；
+            **注入实例同样由本函数启动 tick 线程**（测试注入 mock 后端管线
+            验证 capture 计数 / 线程存活）；装配失败仅告警置 None（视觉不阻断
+            服务启动），线程对象经 handler 类属性 ``_vision_thread`` 透出。
     """
     if manager is None:
         manager = AgentManager()
@@ -689,17 +991,23 @@ def make_handler(
     if chat_cloud is None:
         chat_cloud = CloudAdapter(config)
     # Task C3 接线（N8 语义延续）：仅对显式为 None 的离线兜底管理器回落默认装配。
-    # 默认管理器把「云端 ↔ 本地小 LLM」切换收敛为单一入口；本地运行时按 local_llm
-    # 段组装（未启用/依赖缺席/加载失败由 build_local_chat_runtime 静默降级为 None），
+    # 默认管理器把「云端 ↔ 本地小 LLM」切换收敛为单一入口；本地运行时经
+    # _LocalChatRuntimeHolder 持有（本地模式真正本地，20261002）：
+    # - 启动期：同步调用一次 build_local_chat_runtime(config)（启动期加载），结果
+    #   经 set_runtime 存入持有器复用——禁止同一模型加载两份；
+    # - 运行期：local_llm= 传持有器 get（resolver 形态，每次 chat 现解析），
+    #   PUT local_llm.enabled 经 ensure_started / release 动态接线，无需重启；
     # 装配异常仅告警并置 None——端点退化为旧的直连云端 + 固定离线文案路径，绝不崩。
+    _local_holder = _LocalChatRuntimeHolder()
     _resolved_chat_fallback = chat_fallback
     if _resolved_chat_fallback is None:
         try:
             from lite.cloud.fallback import OfflineFallbackManager
 
+            _local_holder.set_runtime(build_local_chat_runtime(config))
             _resolved_chat_fallback = OfflineFallbackManager(
                 cloud=chat_cloud,
-                local_llm=build_local_chat_runtime(config),
+                local_llm=_local_holder.get,
                 config=config,
             )
         except Exception as exc:  # noqa: BLE001 - 兜底装配失败不得拖垮聊天端点
@@ -713,6 +1021,21 @@ def make_handler(
         download_manager = ModelDownloadManager(
             config_manager=config, write_lock=_CONFIG_WRITE_LOCK
         )
+    # Task C「主动视觉接线」（N8 语义延续）：仅对显式为 None 的视觉管线回落默认
+    # 装配——纯标准库 GDI 屏幕后端（非 Windows 注入 None 空转）+ 自适应采样器
+    # （间隔读 config vision 段）+ VisionPipeline（``vision.enabled`` 默认 False，
+    # 隐私红线：关闭状态绝不采样）。装配失败仅告警并置 None，视觉不阻断服务启动。
+    _resolved_vision = vision_pipeline
+    if _resolved_vision is None:
+        try:
+            _resolved_vision = build_vision_pipeline(config=config, memory_store=store, cloud=chat_cloud)
+        except Exception as exc:  # noqa: BLE001 - 视觉装配失败不阻断服务启动
+            LOGGER.warning("主动视觉管线装配失败（%s）：%s", exc.__class__.__name__, exc)
+    # tick 线程（daemon）对注入实例同样启动：enabled=False 时 run_once 零开销空转，
+    # PUT vision.enabled 热更新后下一拍即开始采样；线程对象经类属性透出供测试断言。
+    _resolved_vision_thread = None
+    if _resolved_vision is not None:
+        _resolved_vision_thread = start_vision_tick_thread(_resolved_vision)
 
     class ApiHandler(BaseHTTPRequestHandler):
         """REST 请求处理器。单线程 HTTPServer 内串行执行，无共享状态竞争。"""
@@ -739,6 +1062,8 @@ def make_handler(
         _chat_cloud = chat_cloud
         _chat_fallback = _resolved_chat_fallback
         _download_manager = download_manager
+        _vision = _resolved_vision
+        _vision_thread = _resolved_vision_thread
 
         # ------------------------------------------------------------ 底层工具
         def log_message(self, fmt, *args):
@@ -887,10 +1212,24 @@ def make_handler(
                     "provider": self._config.get("cloud", "provider", "deepseek"),
                     "base_url": self._config.get("cloud", "base_url", ""),
                 },
-                "tts": {"voice": self._config.get("tts", "voice", "cx-open")},
-                "local_llm": {"enabled": bool(self._config.get("local_llm", "enabled", False))},
+                "tts": {
+                    "voice": self._config.get("tts", "voice", "cx-open"),
+                    "accel": self._config.get("tts", "accel", "auto"),
+                    "accel_device": self._config.get("tts", "accel_device", ""),
+                },
+                # 运行偏好（性能/节能双模式 spec）：设置页首帧对齐 + 切换回显
+                "accel": {"mode": self._config.get("accel", "mode", "performance")},
+                # ready：本地聊天运行时持有器当前是否已加载（本地模式真正本地，
+                # 20261002）——前端据此提示"本地大脑是否就绪"，与 enabled 分离
+                "local_llm": {
+                    "enabled": bool(self._config.get("local_llm", "enabled", False)),
+                    "ready": bool(_local_holder.ready()),
+                },
                 "acp": {"enabled": bool(self._config.get("acp", "enabled", False))},
                 "remote": {"enabled": bool(self._config.get("remote", "enabled", False))},
+                # 主动视觉（Task C）：设置页开关回显；开启后由 vision tick 线程
+                # 驱动采样（默认 False，隐私红线：关闭状态绝不产生屏幕采样）
+                "vision": {"enabled": bool(self._config.get("vision", "enabled", False))},
             }
 
         def _handle_settings_get(self):
@@ -901,14 +1240,26 @@ def make_handler(
             """PUT /api/settings：应用白名单补丁并热更新落盘。
 
             支持键：``cloud.provider``（须在 provider 白名单内）、``tts.voice``、
-            ``local_llm.enabled``。其余键被忽略并列入 ``ignored`` 返回，供调用方校正。
-            段（cloud/tts/local_llm）存在但非 dict 时回 400，避免 AttributeError 冒泡。
+            ``local_llm.enabled``（本地模式真正本地：True 经本地聊天运行时持有器
+            ``ensure_started`` 幂等拉起后台加载线程——立即返回不阻塞请求、不持
+            ``_CONFIG_WRITE_LOCK``；False 经 ``release()`` 释放运行时，无需重启）、
+            ``vision.enabled``（主动视觉开关，Task C：布尔校验；True 后由 vision
+            tick 线程下一拍驱动采样，ConfigManager 内存写即时生效无需重启）、
+            ``accel.mode``（性能/节能双模式，保存时经
+            ``accel_plan`` 展开全部组件落点并在既有写锁内落盘，随后按新配置重建
+            语音桥）。其余键被忽略并列入 ``ignored`` 返回，供调用方校正。
+            段（cloud/tts/local_llm/accel/vision）存在但非 dict 时回 400，避免
+            AttributeError 冒泡。
 
             L2 收口语义：
             - malformed / 非 dict JSON body → 400 ``bad_json``；
             - 空 body（``{}``）→ 400 ``empty_body``（与 malformed 明确区分）；
             - GET 视图可见但白名单只读的已知键（acp/remote/vector section 及
               cloud.base_url）收集进 ``ignored`` 数组随响应回显，消除静默丢弃。
+
+            语音桥重建（N-6）：保存 ``accel.mode`` 后关闭旧 sidecar 进程并按新
+            ``tts.accel`` / ``tts.accel_device`` 重建；重建失败**不静默**——响应
+            附 ``voice_backend.needs_restart=true`` 与中文 message（需重启应用）。
             """
             body = self._read_body_json()
             if body is None:
@@ -921,7 +1272,7 @@ def make_handler(
                 return
             # 先做段类型校验——段存在但非 dict 一律 400，不做 .get() 取值
             invalid_sections = [
-                name for name in ("cloud", "tts", "local_llm")
+                name for name in ("cloud", "tts", "local_llm", "accel", "vision")
                 if name in body and not isinstance(body[name], dict)
             ]
             if invalid_sections:
@@ -973,9 +1324,55 @@ def make_handler(
                 if isinstance(local_enabled, bool):
                     self._config.set("local_llm", "enabled", local_enabled)
                     applied.append("local_llm.enabled")
+                    # 本地模式动态接线（本地模式真正本地，20261002）：写 config 后
+                    # True → 幂等拉起后台加载线程（立即返回，不阻塞请求、不持
+                    # _CONFIG_WRITE_LOCK）；False → 释放运行时（close 幂等）。
+                    if local_enabled:
+                        _local_holder.ensure_started(self._config)
+                    else:
+                        _local_holder.release()
                 else:
                     ignored.append("local_llm.enabled（必须为布尔）")
 
+            # 主动视觉开关（Task C）：布尔校验，非法入 ignored 显式回显。
+            # ConfigManager 内存写即时生效——vision tick 线程的 run_once 每拍
+            # 现读 vision.enabled（热更新段），开启后下一拍即开始采样，无需重启。
+            vision_enabled = body.get("vision", {}).get("enabled")
+            if vision_enabled is not None:
+                if isinstance(vision_enabled, bool):
+                    self._config.set("vision", "enabled", vision_enabled)
+                    applied.append("vision.enabled")
+                else:
+                    ignored.append("vision.enabled（必须为布尔）")
+
+            # 运行偏好（性能/节能双模式）：保存 accel.mode 时经唯一真相源 accel_plan
+            # 展开全部组件落点（tts.accel / tts.accel_device / asr / local_llm /
+            # embedding），与安装链、向导共用同一决策函数（禁止本处另写判断）。
+            accel_mode_raw = body.get("accel", {}).get("mode")
+            accel_applied = False
+            if accel_mode_raw is not None:
+                normalized_mode = (
+                    accel_mode_raw.strip().lower() if isinstance(accel_mode_raw, str) else ""
+                )
+                if normalized_mode in _ACCEL_MODES:
+                    try:
+                        profile = detect_profile()
+                    except Exception as exc:  # noqa: BLE001 - 探测失败保守空画像推导
+                        LOGGER.warning("保存运行偏好时硬件探测失败，已按空画像保守推导：%s", exc)
+                        profile = {}
+                    plan = accel_plan(profile, normalized_mode)
+                    _apply_accel_plan_to_config(self._config, plan)
+                    applied.append("accel.mode")
+                    for key in ("tts.accel", "tts.accel_device", "asr.device",
+                                "local_llm.device", "embedding.device"):
+                        applied.append(key)
+                    accel_applied = True
+                else:
+                    ignored.append(
+                        f"accel.mode={accel_mode_raw!r}（不在白名单 {list(_ACCEL_MODES)}）"
+                    )
+
+            voice_backend = None
             if applied:
                 try:
                     # Task 7：与下载线程共用同一把模块级写锁（配置落盘串行化）
@@ -988,8 +1385,52 @@ def make_handler(
                         status=500,
                     )
                     return
+                # 语音桥重建（N-6）：配置已落盘 → 关旧 sidecar → 按新 tts.accel 重建；
+                # 失败不静默（响应附 needs_restart + 中文 message）。
+                if accel_applied:
+                    voice_backend = self._rebuild_voice_backend()
 
-            self._send_json({"ok": True, "applied": applied, "ignored": ignored, "config": self._settings_view()})
+            response = {"ok": True, "applied": applied, "ignored": ignored,
+                        "config": self._settings_view()}
+            if voice_backend is not None:
+                response["voice_backend"] = voice_backend
+            self._send_json(response)
+
+        def _rebuild_voice_backend(self):
+            """按当前配置重建语音后端（关闭旧 sidecar → 用新参数重建）。
+
+            仅重建语音后端（对话历史保留）；重建失败**不静默**，返回
+            ``{rebuilt: False, needs_restart: True, message: ...}`` 明确提示需重启应用。
+            """
+            try:
+                old_voice = self._voice
+                _close_voice_backends(old_voice)
+                components = build_default_pipeline(self._config)
+                new_voice = LiteVoicePipeline(
+                    vad=components["vad"],
+                    asr=components["asr"],
+                    tts=components["tts"],
+                    cloud=None,
+                    judge=components["judge"],
+                )
+                try:
+                    # 重建的是后端，非会话：保留既有对话历史
+                    new_voice.messages = list(getattr(old_voice, "messages", []) or [])
+                except Exception:  # noqa: BLE001 - 历史保留失败不影响重建
+                    pass
+                # 类属性持久化：BaseHTTPRequestHandler 每请求新建实例，实例属性会丢失
+                type(self)._voice = new_voice
+                return {"rebuilt": True, "needs_restart": False, "message": "运行偏好已切换并生效"}
+            except Exception as exc:  # noqa: BLE001 - 重建失败明确提示需重启，不静默
+                LOGGER.warning("语音加速切换重建失败：%s", exc)
+                return {
+                    "rebuilt": False,
+                    "needs_restart": True,
+                    "message": (
+                        f"运行偏好已保存，但语音加速切换失败（{type(exc).__name__}）："
+                        "需重启应用后生效"
+                    ),
+                }
 
         # ------------------------------------------------------------ 首启向导接口族（Task 6 / Task 7）
         def _handle_setup_status(self):
@@ -1031,8 +1472,13 @@ def make_handler(
             }
 
         def _degraded_recommendation(self, exc):
-            """推荐推导异常时的降级结论（``local_llm.enabled=False`` 走云）。"""
+            """推荐推导异常时的降级结论（``local_llm.enabled=False`` 走云）。
+
+            加速剖面按空画像保守推导（默认节能 + 组件落点回 CPU），保证
+            ``recommendation.accel`` 结构完整、前端不因缺字段而崩。
+            """
             note = f"硬件推荐推导失败，已降级为「先走云端」：{exc.__class__.__name__}"
+            plan = accel_plan({}, derive_default_mode({}))
             return {
                 "use_local": False,
                 "device": "cpu",
@@ -1041,6 +1487,7 @@ def make_handler(
                 "model": None,
                 "reasons": [note],
                 "probe_notes": [note],
+                "accel": _accel_profile_from_plan(plan),
             }
 
         def _handle_setup_recommend(self):
@@ -1065,10 +1512,16 @@ def make_handler(
                 recommendation = self._degraded_recommendation(exc)
             tiers = [dict(entry, tier=name) for name, entry in MODEL_TIERS.items()]
             channel = normalize_channel(self._config.get("download", "channel", DEFAULT_CHANNEL))
+            # 加速剖面（唯一真相源）：优先取 recommend_for 产物；缺失时按画像兜底
+            # 重算（降级路径不得少字段——前端据此渲染模式询问与口语化结论）。
+            accel = recommendation.get("accel") or _accel_profile_from_plan(
+                accel_plan(profile, derive_default_mode(profile))
+            )
             self._send_json(
                 {
                     "profile": profile,
                     "recommendation": recommendation,
+                    "accel": accel,
                     "tiers": tiers,
                     "suggested_source": model_repo_for_channel(channel),
                 }
@@ -1094,6 +1547,8 @@ def make_handler(
             cloud = body.get("cloud") or {}
             download = body.get("download") or {}
             local = body.get("local_llm") or {}
+            accel = body.get("accel") or {}
+            tts = body.get("tts") or {}
 
             provider = cloud.get("provider")
             if provider is not None:
@@ -1149,6 +1604,45 @@ def make_handler(
                     applied.append("local_llm.enabled")
                 else:
                     ignored.append("local_llm.enabled（必须为布尔）")
+
+            # 运行偏好（性能/节能双模式）：accel.mode / tts.accel / tts.accel_device
+            # 白名单校验——合法入 pending 应用，非法入 ignored 显式回显（值域冻结，
+            # 禁止扩张）。
+            mode = accel.get("mode")
+            if mode is not None:
+                normalized_mode = mode.strip().lower() if isinstance(mode, str) else ""
+                if normalized_mode in _ACCEL_MODES:
+                    pending[("accel", "mode")] = normalized_mode
+                    applied.append("accel.mode")
+                else:
+                    ignored.append(f"accel.mode={mode!r}（不在白名单 {list(_ACCEL_MODES)}）")
+
+            tts_accel = tts.get("accel")
+            if tts_accel is not None:
+                normalized_accel = (
+                    tts_accel.strip().lower() if isinstance(tts_accel, str) else ""
+                )
+                if normalized_accel in _TTS_ACCEL_VALUES:
+                    pending[("tts", "accel")] = normalized_accel
+                    applied.append("tts.accel")
+                else:
+                    ignored.append(
+                        f"tts.accel={tts_accel!r}（不在白名单 {list(_TTS_ACCEL_VALUES)}）"
+                    )
+
+            tts_device = tts.get("accel_device")
+            if tts_device is not None:
+                normalized_device = (
+                    tts_device.strip().lower() if isinstance(tts_device, str) else None
+                )
+                if normalized_device in _TTS_ACCEL_DEVICE_VALUES:
+                    pending[("tts", "accel_device")] = normalized_device
+                    applied.append("tts.accel_device")
+                else:
+                    ignored.append(
+                        f"tts.accel_device={tts_device!r}"
+                        f"（不在白名单 {list(_TTS_ACCEL_DEVICE_VALUES)}）"
+                    )
 
             return pending
 
@@ -1211,7 +1705,7 @@ def make_handler(
                 )
                 return
             invalid_sections = [
-                name for name in ("cloud", "download", "local_llm")
+                name for name in ("cloud", "download", "local_llm", "accel", "tts")
                 if name in body and not isinstance(body[name], dict)
             ]
             if invalid_sections:
@@ -1530,6 +2024,10 @@ def make_handler(
                     self._handle_pet_model()
                     return
 
+                if path == "/api/voices":
+                    self._handle_voices_list()
+                    return
+
                 self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
             except Exception as exc:  # noqa: BLE001 - 兜底：任何畸形输入都得到结构化 500 而非连接中断
                 # SystemExit / KeyboardInterrupt 继承 BaseException，不会被此处捕获
@@ -1586,6 +2084,12 @@ def make_handler(
                     return
                 if path == "/api/voice/transcribe":
                     self._handle_voice_transcribe()
+                    return
+                if path == "/api/voice/synthesize_stream":
+                    self._handle_voice_synthesize_stream()
+                    return
+                if path == "/api/voices/import":
+                    self._handle_voices_import()
                     return
                 if path == "/api/cxfc/relay/result":
                     self._handle_relay_result()
@@ -2051,7 +2555,10 @@ def make_handler(
                     400,
                 )
                 return
-            voice = body.get("voice") or None
+            # 音色热切换（Task B）：未显式指定音色时现读 config ``tts.voice``——
+            # 设置页改默认音色后下一次合成即生效，无需重建后端/重启（修复
+            # ``default_voice`` 构造期固化、改 config 不重启不生效的缺陷）
+            voice = body.get("voice") or self._voice_config_default()
             try:
                 audio = self._voice.tts.synthesize(text, voice)
             except Exception as exc:  # noqa: BLE001 - 语音后端故障统一 503 兜底
@@ -2106,6 +2613,229 @@ def make_handler(
                 )
                 return
             self._send_json({"ok": True, "text": str(result.get("text", ""))})
+
+        def _handle_voice_synthesize_stream(self):
+            """POST /api/voice/synthesize_stream：按标点切分后逐句合成，chunked NDJSON 流式下发。
+
+            body ``{text, voice?}``：
+            - 校验：text 非空、长度 <= ``_MAX_SYNTH_TEXT_CHARS``（与整段合成同口径）。
+            - 切分：经 :func:`lite.audio.text_splitter.split_by_punctuation` 按标点切短句。
+            - 流式：每句合成后立即以 chunked 方式下发一行 NDJSON：
+              ``{"seq": N, "text": "<原文片段>", "audio_base64": "<wav base64>"}``
+              末帧：``{"done": true, "total": N}``。
+              单句合成失败不中断，发送 ``{"seq": N, "error": "..."}`` 后继续。
+            - 与 ``/api/voice/synthesize`` 并存：原端点保持整段返回，本端点专供长文本流式。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            text = str(body.get("text") or "").strip()
+            if not text:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "text 为必填字段且不能为空"}, 400
+                )
+                return
+            if len(text) > _MAX_SYNTH_TEXT_CHARS:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "bad_request",
+                        "message": f"text 长度超过上限 {_MAX_SYNTH_TEXT_CHARS} 字符（收到 {len(text)}）",
+                    },
+                    400,
+                )
+                return
+            # 音色热切换（Task B）：与整段合成同口径——未显式指定时现读 config
+            voice = body.get("voice") or self._voice_config_default()
+            segments = split_by_punctuation(text)
+            if not segments:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "文本切分后为空"}, 400
+                )
+                return
+
+            # 发起 chunked 响应头（无 Content-Length，逐段 flush 推送）
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Transfer-Encoding", "chunked")
+            for key, value in self._cors_headers().items():
+                self.send_header(key, value)
+            self.end_headers()
+
+            def _write_ndjson(obj):
+                """写一行 NDJSON chunk（带 chunked 帧头帧尾）。"""
+                line = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+                self.wfile.write(f"{len(line):X}\r\n".encode("ascii"))
+                self.wfile.write(line)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+
+            total = len(segments)
+            for seq, seg in enumerate(segments):
+                try:
+                    audio = self._voice.tts.synthesize(seg, voice)
+                    if not audio:
+                        _write_ndjson({"seq": seq, "text": seg, "error": "合成返回空音频"})
+                        continue
+                    _write_ndjson({
+                        "seq": seq,
+                        "text": seg,
+                        "audio_base64": base64.b64encode(bytes(audio)).decode("ascii"),
+                    })
+                except (BrokenPipeError, ConnectionResetError):
+                    # 客户端已断开（前端 stopSpeaking 触发 abort）：停止后续合成，避免无效 CPU 消耗
+                    return
+                except Exception as exc:  # noqa: BLE001 - 单句失败不中断整段
+                    try:
+                        _write_ndjson({"seq": seq, "text": seg, "error": str(exc)[:200]})
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+            try:
+                _write_ndjson({"done": True, "total": total})
+                # chunked 终止帧
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        # ------------------------------------------------------------ 音色管理（Task B「音色自由选」）
+        def _voice_config_default(self):
+            """读当前 config 的默认音色 id（``tts.voice``；缺失回 ``cx-open``）。"""
+            return str(self._config.get("tts", "voice", DEFAULT_VOICE_ID) or DEFAULT_VOICE_ID)
+
+        def _handle_voices_list(self):
+            """GET /api/voices：内置默认音色 + ``data/voices`` 目录音色包合并列表。
+
+            返回 ``{ok, voices: [{id, path, size, is_default, builtin}]}``：
+            - 内置项 ``cx-open`` 恒在列（``builtin: true``）；目录中亦有同名包时
+              与内置项合并去重（保留目录项的 size/path 信息）；
+            - 目录项来自 :meth:`VoiceManager.list_voices`（附 ``builtin: false``）；
+            - ``is_default`` 统一以当前 config ``tts.voice`` 为口径——列表中恰好
+              一项标记默认，与设置页回显一致（VoiceManager.list_voices 的
+              ``cx-open 恒默认``口径在用户切换默认音色后会与 config 矛盾）。
+            目录扫描失败仅告警并按空目录项处理（端点不 5xx）。
+            """
+            config_default = self._voice_config_default()
+            dir_items = []
+            try:
+                dir_items = VoiceManager(config=self._config).list_voices()
+            except Exception as exc:  # noqa: BLE001 - 目录扫描失败不阻断列表
+                LOGGER.warning("音色目录扫描失败（%s）：%s", exc.__class__.__name__, exc)
+            voices = []
+            builtin_merged = False
+            for item in dir_items:
+                voice_id = str(item.get("id", ""))
+                entry = {
+                    "id": voice_id,
+                    "path": item.get("path"),
+                    "size": item.get("size", 0),
+                    "is_default": (voice_id == config_default),
+                    "builtin": False,
+                }
+                if voice_id == DEFAULT_VOICE_ID:
+                    # 目录项与内置项合并：保留目录项 size/path，builtin 身份保留
+                    entry["builtin"] = True
+                    builtin_merged = True
+                voices.append(entry)
+            if not builtin_merged:
+                voices.insert(0, {
+                    "id": DEFAULT_VOICE_ID,
+                    "path": None,
+                    "size": 0,
+                    "is_default": (config_default == DEFAULT_VOICE_ID),
+                    "builtin": True,
+                })
+            voices.sort(key=lambda v: v["id"])
+            self._send_json({"ok": True, "voices": voices})
+
+        def _handle_voices_import(self):
+            """POST /api/voices/import：把本机音色包目录复制为 ``data/voices/<name>/``。
+
+            body ``{source_path, name?, overwrite?}``，校验链（任一失败回 400
+            中文 message 且不产生任何写入副作用）：
+            - source_path 必填且须为已存在目录；
+            - 须含可加载音色产物（config.json / ckpt.txt / *.pth / *.ckpt 任一，
+              与 TTS 加载口径 ``VoiceManager._is_loadable_voice`` 一致）；
+            - name 缺省取 source_path 的 basename；为空或含路径穿越特征
+              （:func:`is_unsafe_voice_id`）→ 400——防目标目录逃逸；
+            - 目标已存在且 overwrite 非 true → 400；overwrite=true 先删旧目录再复制。
+            本端点为本地单用户应用的受令牌保护端点：source_path 由本机用户经
+            系统对话框选择，不做沙箱化；仅 name 强制过 ``is_unsafe_voice_id``。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            source_path = body.get("source_path")
+            if not isinstance(source_path, str) or not source_path.strip():
+                self._send_json(
+                    {"ok": False, "error": "bad_request",
+                     "message": "source_path 为必填字段且必须是已存在的目录"},
+                    400,
+                )
+                return
+            source_path = os.path.normpath(source_path.strip())
+            if not os.path.isdir(source_path):
+                self._send_json(
+                    {"ok": False, "error": "bad_request",
+                     "message": f"source_path 不是有效目录：{source_path}"},
+                    400,
+                )
+                return
+            if not VoiceManager._is_loadable_voice(source_path):
+                self._send_json(
+                    {"ok": False, "error": "bad_request",
+                     "message": "所选文件夹里没有可用的音色模型文件"
+                                "（需要 config.json / ckpt.txt / *.pth / *.ckpt 任一）"},
+                    400,
+                )
+                return
+            raw_name = body.get("name")
+            if raw_name is None:
+                name = os.path.basename(os.path.normpath(source_path))
+            else:
+                name = raw_name.strip() if isinstance(raw_name, str) else ""
+            if not name or is_unsafe_voice_id(name):
+                self._send_json(
+                    {"ok": False, "error": "bad_request",
+                     "message": "音色名称非法：不能为空，且不得包含路径分隔符、盘符或 ..（防目录逃逸）"},
+                    400,
+                )
+                return
+            manager = VoiceManager(config=self._config)
+            target_dir = os.path.join(manager.voices_dir, name)
+            if os.path.isdir(target_dir):
+                if body.get("overwrite") is not True:
+                    self._send_json(
+                        {"ok": False, "error": "bad_request",
+                         "message": f"音色 {name} 已存在；如需覆盖请传 overwrite=true"},
+                        400,
+                    )
+                    return
+                shutil.rmtree(target_dir)
+            try:
+                os.makedirs(manager.voices_dir, exist_ok=True)
+                shutil.copytree(source_path, target_dir, dirs_exist_ok=True)
+            except OSError as exc:
+                # 复制失败尽力清理半成品目录，避免残留不可加载的脏音色包
+                shutil.rmtree(target_dir, ignore_errors=True)
+                self._send_json(
+                    {"ok": False, "error": "bad_request",
+                     "message": f"复制音色文件失败：{exc}"},
+                    400,
+                )
+                return
+            self._send_json({
+                "ok": True,
+                "voice": {
+                    "id": name,
+                    "path": target_dir,
+                    "size": VoiceManager._dir_size(target_dir),
+                    "is_default": (name == self._voice_config_default()),
+                    "builtin": False,
+                },
+            })
 
         # ------------------------------------------------------------ CXFC relay 前端转接（Task H1）
         def _handle_relay_pending(self, query):

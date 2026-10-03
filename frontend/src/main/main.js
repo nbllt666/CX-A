@@ -18,7 +18,7 @@
  * will-navigate 按 URL 解析精确放行（自身 dist 产物 / dev server origin，D2），
  * setWindowOpenHandler 一律拒绝 window.open。
  */
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen } = require('electron');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const http = require('http');
@@ -46,6 +46,23 @@ let mainWindow = null;
 let petWindow = null;
 /** 后端子进程引用（仅主进程持有，退出时回收） */
 let backendProcess = null;
+
+/**
+ * 应用图标路径（build/icon.ico，与前端 BrandMark 同一视觉）。
+ * 开发态与打包态均为 `frontend(或 app 根)/build/icon.ico`（__dirname 上溯两级）；
+ * 打包由 files 清单携带 build/icon.ico。缺失时返回 undefined（Electron 用默认图标）。
+ * @returns {string | undefined}
+ */
+function appIconPath() {
+  const iconPath = path.resolve(__dirname, '..', '..', 'build', 'icon.ico');
+  try {
+    // eslint-disable-next-line global-require
+    require('fs').accessSync(iconPath);
+    return iconPath;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * 推导后端启动命令（命令 + 参数 + cwd）。
@@ -249,6 +266,7 @@ function createWindow(options = {}) {
     height,
     transparent,
     resizable,
+    icon: appIconPath(),
     backgroundColor: transparent ? '#00000000' : '#fafafc',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -269,8 +287,52 @@ function createWindow(options = {}) {
 }
 
 /**
- * 桌宠透明悬浮窗（320×360，置顶、无边框、跳过任务栏）。
+ * 桌宠悬浮窗尺寸档位（画面宽 px → 窗口宽高映射，与 PetOverlay 的档位键一一对应）。
+ *
+ * 推导（与 PetOverlay CSS 对应，写死为查表而非现算）：
+ *  - 画面（VRM 容器）宽 = 档位值，高 = round(档位 × 1.05)（VrmAvatar 的取景比例）；
+ *  - 窗口宽 = 画面宽 + 根容器左右 padding 14×2 = 档位 + 28；
+ *  - 窗口高 = 画面高 + 上下 padding 28 + 底部菜单浮层呼吸余量（约 27~38px），
+ *    三档分别取整定值 286 / 366 / 440（余量随档位微调，保证模型不贴边、菜单不溢出）。
+ */
+const PET_OVERLAY_SIZE_PRESETS = {
+  220: { width: 248, height: 286 },
+  286: { width: 314, height: 366 },
+  360: { width: 388, height: 440 },
+};
+
+/** 中档（默认档位）——建窗初始尺寸与 renderer 缺省 size 保持一致 */
+const PET_OVERLAY_DEFAULT_SIZE = 286;
+
+/**
+ * 把窗口左上角坐标 clamp 到虚拟屏（全部显示器联合范围）内：
+ * 至少保留 60px 可抓取区域在屏内，防止换档后窗口被移出屏幕过远找不回来。
+ * 仅做简单 clamp，不做智能吸附。必须在 app ready 后调用（依赖 screen 模块）。
+ */
+function clampPointToVirtualScreen(x, y, width, height) {
+  const keep = 60;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const display of screen.getAllDisplays()) {
+    const b = display.bounds;
+    minX = Math.min(minX, b.x);
+    minY = Math.min(minY, b.y);
+    maxX = Math.max(maxX, b.x + b.width);
+    maxY = Math.max(maxY, b.y + b.height);
+  }
+  return [
+    Math.min(Math.max(x, minX - width + keep), maxX - keep),
+    Math.min(Math.max(y, minY - height + keep), maxY - keep),
+  ];
+}
+
+/**
+ * 桌宠透明悬浮窗（中档预设尺寸，置顶、无边框、跳过任务栏）。
  * 通过 IPC『pet-overlay:open』由 renderer 触发创建；幂等——已存在则直接复用。
+ * 初始尺寸取中档预设（renderer 缺省档位 286），非中档记忆档位由 renderer
+ * 挂载后经『pet-overlay:resize』幂等校准，保证「初始 size 与窗口大小一致」。
  * 透明窗口先 show:false，ready-to-show 后再 show()，避免部分平台丢透明。
  */
 function createPetOverlayWindow() {
@@ -278,6 +340,8 @@ function createPetOverlayWindow() {
     petWindow.show();
     return petWindow;
   }
+
+  const preset = PET_OVERLAY_SIZE_PRESETS[PET_OVERLAY_DEFAULT_SIZE];
 
   petWindow = new BrowserWindow({
     width: 320,
@@ -292,6 +356,7 @@ function createPetOverlayWindow() {
     alwaysOnTop: true,
     skipTaskbar: true,
     hasShadow: false,
+    icon: appIconPath(),
     backgroundColor: '#00000000',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -337,6 +402,47 @@ ipcMain.handle('pet-overlay:open', () => {
   return true;
 });
 ipcMain.handle('pet-overlay:close', () => closePetOverlayWindow());
+
+// 平移悬浮窗（增量式拖拽）：renderer 在 pointermove 中节流回传像素增量，
+// 主进程取当前坐标直接叠加。非法参数（非有限数字）静默忽略；窗口不存在静默返回。
+ipcMain.handle('pet-overlay:move', (_event, dx, dy) => {
+  if (!petWindow || petWindow.isDestroyed()) return true;
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return true;
+  const [x, y] = petWindow.getPosition();
+  petWindow.setPosition(Math.round(x + dx), Math.round(y + dy));
+  return true;
+});
+
+// 换档悬浮窗尺寸：查白名单档位映射（非白名单值一律忽略）；保持窗口中心不变，
+// 并 clamp 到虚拟屏范围内防止窗口被移出屏幕过远。
+ipcMain.handle('pet-overlay:resize', (_event, size) => {
+  if (!petWindow || petWindow.isDestroyed()) return true;
+  // typeof gate 之后按数字查表：数字键不可能命中 __proto__ 等原型链成员
+  if (typeof size !== 'number' || !Number.isFinite(size)) return false;
+  const preset = PET_OVERLAY_SIZE_PRESETS[size];
+  if (!preset) return false;
+  const oldBounds = petWindow.getBounds();
+  const centerX = oldBounds.x + oldBounds.width / 2;
+  const centerY = oldBounds.y + oldBounds.height / 2;
+  const [nx, ny] = clampPointToVirtualScreen(
+    Math.round(centerX - preset.width / 2),
+    Math.round(centerY - preset.height / 2),
+    preset.width,
+    preset.height,
+  );
+  petWindow.setBounds({ x: nx, y: ny, width: preset.width, height: preset.height });
+  return true;
+});
+
+// 系统目录选择器（音色文件夹导入通道）：取消或未选返回 null，否则返回绝对路径
+ipcMain.handle('voice:pick-folder', async () => {
+  const result = await dialog.showOpenDialog({
+    title: '选择音色文件夹',
+    properties: ['openDirectory'],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return result.filePaths[0];
+});
 
 // 后端启动令牌（N1）：renderer 经 preload 白名单方法获取后，附带在 API 请求头
 ipcMain.handle('backend:token', () => BACKEND_TOKEN);

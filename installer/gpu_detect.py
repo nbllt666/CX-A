@@ -44,8 +44,10 @@ try:  # 常规路径：包上下文 / CLI 直跑（项目根已注入 sys.path�
         _CUDA_VERSION_RE,
         _DETECT_TIMEOUT_S,
         _NVIDIA_SMI_CMD,
+        _summarize_gpus,
         default_runner,
         detect_via_runner,
+        probe_gpu_inventory,
     )
     from lite.runtime.hardware_profile import GpuDetector as _GpuDetector
 except ImportError:  # pragma: no cover - 项目根未在 sys.path 的极端兜底
@@ -63,8 +65,10 @@ except ImportError:  # pragma: no cover - 项目根未在 sys.path 的极端兜�
         _CUDA_VERSION_RE,
         _DETECT_TIMEOUT_S,
         _NVIDIA_SMI_CMD,
+        _summarize_gpus,
         default_runner,
         detect_via_runner,
+        probe_gpu_inventory,
     )
     from lite.runtime.hardware_profile import GpuDetector as _GpuDetector  # noqa: E402
 
@@ -81,11 +85,43 @@ class GpuDetector(_GpuDetector):
         """初始化检测器：runner 缺省时取本模块 ``default_runner``。"""
         super().__init__(runner if runner is not None else default_runner)
 
+    def probe_inventory(self, runner=None):
+        """枚举 GPU 清单（薄适配：复用 ``probe_gpu_inventory`` 唯一实现）。
+
+        公开 API 的**增量**方法（既有 ``__init__`` / ``detect`` 与返回结构不变），
+        供安装链取核显 / 独显结论用于 ORT 包分叉；失败降级为空清单 + 说明，不抛错。
+
+        :param runner: 临时覆盖实例级 runner；缺省用本实例绑定的 runner。
+        :return: ``(gpus, notes)``——与
+            ``lite.runtime.hardware_profile.probe_gpu_inventory`` 同构。
+        """
+        return probe_gpu_inventory(runner if runner is not None else self._runner)
+
+    def detect_inventory(self, runner=None):
+        """返回画像增量摘要（核显 / 独显结论），供 ORT 包分叉使用。
+
+        为公开 API 的增量方法：不改变 ``detect()`` 契约，仅在既有检测之外补充
+        ``gpus`` / ``has_igpu`` / ``dgpu_vendor``；枚举失败降级为「无核显」保守结论，
+        绝不抛错（安装失败不阻断主安装的口径不变）。
+
+        :param runner: 临时覆盖实例级 runner。
+        :return: dict —— ``gpus`` / ``has_igpu`` / ``dgpu_vendor`` / ``notes``。
+        """
+        gpus, notes = self.probe_inventory(runner=runner)
+        has_igpu, dgpu_vendor = _summarize_gpus(gpus)
+        return {
+            "gpus": gpus,
+            "has_igpu": has_igpu,
+            "dgpu_vendor": dgpu_vendor,
+            "notes": notes,
+        }
+
 
 __all__ = [
     "GpuDetector",
     "default_runner",
     "detect_via_runner",
+    "probe_gpu_inventory",
     "_CREATE_NO_WINDOW",
     "_NVIDIA_SMI_CMD",
     "_AMD_WMIC_CMD",

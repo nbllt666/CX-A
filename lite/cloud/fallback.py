@@ -1,25 +1,30 @@
 # -*- coding: utf-8 -*-
 """断网兜底机制（Task C3）：OfflineFallbackManager。
 
-对齐工程文档 §10.2——在不改动机器现有行为的前提下，将「云端主 LLM ↔ 本地小 LLM」
-的通道切换收敛为单一对外入口：:
+对齐工程文档 §10.2——将「云端主 LLM ↔ 本地小 LLM」的通道切换收敛为单一对外入口。
+本地模式（local_llm.enabled）开启后为**本地优先**路由（隐私红线：设置页承诺
+"不上传任何内容"，本地模式下不得探测网络、不得连云端）：
 
-    在线 → 云端主 LLM（主力）
-    断网 → 检测（CloudAdapter.is_online）
-         → 本地模式已开启？
-            ├─ 是 → 自动切换本地小 LLM 兜底回复
-            └─ 否 → 提示「当前离线，开启本地模式可继续对话」
-    恢复 → 网络恢复，自动切回云端
+    本地模式开启 → 完全跳过网络探测，直连本地：
+        ├─ 本地运行时就绪 → 切 local，本地小 LLM 单块回复
+        └─ 未就绪 → 产 LOCAL_NOT_READY_PROMPT 中文引导提示（绝不静默回落云端）
+    本地模式未开启 → 在线探测（CloudAdapter.is_online）：
+        ├─ 在线 → 云端主 LLM（主力）；云端调用抛 CloudUnavailableError 自动降级
+        └─ 断网 → 本地模式未开启，提示「当前离线，开启本地模式可继续对话」
 
 设计要点：
 - **状态机**：{@link OfflineFallbackManager.Mode} 严格为 ``"cloud" | "local"`` 二值。
   - ``mode == "cloud"``：当前由云端主 LLM 承接；
   - ``mode == "local"``：当前由本地小 LLM 承接。
-  - 离线且「本地模式未开启」时**不切换** state 机（mode 维持 ``"cloud"``），仅产出
-    提示文案——因为并未真正进入本地承接；该提示态以独立的状态字符串
+  - 本地模式开启但运行时未就绪时**不切换** state 机（mode 维持 ``"cloud"``），仅产出
+    引导提示——因为并未真正进入本地承接；该提示态以独立的状态字符串
     {@link OfflineFallbackManager.status}（``"offline_hint"``）记录，供 UI 显示。
+- **本地运行时惰性解析**：``local_llm`` 既支持实例（行为同旧版），也支持**零参
+  可调用对象**（resolver，每次 chat 现解析当前运行时，返回 None 表示未加载），
+  使运行中开启/加载本地模型无需重建管理器即可动态生效。
 - **连接探测节流**：``refresh_online`` 在间隔 {@link OfflineFallbackManager.online_probe_interval}
   内复用缓存探测结果，避免每次 chat 都打真实网络；``force=True`` 可强制重探。
+  仅本地模式未开启的云端路径会探测。
 - **云端调用失败自动降级**：探测在线但 ``cloud.chat`` 真正抛
   {@link CloudUnavailableError} 时，与离线分支同一逻辑降级（切本地或提示）。
 - **模式变化事件**：``add_listener`` 注册的回调在模式真正切换时收到新模式字符串；
@@ -43,6 +48,11 @@ OFFLINE_PROMPT = "当前离线，开启本地模式可继续对话"
 
 #: 云端配置错误诊断态下的提示文案（N5：未配置 API Key 不得误诊为"断网"）
 CONFIG_ERROR_PROMPT = "云端配置未完成，请在设置中填写服务商与 API Key"
+
+#: 本地模式未就绪引导文案（本地优先路由）：本地模式开启但模型未下载/未加载完成
+#: 时的中文引导提示——语义是"去把本地大脑下载好"，绝非"断网"，且绝不静默回落
+#: 云端（设置页承诺"不上传任何内容"，隐私红线）。
+LOCAL_NOT_READY_PROMPT = "本地大脑还没准备好，先去下载好它（设置页或新手引导里可以下）"
 
 #: mode_history 保留的尾部条数上限（第四轮体检批次C：防长驻进程无界增长）
 _MAX_MODE_HISTORY = 100
@@ -69,17 +79,23 @@ OnlineCheck = Callable[[], bool]
 
 
 class OfflineFallbackManager:
-    """断网兜底管理器：在线走云端、离线自动切本地的统一对外入口。
+    """断网兜底管理器：本地模式优先直连本地、云端模式在线走云的统一对外入口。
 
     Args:
         cloud: CloudAdapter 实例。调用其 ``chat``（流式）与 ``is_online``（探测）。
-        local_llm: 可选的 LlamaRuntime 实例；缺省为 None（此时即使开启本地模式
-            也无法兜底，chat 直接产出提示文案）。
+            本地模式开启时**两者均不被调用**（隐私红线：不探测、不连云）。
+        local_llm: 可选的本地小 LLM 运行时，支持两种形态：
+            - 实例（如 LlamaRuntime）：行为同旧版，chat 时直接调用其
+              ``offline_chat``；
+            - 零参可调用对象（resolver）：每次 chat 时惰性调用取得**当前**运行时
+              实例，返回 None 表示未加载——运行中开启本地模式 / 模型后台加载完成
+              无需重建管理器即可动态生效。
+            缺省为 None（此时即使开启本地模式也产出引导提示文案）。
         config: 可选的配置来源，支持三种形态：
             - ``None``：使用默认配置意向（local_llm.enabled 视为 False）；
             - ``dict``：形如 ``{"local_llm": {"enabled": True}}`` 嵌套字典；
             - ``ConfigManager`` 实例（具备 ``get(section, key, default)`` 接口）。
-        online_probe_interval: 在线探测节流间隔（秒），默认 30。
+        online_probe_interval: 在线探测节流间隔（秒），默认 30。仅云端路径探测。
         online_check: 可选的在线探测回调（``() -> bool``）；缺省为
             ``cloud.is_online(timeout=5)`` 的包装。测试注入以模拟网络。
     """
@@ -230,22 +246,57 @@ class OfflineFallbackManager:
         """
         return bool(self._read_cfg("local_llm", "enabled", False))
 
+    def _resolve_local_llm(self):
+        """解析当前本地小 LLM 运行时（实例 / resolver 两形态收敛口）。
+
+        - callable 形态：每次调用现解析（返回 None 表示未加载）；解析异常按
+          未加载处理（返回 None），不向 chat 路径渗漏。
+        - 实例 / None 形态：原样返回（兼容既有调用方）。
+        """
+        if callable(self._local_llm):
+            try:
+                return self._local_llm()
+            except Exception:  # noqa: BLE001 - resolver 异常一律视为未加载
+                LOGGER.warning("本地运行时 resolver 解析异常，按未加载处理", exc_info=True)
+                return None
+        return self._local_llm
+
+    def local_llm_ready(self) -> bool:
+        """本地小 LLM 是否就绪（本地优先路由的就绪判定）。
+
+        判定口径：解析当前运行时（实例直取 / resolver 现调），非 None 即视为
+        就绪；若运行时暴露 ``is_ready`` / ``model_ready`` 属性，则该属性须为真。
+        解析异常（含 resolver 抛错）一律视为未就绪。
+
+        Returns:
+            bool: True 本地运行时就绪；False 未加载 / 未就绪 / 解析异常。
+        """
+        runtime = self._resolve_local_llm()
+        if runtime is None:
+            return False
+        for attr in ("is_ready", "model_ready"):
+            flag = getattr(runtime, attr, None)
+            if flag is not None and not flag:
+                return False
+        return True
+
     # ------------------------------------------------------------------ #
     # 兜底：本地回复 / 离线提示                                           #
     # ------------------------------------------------------------------ #
 
     def _try_local_chat(self, messages) -> Optional[str]:
-        """尝试用本地小 LLM 兜底，失败返回 None（不抛）。
+        """尝试用本地小 LLM 产出回复，失败返回 None（不抛）。
 
         Args:
             messages: OpenAI 兼容消息列表。
         Returns:
             Optional[str]: 本地小 LLM 产出的纯文本；未就绪 / 缺失 / 异常时 None。
         """
-        if self._local_llm is None:
+        runtime = self._resolve_local_llm()
+        if runtime is None:
             return None
         try:
-            return self._local_llm.offline_chat(messages)
+            return runtime.offline_chat(messages)
         except Exception:  # noqa: BLE001 - 兜底失败（含 LlamaNotReady）不崩溃
             return None
 
@@ -298,25 +349,56 @@ class OfflineFallbackManager:
     # 公开入口                                                           #
     # ------------------------------------------------------------------ #
 
+    def _local_mode_stream(self, messages) -> Iterator[str]:
+        """本地模式分支（本地优先路由）：完全不探测网络、不连云端。
+
+        - 运行时就绪 → 切 local、本地单块产出；本地调用中途失败返回 None 时
+          产出 {@link LOCAL_NOT_READY_PROMPT}（本地模式下的语义不再是"断网"，
+          且绝不静默回落云端）。
+        - 未就绪 → 不切换状态机（mode 保持 cloud），产出引导提示文案。
+        """
+        if not self.local_llm_ready():
+            # 未就绪：不切换状态机（未真正进入本地承接），仅产引导提示
+            self.status = "offline_hint"
+            yield LOCAL_NOT_READY_PROMPT
+            return
+        self.change_mode("local")
+        text = self._try_local_chat(messages)
+        if text is None:
+            # 就绪判定通过但本地调用中途失败：产引导提示，不抛、不回落云端
+            self.status = "offline_hint"
+            yield LOCAL_NOT_READY_PROMPT
+            return
+        self.status = "local"
+        yield text
+
     def chat(self, messages) -> Iterator[str]:
-        """对外统一对话入口（流式）。
+        """对外统一对话入口（流式，本地优先路由）。
 
         路由逻辑：
-        1. 先 ``refresh_online`` 探测在线状态；
-        2. 在线 → 若处于本地兜底模式则自动恢复切回云端，再透传 ``cloud.chat``
-           流式；探测在线但调用抛 CloudUnavailableError 时自动降级；
-        3. 离线且本地模式开启 → 切 local，走 ``local_llm.offline_chat`` 单块产出；
-           本地未就绪 → 产提示文案（不抛）；
-        4. 离线且本地模式未开启 → 产提示文案（mode 保持 cloud）。
+        1. 本地模式开启（``local_llm.enabled``）→ **完全不调用 ``refresh_online``**
+           （不探测网络、不连云端，隐私红线）：
+           - 本地运行时就绪 → 切 local，走 ``offline_chat`` 单块产出；
+             中途失败 → 产 {@link LOCAL_NOT_READY_PROMPT}（不抛、不回落云端）；
+           - 未就绪 → 产 {@link LOCAL_NOT_READY_PROMPT} 引导提示（mode 保持 cloud）；
+        2. 本地模式未开启 → 先 ``refresh_online`` 探测在线状态：
+           - 在线 → 若处于本地兜底模式则自动恢复切回云端，再透传 ``cloud.chat``
+             流式；探测在线但调用抛 CloudUnavailableError 时自动降级；
+           - 离线 → 产离线提示文案（mode 保持 cloud；若探测到在线但云端故障的
+             降级路径中本地模式已被中途开启，则切本地兜底）。
 
         Args:
             messages: OpenAI 兼容消息列表（[{role, content}, ...]）。
         Returns:
             Iterator[str]: 文本块迭代器。
         """
+        if self.local_mode_enabled():
+            # 本地优先：不探测、不连云，直连本地（未就绪给引导提示，绝不回落云端）
+            yield from self._local_mode_stream(messages)
+            return
         online = self.refresh_online()
         if online:
-            # 网络已恢复：若停留在本地兜底模式，自动切回云端并通知监听者
+            # 网络可用：若停留在本地兜底模式，自动切回云端并通知监听者
             if self._mode == "local":
                 self.change_mode("cloud")
             yield from self._cloud_stream(messages)

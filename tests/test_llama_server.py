@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""LlamaServerEmbedder 单测（纯替身：绝不启真进程、绝不触网）。
+"""LlamaServerEmbedder / LlamaServerChat 单测（纯替身：绝不启真进程、绝不触网）。
 
 覆盖：冷启动 argv 精确断言 / 就绪轮询（503→200）/ 文件缺失与中途退出 /
 就绪超时 / embed 保序与长度一致性 / 连接异常自动重启重试 / 重试仍失败 /
-条数不匹配与空 data / dim 探针 / close 幂等 / running 状态联动。
+条数不匹配与空 data / dim 探针 / close 幂等 / running 状态联动；
+chat（20260930 常驻化）：argv 形状 / 请求体形状（enable_thinking=false）/ 响应解析 /
+连接异常重启重试 / 4xx 业务错误不重启 / 空 messages 拒绝 / close 幂等。
 
 纪律：全程注入 ``popen_factory`` 与 ``http_factory`` 两个替身，不调用默认实现
 （不 subprocess.Popen、不 urllib 触网）；唯一真实动作是取空闲端口时的本机
@@ -14,7 +16,7 @@ import json
 
 import pytest
 
-from lite.runtime.llama_server import LlamaServerEmbedder
+from lite.runtime.llama_server import LlamaServerChat, LlamaServerEmbedder
 
 
 # ------------------------------------------------------------------ #
@@ -68,17 +70,19 @@ class _PopenRecorder:
 
 
 class _FakeHttp:
-    """假 http 工厂：按 URL 分流到 health / tokenize / embed 处理函数并记录调用。"""
+    """假 http 工厂：按 URL 分流到 health / tokenize / embed / chat 处理函数并记录调用。"""
 
-    def __init__(self, health=None, embed=None, tokenize=None):
-        """注入 health / tokenize / embed 处理函数。
+    def __init__(self, health=None, embed=None, tokenize=None, chat=None):
+        """注入 health / tokenize / embed / chat 处理函数。
 
         tokenize 缺省返回"无 tokens 字段"的 200（等效端点不可用 → 走启发式回退，
         保持既有用例的语义不变）；显式注入可演练真实分词口径。
+        chat 缺省返回固定回复的 200（``choices[0].message.content``）。
         """
         self._health = health or (lambda: (200, b'{"status":"ok"}'))
         self._embed = embed or (lambda _payload: (200, _emb_body([[0.1, 0.2]])))
         self._tokenize = tokenize or (lambda _payload: (200, b'{"no_tokens": true}'))
+        self._chat = chat or (lambda _payload: (200, _chat_body("你好呀")))
         self.calls = []
 
     def __call__(self, url, payload, timeout):
@@ -88,7 +92,16 @@ class _FakeHttp:
             return self._health()
         if url.endswith("/tokenize"):
             return self._tokenize(payload)
+        if url.endswith("/v1/chat/completions"):
+            return self._chat(payload)
         return self._embed(payload)
+
+
+def _chat_body(content):
+    """构造 ``/v1/chat/completions`` 响应体 bytes（OpenAI 兼容形状）。"""
+    return json.dumps(
+        {"choices": [{"message": {"role": "assistant", "content": content}}]}
+    ).encode("utf-8")
 
 
 def _emb_body(vectors, with_index=False, index_order=None):
@@ -614,3 +627,326 @@ def test_embed_4xx_does_not_restart_server(files):
     assert "exceed_context_size_error" in message
     assert len(popen.calls) == 1  # 仅初次启动，无重启抖动
     assert embedder.running is True  # 4xx 不代表服务不健康，进程保留复用
+
+
+# ------------------------------------------------------------------ #
+# 14. LlamaServerChat（常驻 chat 服务，20260930 常驻化改造）           #
+# ------------------------------------------------------------------ #
+
+def _chat_client(files, popen, http, **kwargs):
+    """按注入替身构造 chat 客户端。"""
+    exe, model = files
+    return LlamaServerChat(
+        exe, model, popen_factory=popen, http_factory=http, **kwargs
+    )
+
+
+def test_chat_cold_start_argv_exact(files):
+    """chat 服务冷启动 argv 严格为规定形状（无 ``--embeddings`` 等嵌入专用开关）；幂等。"""
+    popen = _PopenRecorder()
+    client = _chat_client(files, popen, _FakeHttp())
+
+    client.ensure_started()
+
+    assert len(popen.calls) == 1
+    argv = popen.calls[0]
+    exe, model = files
+    assert argv[:6] == [exe, "-m", model, "--host", "127.0.0.1", "--port"]
+    assert argv[6].isdigit() and 1 <= int(argv[6]) <= 65535
+    assert argv[7:] == ["-c", "2048", "-ngl", "0", "--no-webui"]
+    assert len(argv) == 12
+    assert "--embeddings" not in argv
+
+    # 幂等：进程存活时不重复拉起
+    client.ensure_started()
+    assert len(popen.calls) == 1
+    assert client.running is True
+
+
+def test_chat_request_shape_and_parse(files):
+    """chat 请求体形状（messages / max_tokens / temperature / enable_thinking=false /
+    seed）与响应解析（choices[0].message.content）。"""
+    captured = {}
+
+    def chat(payload):
+        captured["body"] = json.loads(payload.decode("utf-8"))
+        return 200, _chat_body("今天过得还不错 [emotion:calm]")
+
+    client = _chat_client(files, _PopenRecorder(), _FakeHttp(chat=chat))
+    out = client.chat(
+        [{"role": "system", "content": "人设"}, {"role": "user", "content": "你好"}],
+        max_tokens=128, temperature=0.7, seed=42,
+    )
+
+    assert out == "今天过得还不错 [emotion:calm]"
+    body = captured["body"]
+    assert body["messages"] == [
+        {"role": "system", "content": "人设"}, {"role": "user", "content": "你好"},
+    ]
+    assert body["max_tokens"] == 128
+    assert body["temperature"] == 0.7
+    # 原生关闭思考链（Qwen3 chat template 开关；实测依据见 20260930 变体矩阵）
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert body["seed"] == 42
+
+
+def test_chat_without_seed_omits_field(files):
+    """seed 缺省不出现在请求体（由服务端默认；仅显式传入才固定复现）。"""
+    captured = {}
+
+    def chat(payload):
+        captured["body"] = json.loads(payload.decode("utf-8"))
+        return 200, _chat_body("嗯")
+
+    client = _chat_client(files, _PopenRecorder(), _FakeHttp(chat=chat))
+    client.chat([{"role": "user", "content": "在吗"}])
+
+    assert "seed" not in captured["body"]
+
+
+def test_chat_retries_after_restart_on_connection_error(files):
+    """首次连接异常 → 自动重启并重试成功（popen 被调用两次）。"""
+    state = {"n": 0}
+
+    def chat(_payload):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise ConnectionError("模拟连接失败")
+        return 200, _chat_body("我在呢")
+
+    popen = _PopenRecorder()
+    client = _chat_client(files, popen, _FakeHttp(chat=chat))
+
+    assert client.chat([{"role": "user", "content": "在吗"}]) == "我在呢"
+    assert len(popen.calls) == 2  # 初次启动 + 重启一次
+    assert client.running is True
+
+
+def test_chat_retry_still_fails_raises_chinese_error(files):
+    """HTTP 5xx 且重试仍失败 → 中文 RuntimeError（含「已重启重试」）并清理引用。"""
+    http = _FakeHttp(chat=lambda _p: (500, b'{"error":"boom"}'))
+    popen = _PopenRecorder()
+    client = _chat_client(files, popen, http)
+
+    with pytest.raises(RuntimeError) as ei:
+        client.chat([{"role": "user", "content": "在吗"}])
+
+    message = str(ei.value)
+    assert "已重启重试" in message
+    assert "HTTP 500" in message
+    assert "boom" in message
+    assert len(popen.calls) == 2
+    assert client._proc is None  # 最终失败后已清理
+
+
+def test_chat_4xx_does_not_restart_server(files):
+    """HTTP 4xx（消息非法 / 超上下文）→ 不重启服务，直接抛中文 RuntimeError。"""
+    http = _FakeHttp(chat=lambda _p: (400, b'{"error":"bad request"}'))
+    popen = _PopenRecorder()
+    client = _chat_client(files, popen, http)
+
+    with pytest.raises(RuntimeError) as ei:
+        client.chat([{"role": "user", "content": "x"}])
+
+    message = str(ei.value)
+    assert "HTTP 400" in message
+    assert "已重启重试" not in message
+    assert len(popen.calls) == 1  # 仅初次启动，无重启抖动
+    assert client.running is True  # 4xx 不代表服务不健康，进程保留复用
+
+
+def test_chat_rejects_empty_messages(files):
+    """空 / 非列表 messages → 中文 RuntimeError（不启动进程、不触网）。"""
+    popen = _PopenRecorder()
+    client = _chat_client(files, popen, _FakeHttp())
+
+    for bad in ([], None, "not-a-list"):
+        with pytest.raises(RuntimeError) as ei:
+            client.chat(bad)
+        assert "messages" in str(ei.value)
+    assert popen.calls == []
+
+
+def test_chat_missing_choices_raises(files):
+    """响应缺 choices / content → RuntimeError（含缺失字段提示），并触发重启重试后失败。"""
+    http = _FakeHttp(chat=lambda _p: (200, b'{"choices":[]}'))
+    client = _chat_client(files, _PopenRecorder(), http)
+
+    with pytest.raises(RuntimeError) as ei:
+        client.chat([{"role": "user", "content": "在吗"}])
+    assert "choices" in str(ei.value)
+
+
+def test_chat_close_idempotent_and_terminates(files):
+    """close 幂等：运行中终止进程；重复 close / 未启动 close 均安全。"""
+    proc = _FakeProc()
+    client = _chat_client(files, _PopenRecorder([proc]), _FakeHttp())
+
+    client.ensure_started()
+    client.close()
+    assert proc.terminated == 1
+    assert client.running is False
+
+    client.close()  # 幂等
+    assert proc.terminated == 1
+
+
+# ------------------------------------------------------------------ #
+# resolve_llama_dir：后端目录选择（20261002 批 A；纯文件系统，不触 socket） #
+# ------------------------------------------------------------------ #
+
+def test_resolve_llama_dir_vulkan_hit(tmp_path):
+    """backend=vulkan 且 vulkan 目录含 llama-server.exe → 取 runtime/llama_vulkan。"""
+    from lite.runtime.llama_server import resolve_llama_dir
+
+    vulkan_dir = tmp_path / "runtime" / "llama_vulkan"
+    vulkan_dir.mkdir(parents=True)
+    (vulkan_dir / "llama-server.exe").write_bytes(b"fake")
+
+    result = resolve_llama_dir(str(tmp_path), "vulkan")
+
+    assert result == str(vulkan_dir)
+
+
+def test_resolve_llama_dir_vulkan_missing_falls_back(tmp_path, caplog):
+    """backend=vulkan 但目录缺失 → 回退 runtime/llama + 中文日志告警。"""
+    import logging
+
+    from lite.runtime.llama_server import resolve_llama_dir
+
+    base_dir = tmp_path / "runtime" / "llama"
+    base_dir.mkdir(parents=True)
+
+    with caplog.at_level(logging.WARNING, logger="lite.runtime.llama_server"):
+        result = resolve_llama_dir(str(tmp_path), "vulkan")
+
+    assert result == str(base_dir)
+    assert any("回退" in rec.message and "Vulkan" in rec.message for rec in caplog.records)
+
+
+def test_resolve_llama_dir_cuda_and_default_keeps_base(tmp_path):
+    """backend=cuda / "" / 未知值 / None → 一律默认 runtime/llama（历史行为等价）。"""
+    from lite.runtime.llama_server import resolve_llama_dir
+
+    base_dir = tmp_path / "runtime" / "llama"
+    base_dir.mkdir(parents=True)
+
+    for backend in ("cuda", "", "auto", "rocm", None):
+        assert resolve_llama_dir(str(tmp_path), backend) == str(base_dir)
+
+
+def test_resolve_llama_dir_cuda_missing_falls_back_vulkan(tmp_path, caplog):
+    """backend=cuda 且默认目录缺 exe → 回退 Vulkan 目录（NVIDIA 亦可运行）+ 中文日志。"""
+    import logging
+
+    from lite.runtime.llama_server import resolve_llama_dir
+
+    vulkan_dir = tmp_path / "runtime" / "llama_vulkan"
+    vulkan_dir.mkdir(parents=True)
+    (vulkan_dir / "llama-server.exe").write_bytes(b"fake")
+
+    with caplog.at_level(logging.WARNING, logger="lite.runtime.llama_server"):
+        result = resolve_llama_dir(str(tmp_path), "cuda")
+
+    assert result == str(vulkan_dir)
+    assert any("回退" in rec.message and "Vulkan" in rec.message for rec in caplog.records)
+
+
+def test_resolve_llama_dir_cuda_and_vulkan_both_missing_keeps_base(tmp_path):
+    """backend=cuda 且两目录均缺 exe → 返回默认目录（交由上层报中文错误）。"""
+    from lite.runtime.llama_server import resolve_llama_dir
+
+    base_dir = tmp_path / "runtime" / "llama"
+    base_dir.mkdir(parents=True)
+
+    assert resolve_llama_dir(str(tmp_path), "cuda") == str(base_dir)
+
+
+def test_resolve_llama_dir_cuda_prefers_base_when_both_present(tmp_path):
+    """backend=cuda 且两目录 exe 齐备 → 仍取默认 CUDA 构建（Vulkan 仅为兜底）。"""
+    from lite.runtime.llama_server import resolve_llama_dir
+
+    base_dir = tmp_path / "runtime" / "llama"
+    base_dir.mkdir(parents=True)
+    (base_dir / "llama-server.exe").write_bytes(b"fake")
+    vulkan_dir = tmp_path / "runtime" / "llama_vulkan"
+    vulkan_dir.mkdir(parents=True)
+    (vulkan_dir / "llama-server.exe").write_bytes(b"fake")
+
+    assert resolve_llama_dir(str(tmp_path), "cuda") == str(base_dir)
+
+
+def test_resolve_llama_dir_vulkan_case_insensitive(tmp_path):
+    """backend 大小写与首尾空白不敏感（" VULKAN " 命中 vulkan 分支）。"""
+    from lite.runtime.llama_server import resolve_llama_dir
+
+    vulkan_dir = tmp_path / "runtime" / "llama_vulkan"
+    vulkan_dir.mkdir(parents=True)
+    (vulkan_dir / "llama-server.exe").write_bytes(b"fake")
+
+    assert resolve_llama_dir(str(tmp_path), " VULKAN ") == str(vulkan_dir)
+
+
+def test_llama_runtime_backend_selects_vulkan_dir(tmp_path, monkeypatch):
+    """llama_runtime 按 embedding/local_llm.backend 组装 exe 路径（vulkan 命中场景）。"""
+    from lite.runtime.llama_runtime import LlamaRuntime
+
+    # 嵌入路径就绪流程会真实拉起子进程：patch 掉启动与维度探针（仅验路径选择）
+    monkeypatch.setattr(
+        "lite.runtime.llama_server.LlamaServerEmbedder.ensure_started", lambda self: None
+    )
+    monkeypatch.setattr(
+        "lite.runtime.llama_server.LlamaServerEmbedder.dim",
+        lambda self, probe_text="ping": 1024,
+    )
+
+    vulkan_dir = tmp_path / "runtime" / "llama_vulkan"
+    vulkan_dir.mkdir(parents=True)
+    (vulkan_dir / "llama-server.exe").write_bytes(b"fake")
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"fake-gguf")
+
+    runtime = LlamaRuntime(
+        config={"embedding": {"backend": "vulkan"}, "local_llm": {"backend": "vulkan"}},
+        root=str(tmp_path),
+    )
+    assert runtime._try_load_external_embedding(str(gguf)) is True
+    embedder = runtime._external_emb
+    assert embedder is not None
+    assert embedder._exe_path == str(vulkan_dir / "llama-server.exe")
+
+    assert runtime._try_load_chat_server(str(gguf)) is True
+    chat_server = runtime._external_chat
+    assert chat_server is not None
+    assert chat_server._exe_path == str(vulkan_dir / "llama-server.exe")
+
+
+def test_llama_runtime_backend_missing_falls_back_to_default(tmp_path, monkeypatch):
+    """backend=vulkan 但 vulkan 目录缺失 → 回退默认目录（行为可用性优先）。"""
+    from lite.runtime.llama_runtime import LlamaRuntime
+
+    # 同上：patch 启动与探针（仅验路径选择，不真实拉起 fake exe）
+    monkeypatch.setattr(
+        "lite.runtime.llama_server.LlamaServerEmbedder.ensure_started", lambda self: None
+    )
+    monkeypatch.setattr(
+        "lite.runtime.llama_server.LlamaServerEmbedder.dim",
+        lambda self, probe_text="ping": 1024,
+    )
+
+    base_dir = tmp_path / "runtime" / "llama"
+    base_dir.mkdir(parents=True)
+    (base_dir / "llama-server.exe").write_bytes(b"fake")
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"fake-gguf")
+
+    runtime = LlamaRuntime(
+        config={"embedding": {"backend": "vulkan"}, "local_llm": {"backend": "bogus"}},
+        root=str(tmp_path),
+    )
+    assert runtime._try_load_external_embedding(str(gguf)) is True
+    assert runtime._external_emb._exe_path == str(base_dir / "llama-server.exe")
+
+    # 非法 backend（bogus）归一 "" → 默认目录（chat 侧，构造即置好客户端）
+    assert runtime._try_load_chat_server(str(gguf)) is True
+    assert runtime._external_chat._exe_path == str(base_dir / "llama-server.exe")

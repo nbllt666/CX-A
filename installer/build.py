@@ -18,6 +18,7 @@
 
 import argparse
 import datetime
+import json
 import os
 import shutil
 import subprocess
@@ -189,8 +190,41 @@ def build_electron_shell():
         )
     if not os.path.isfile(os.path.join(unpacked, ELECTRON_SHELL_EXE)):
         _die(f"壳产物缺失：{os.path.join(unpacked, ELECTRON_SHELL_EXE)}")
+    _apply_exe_icon(os.path.join(unpacked, ELECTRON_SHELL_EXE))
     _log_info(f"Electron 壳打包完成：{unpacked}")
     return unpacked
+
+
+def _apply_exe_icon(shell_exe):
+    """给壳 exe 嵌入应用图标（build/icon.ico，与前端 BrandMark 同一视觉）。
+
+    背景：无证书 Windows 必须保持 electron-builder `win.signAndEditExecutable: false`
+    （否则 app-builder 崩溃，见项目 memory），该开关同时关闭了 exe 资源编辑——
+    故在打包后用 rcedit 单独嵌图标。任何失败仅告警不阻断（图标缺失不致命，
+    任务栏/窗口图标仍由 BrowserWindow icon 生效）。
+    """
+    icon_path = os.path.join(FRONTEND_DIR, "build", "icon.ico")
+    if not os.path.isfile(icon_path):
+        _log_warn(f"图标资产缺失，跳过 exe 图标嵌入：{icon_path}")
+        return
+    icon_js = (
+        "const {rcedit}=require('rcedit');"
+        f"rcedit({json.dumps(shell_exe)},{{icon:{json.dumps(icon_path)}}})"
+        ".then(()=>console.log('ICON_OK')).catch(e=>{console.error(e);process.exit(1)});"
+    )
+    npm_prefix = FRONTEND_DIR  # 从 frontend 解析 node_modules 里的 rcedit
+    try:
+        proc = subprocess.run(
+            ["node", "-e", icon_js], cwd=npm_prefix,
+            capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="replace",
+        )
+        if proc.returncode == 0 and "ICON_OK" in proc.stdout:
+            _log_info("exe 图标已嵌入（rcedit）")
+        else:
+            _log_warn(f"rcedit 嵌图标失败（不影响打包继续）：{(proc.stderr or proc.stdout)[-300:]}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _log_warn(f"rcedit 调用异常（不影响打包继续）：{exc}")
 
 
 def build_backend(work_dir):
@@ -323,6 +357,19 @@ def assemble(electron_dist, backend_dist, portable_root):
         _log_info("语音桥脚本已落位：runtime/voice_bridge/bridge.py")
     else:
         _log_warn(f"语音桥脚本源缺失：{bridge_src}（打包态语音将降级）")
+
+    # TTS ORT 加速资产 -> runtime/voice_bridge/tts_onnx/（与 bridge.py 同目录，脚本按
+    # 相对路径读取；源由 installer/export_tts_onnx.py 生成；缺资产时 bridge 静默回退
+    # 纯 torch。见 .trae/documents/20261001_模块0_TTS引擎ORT落地.md）
+    ort_src = os.path.join(BUNDLED_DIR, "tts_onnx")
+    if os.path.isdir(ort_src) and any(
+        name.endswith(".onnx") for name in os.listdir(ort_src)
+    ):
+        ort_target = os.path.join(portable_root, "runtime", "voice_bridge", "tts_onnx")
+        _copytree_contents(ort_src, ort_target)
+        _log_info("TTS ORT 资产已落位：runtime/voice_bridge/tts_onnx")
+    else:
+        _log_warn(f"TTS ORT 资产源缺失：{ort_src}（打包态 TTS 将回退纯 torch）")
 
     # 数据目录 + 内置模型组件落位 + 默认 config（复用 bootstrap，幂等）
     from installer import bootstrap
@@ -483,6 +530,9 @@ def build_installer(portable_root, release_dir, version=None):
         # llama.cpp 运行时（G-12 补检）：installer.iss [Files] 引用 bundled\llama_cpp，
         # 缺失同样应跳过编译（与"嵌入模型"同口径，避免产出"装完无本地推理"的残缺包）
         "llama.cpp 运行时": os.path.join(BUNDLED_DIR, "llama_cpp"),
+        # llama.cpp Vulkan 运行时（20261002 批 A 补检）：installer.iss [Files] 引用
+        # bundled\llama_cpp_vulkan（AMD/Intel 独显与核显的 GPU 路径），缺失同口径跳过编译
+        "llama.cpp Vulkan 运行时": os.path.join(BUNDLED_DIR, "llama_cpp_vulkan"),
         # 嵌入模型（20260926_模块0_真实嵌入与向量持久化）：记忆检索真实语义嵌入，
         # 缺失即跳过安装器编译（避免产出"装完无嵌入"的静默残缺包）
         "嵌入模型": os.path.join(BUNDLED_DIR, "embedding_model"),

@@ -58,6 +58,124 @@ _TOKENS_PER_CJK_CHAR = 0.75
 #: CJK 表意字符判定（含扩展 A 区与兼容表意区）
 _CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
+#: llama.cpp 后端构建合法值集（20261002 批 A）：其余值一律归一 ""（默认构建）。
+_LLAMA_BACKENDS = ("cuda", "vulkan")
+
+#: 嵌入桥接后端档（20261002 批 B）：``embedding.backend == "onnx"`` 时嵌入经
+#: 语音桥 embed op（sidecar 以 ORT 加载 Qwen3-Embedding ONNX，last-token
+#: pooling + L2 归一）；桥路径不可用（sidecar 缺席 / embed 资产缺失）→ 中文
+#: 告警回退 llama.cpp 既有路径。与 :data:`_LLAMA_BACKENDS`（llama.cpp 构建目录
+#: 选择语义）互斥使用——``onnx`` 不是构建目录意图，不参与 resolve_llama_dir。
+EMBED_BRIDGE_BACKEND = "onnx"
+
+
+class VoiceBridgeEmbedder:
+    """经语音桥 embed op 的嵌入客户端（与 :class:`LlamaServerEmbedder` 同接口）。
+
+    ``embedding.backend == "onnx"`` 时由 :class:`LlamaRuntime` 装配：sidecar
+    以 ORT 加载 ``<root>/runtime/voice_bridge/embed_onnx/`` 下的 Qwen3-Embedding
+    ONNX（last-token pooling + L2 归一，见 voice_bridge.py 的 embed op 协议）。
+    接口对齐：``ensure_started`` / ``embed`` / ``dim`` / ``close``。
+
+    失败语义：sidecar 缺席 / 桥进程不可用 / embed 资产缺失 / ok=false 均抛
+    中文 ``RuntimeError``（含桥客户端的 :class:`VoiceBridgeError`——其本身即
+    RuntimeError 子类），由 :meth:`LlamaRuntime.load_embedding_model` 按
+    "桥路径不可用"回退 llama.cpp。
+    """
+
+    def __init__(self, root=None, device="cpu", timeout=None):
+        """构造独立桥客户端（不启动进程；``ensure_started`` 时探针）。
+
+        :param root: 便携根；缺省经 ``app_root()`` 推导。
+        :param device: 桥设备意图（embed 固定 CPU EP 推理，此参数仅透传桥进程）。
+        :param timeout: 单请求超时秒数；缺省 :data:`EXTERNAL_EMBED_REQUEST_TIMEOUT_S`。
+        """
+        # 函数内延迟导入：仅 onnx 后端真正走到本类时才进入桥客户端导入链
+        from lite.audio.voice_bridge_client import VoiceBridgeClient
+
+        self._client = VoiceBridgeClient(
+            root=root, device=device,
+            timeout=int(timeout or EXTERNAL_EMBED_REQUEST_TIMEOUT_S),
+        )
+        self._dim = None
+
+    def ensure_started(self):
+        """探针就绪：ping 桥进程 + embed 单条探针确定维度。
+
+        :raises RuntimeError: sidecar 缺席 / 进程不可用 / embed 资产缺失
+            （sidecar ok=false）时抛出（中文）。
+        """
+        self._client.request({"op": "ping"}, timeout=30)
+        self._dim = self._probe_dim()
+
+    def _probe_dim(self, probe_text="ping"):
+        """embed 单条探针：返回向量维度（缓存）。"""
+        vectors = self.embed([str(probe_text)])
+        if not vectors or not vectors[0]:
+            raise RuntimeError("embed 探针未返回向量（sidecar 响应异常）")
+        return len(vectors[0])
+
+    def embed(self, texts):
+        """批量文本嵌入：``list[str]`` → ``list[list[float]]``（L2 归一 float32）。
+
+        :raises RuntimeError: texts 非列表/为空（中文）；桥交互失败或 sidecar
+            返回 ok=false（VoiceBridgeError，中文）时抛出。
+        """
+        if not isinstance(texts, list):
+            raise RuntimeError("embed 的 texts 必须为 list。")
+        if not texts:
+            raise RuntimeError("embed 的 texts 不能为空列表。")
+        header, _payload = self._client.request({"op": "embed", "texts": [str(t) for t in texts]})
+        vectors = header.get("vectors")
+        if not isinstance(vectors, list):
+            raise RuntimeError("embed 响应缺少 vectors 字段（sidecar 响应异常）")
+        return vectors
+
+    def dim(self, probe_text="ping"):
+        """嵌入向量维度（首次探针后缓存）。"""
+        if self._dim is None:
+            self._dim = self._probe_dim(probe_text)
+        return self._dim
+
+    def close(self):
+        """显式收尾桥进程（幂等、不抛错；与 LlamaRuntime.close 的调用约定一致）。"""
+        try:
+            self._client.close()
+        except Exception:  # noqa: BLE001 - 回收失败不抛（进程随系统回收）
+            pass
+
+
+def _normalize_backend(value) -> str:
+    """归一 llama.cpp 后端意图（``"cuda"`` / ``"vulkan"`` / ``""``）。
+
+    缺键 / None / 空串 / 非法值（含 ``"auto"`` 等未定义档）一律归一 ``""``，
+    与历史行为（默认 CUDA/CPU 构建目录）逐字等价。
+
+    :param value: 配置读出的原始值（任意类型先 str 化）。
+    :return: 合法后端标识（小写、去首尾空白）；非法回 ``""``。
+    """
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in _LLAMA_BACKENDS else ""
+
+
+#: 嵌入后端合法值集（20261002 批 B 扩展）：cuda / vulkan（llama.cpp 构建目录
+#: 选择）+ ``onnx``（语音桥 ORT 嵌入档，见 :data:`EMBED_BRIDGE_BACKEND`）。
+_EMBED_BACKENDS = _LLAMA_BACKENDS + (EMBED_BRIDGE_BACKEND,)
+
+
+def _normalize_embed_backend(value) -> str:
+    """归一嵌入后端意图（``"cuda"`` / ``"vulkan"`` / ``"onnx"`` / ``""``）。
+
+    与 :func:`_normalize_backend` 的差异：嵌入侧放行 ``"onnx"`` 档（显式配置
+    嵌入走语音桥 embed op）；``local_llm.backend`` 无此语义，仍由
+    :func:`_normalize_backend` 归一（非法回 ``""``，批 A 行为不变）。
+
+    :param value: 配置读出的原始值（任意类型先 str 化）。
+    :return: 合法后端标识（小写、去首尾空白）；非法回 ``""``。
+    """
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in _EMBED_BACKENDS else ""
+
 #: GPU 卸载层数——device="cpu" 且未显式配置 n_gpu_layers 时使用（0 = 全部层驻留 CPU）
 GPU_LAYERS_CPU = 0
 
@@ -75,9 +193,10 @@ EXTERNAL_CHAT_TIMEOUT_S = 300
 # 外部嵌入路径（20260926_模块0_真实嵌入与向量持久化）                  #
 # ------------------------------------------------------------------ #
 
-#: 外部嵌入路径：llama-server 预编译二进制相对便携根的落点（主进程直管常驻
-#: 子进程 + 本机回环 HTTP /v1/embeddings；实测 dim=1024、冷加载约 3s）。
-EXTERNAL_LLAMA_SERVER_REL = ("runtime", "llama", "llama-server.exe")
+#: （20261002 批 A 起废弃）原 llama-server 固定落点常量已由
+#: ``lite.runtime.llama_server.resolve_llama_dir`` 接管——按 backend 意图在
+#: ``runtime/llama``（默认 CUDA/CPU 构建）与 ``runtime/llama_vulkan``
+#: （Vulkan 构建）间选择；缺省行为与历史落点逐字等价。
 
 #: 嵌入模型约定落点（安装器 [Files] 直落目标，与 manifest install_target 一致）：
 #: ``<root>/data/local_llm/qwen3-embedding-0.6b/*.gguf``。
@@ -94,6 +213,18 @@ EXTERNAL_EMBED_REQUEST_TIMEOUT_S = 120
 
 #: 离线对话经外部路径生成时的采样温度（与 2026-09-25 实测口径一致）。
 OFFLINE_CHAT_TEMPERATURE = 0.7
+
+#: 常驻 chat 服务的固定随机种子（20260930）：与语音桥 llama-cli 路径 ``-s 42``
+#: 同口径。实测（20260930 全链探针）：同请求可稳定复现，但首轮与后续轮存在
+#: 服务端序列状态差异（首轮回复与后续不同）——回复多样性是否放开另议。
+CHAT_DEFAULT_SEED = 42
+
+#: 思维链关闭后缀（Qwen3 软开关，20260930）：追加在提示词末尾后，模型直接给出
+#: 回复而不产出 ``[Start thinking]…[End thinking]`` 思考块。本链路是 raw 补全
+#: （llama-cli -p，无 chat template），``--chat-template-kwargs`` 不生效，
+#: 软开关是唯一可行路径。用力点：思考块既拖慢生成（实测约 168 token ≈ 1.9s），
+#: 又会混入回复文本被 TTS 当作正文朗读（实测整段合成放大到 25s 级首音延迟）。
+NO_THINK_SUFFIX = " /no_think"
 
 #: 「是否回复」判定提示词（中文，要求只答 是/否）
 JUDGE_PROMPT_TEMPLATE = (
@@ -243,6 +374,12 @@ class LlamaRuntime:
         self._llm_path = self._read_cfg(config, "local_llm", "model_path", "") or ""
         #: 本地小 LLM 设备意图串（cpu/gpu/auto；外部桥客户端透传用）
         self._llm_device = str(self._read_cfg(config, "local_llm", "device", "cpu") or "cpu")
+        #: llama.cpp 后端构建意图（"cuda"/"vulkan"/""；20261002 批 A：非法归一 ""，
+        #: 决定 llama-server.exe 取 runtime/llama_vulkan 还是默认 runtime/llama 目录）
+        self._llm_backend = _normalize_backend(self._read_cfg(config, "local_llm", "backend", ""))
+        #: 嵌入服务后端意图（20261002 批 B 扩展："cuda"/"vulkan"/"onnx"；onnx =
+        #: 语音桥 ORT 嵌入档，cuda/vulkan 决定 llama.cpp 构建目录，非法归一 ""）
+        self._emb_backend = _normalize_embed_backend(self._read_cfg(config, "embedding", "backend", ""))
         #: 本地小 LLM 上下文窗口（可选 n_ctx 覆盖键，缺省 DEFAULT_LLM_N_CTX；非法值回退默认）
         raw_n_ctx = self._read_cfg(config, "local_llm", "n_ctx", None)
         try:
@@ -269,6 +406,9 @@ class LlamaRuntime:
         self._llm_ready = False
         #: 外部路径：语音桥客户端（llama-cli 子进程推理），未启用为 None
         self._external_client = None
+        #: 外部路径：常驻 chat 服务客户端（llama-server /v1/chat/completions，
+        #: 20260930_模块0_本地LLM常驻推理改造；优先于桥路径），未启用为 None
+        self._external_chat = None
         #: 外部路径的 GGUF 模型路径（逐次请求透传给桥）
         self._external_model_path = ""
         #: 加载过程中的降级提示（与 ConfigManager.warnings 语义一致）
@@ -419,6 +559,11 @@ class LlamaRuntime:
         """
         if not os.path.exists(path):
             return self._record_load_failure("emb", f"嵌入模型文件不存在：{path}（配置意向：{self._emb_model_name}）")
+        # 20261002 批 B：backend="onnx" → 嵌入优先走语音桥 embed op（sidecar 以
+        # ORT 加载 Qwen3-Embedding ONNX）；桥路径不可用（sidecar 缺席 / embed
+        # 资产缺失）→ 中文告警后回落 llama.cpp 既有双路径，行为不中断。
+        if self._emb_backend == EMBED_BRIDGE_BACKEND and self._try_load_bridge_embedding():
+            return True
         try:
             llama_cls = _import_llama()  # 导入失败抛 RuntimeError（提示安装）
         except RuntimeError as exc:
@@ -439,6 +584,27 @@ class LlamaRuntime:
         self._emb_ready = True
         return True
 
+    def _try_load_bridge_embedding(self) -> bool:
+        """尝试经语音桥 embed op 的嵌入路径（``backend=="onnx"`` 专用，20261002 批 B）。
+
+        就位条件：sidecar 解释器与 bridge 脚本就位，且 embed 资产就绪
+        （``<root>/runtime/voice_bridge/embed_onnx/`` + 探针成功）。任一环节失败
+        仅记录 ``warnings``（中文）并返回 False，由调用方回落 llama.cpp 既有路径。
+
+        :return: 就绪返回 True（置 ``_external_emb`` / ``_emb_ready`` / ``emb_dim``）；
+            否则 False（不改就绪状态）。
+        """
+        try:
+            embedder = VoiceBridgeEmbedder(root=self._app_root())
+            embedder.ensure_started()
+        except Exception as exc:  # noqa: BLE001 - 桥路径不可用仅告警，不改动内嵌状态
+            self.warnings.append(f"嵌入 ONNX 桥路径不可用：{exc}")
+            return False
+        self._external_emb = embedder
+        self._emb_ready = True
+        self.emb_dim = int(embedder.dim())
+        return True
+
     def _try_load_external_embedding(self, path) -> bool:
         """尝试外部 llama-server 嵌入路径（预编译二进制 + 本机回环 HTTP）。
 
@@ -451,7 +617,11 @@ class LlamaRuntime:
             否则 False（不改就绪状态）。
         """
         root = self._app_root()
-        exe = os.path.join(root, *EXTERNAL_LLAMA_SERVER_REL)
+        # 20261002 批 A：按嵌入后端意图选目录（vulkan → runtime/llama_vulkan，
+        # 缺失回退默认目录；cuda/"" → runtime/llama 既有行为）
+        from lite.runtime.llama_server import LLAMA_SERVER_EXE_NAME, resolve_llama_dir
+
+        exe = os.path.join(resolve_llama_dir(root, self._emb_backend), LLAMA_SERVER_EXE_NAME)
         if not os.path.isfile(exe):
             self.warnings.append(f"外部嵌入路径不可用：llama-server 不存在（{exe}）")
             return False
@@ -543,6 +713,76 @@ class LlamaRuntime:
         return app_root()
 
     def _try_load_external_llm(self, path) -> bool:
+        """尝试外部路径（优先级：常驻 llama-server → 语音桥 llama-cli）。
+
+        常驻路径（20260930_模块0_本地LLM常驻推理改造）：``llama-server.exe`` 就位时
+        改走 ``/v1/chat/completions`` 常驻服务——消除 llama-cli **每次请求重载模型**
+        （实测单次全流程 6.4~7.4s → 常驻 0.41~0.43s）；
+        回落路径：维持既有语音桥 llama-cli 单次推理（``NO_THINK_SUFFIX`` 软开关
+        即该路径关闭思考链的手段）。
+        两条都不就位返回 False，由调用方按既有口径处理。
+
+        :param path: GGUF 模型文件路径
+        :return: 就绪返回 True 并置 ``_llm_ready``；否则 False（不改状态）
+        """
+        if self._try_load_chat_server(path):
+            return True
+        return self._try_load_bridge_llm(path)
+
+    def _try_load_chat_server(self, path) -> bool:
+        """尝试常驻 chat 服务路径（llama-server ``/v1/chat/completions``）。
+
+        就位条件：``<root>/runtime/llama/llama-server.exe`` 存在。进程**懒启动**
+        （此处置好客户端，首次 chat 或 :meth:`warm_local_llm` 预热时按需拉起）。
+        构造失败仅记录 ``warnings`` 并返回 False（由调用方回落桥路径）。
+
+        :param path: 本地小 LLM GGUF 路径
+        :return: 就绪返回 True（置 ``_external_chat`` / ``_llm_ready``）；否则 False
+        """
+        root = self._app_root()
+        # 20261002 批 A：按本地 LLM 后端意图选目录（口径同嵌入路径，见
+        # resolve_llama_dir；缺省/非法值与历史 runtime/llama 推导逐字等价）
+        from lite.runtime.llama_server import LLAMA_SERVER_EXE_NAME, resolve_llama_dir
+
+        exe = os.path.join(resolve_llama_dir(root, self._llm_backend), LLAMA_SERVER_EXE_NAME)
+        if not os.path.isfile(exe):
+            self.warnings.append(f"常驻 chat 路径不可用：llama-server 不存在（{exe}）")
+            return False
+        try:
+            # 函数内延迟导入：chat 服务客户端模块仅在实际走该路径时进入导入链
+            from lite.runtime.llama_server import LlamaServerChat
+
+            chat_server = LlamaServerChat(
+                exe,
+                str(path),
+                n_gpu_layers=int(self._llm_n_gpu_layers),
+                n_ctx=int(self._n_ctx),
+            )
+        except Exception as exc:  # noqa: BLE001 - 构造失败按外部不可用处理
+            self.warnings.append(f"常驻 chat 路径不可用：{exc}")
+            return False
+        self._external_chat = chat_server
+        self._llm_ready = True
+        return True
+
+    def warm_local_llm(self) -> bool:
+        """预热常驻 chat 服务（幂等；失败返回 False 不抛错）。
+
+        用例：装配方在启动后台线程调用，规避"应用启动后第一句话"再吃一次模型
+        冷加载（实测 8B Q4 GPU 约 5.3~5.5s）。in-process / 桥路径为 no-op（True）。
+
+        :return: 常驻服务已就绪（或本路径无需预热）返回 True；预热失败 False
+        """
+        chat_server = self._external_chat
+        if chat_server is None:
+            return True
+        try:
+            chat_server.ensure_started()
+            return True
+        except Exception:  # noqa: BLE001 - 预热失败静默（首次真实请求再兜底拉起）
+            return False
+
+    def _try_load_bridge_llm(self, path) -> bool:
         """尝试外部 llama-cli 路径（预编译二进制 + 语音桥 sidecar）。
 
         就位条件：``<root>/runtime/llama/llama-cli.exe`` 存在，且语音桥可用
@@ -572,10 +812,82 @@ class LlamaRuntime:
         return True
 
     def _llm_available(self) -> bool:
-        """本地小 LLM 是否可用（in-process 实例或外部桥二者之一就绪）。"""
+        """本地小 LLM 是否可用（in-process / 常驻 chat 服务 / 外部桥 三者之一就绪）。"""
         return bool(
-            self._llm_ready and (self._external_client is not None or self._llm is not None)
+            self._llm_ready
+            and (
+                self._external_chat is not None
+                or self._external_client is not None
+                or self._llm is not None
+            )
         )
+
+    def _external_chat_generate(self, messages, max_tokens, temperature) -> str:
+        """经常驻 chat 服务（llama-server /v1/chat/completions）生成一次文本。
+
+        :raises LlamaNotReady: 常驻路径未就绪（防御性）
+        :raises RuntimeError: 服务侧失败（重启重试后仍失败等中文错误）向上抛出，
+            由调用方的降级出口（OfflineFallbackManager / judge 统一出口）兜底。
+        """
+        if self._external_chat is None:
+            raise LlamaNotReady("常驻 chat 服务路径未就绪。")
+        return self._external_chat.chat(
+            messages,
+            max_tokens=int(max_tokens),
+            temperature=float(temperature),
+            seed=CHAT_DEFAULT_SEED,
+        ).strip()
+
+    def _fit_messages(self, messages, max_tokens):
+        """messages 版的 n_ctx 溢出防护（常驻 chat 服务路径，20260930）。
+
+        规则：按 :func:`_estimate_prompt_tokens` 估算全部消息文本，超预算
+        ``n_ctx - max_tokens - 64余量`` 时从最旧侧删减**非 system** 消息
+        （最近一条恒留）；仍超限则把最后一条内容硬截断到剩余预算内。
+        与 raw 提示词路径的 :meth:`_fit_prompt` 同哲学（保底 system + 最近一轮）。
+
+        :param messages: OpenAI 兼容消息列表
+        :param max_tokens: 本次生成最大 token 数（预算扣减）
+        :return: 裁剪后的消息列表（浅拷贝，元素为 dict）
+        """
+        budget = self._token_budget(max_tokens)
+        msgs = [
+            dict(m) if isinstance(m, dict) else {"role": "user", "content": str(m)}
+            for m in (messages or [])
+        ]
+        if not msgs:
+            return msgs
+
+        def _est(items):
+            """消息列表的 token 估算（各条内容按行拼接后估算）。"""
+            return _estimate_prompt_tokens(
+                "\n".join(str(m.get("content", "")) for m in items)
+            )
+
+        # 1) 从最旧侧删减非 system 消息（最近一条恒留）
+        while len(msgs) > 1 and _est(msgs) > budget:
+            for idx, m in enumerate(msgs[:-1]):
+                if m.get("role") != "system":
+                    msgs.pop(idx)
+                    break
+            else:
+                break  # 已无非 system 可删（只剩 system + 最近一条）
+
+        def _clip_at(index):
+            """把第 ``index`` 条内容截到「预算 − 其余各条估算」内（整表兜底用）。"""
+            others = _est([m for pos, m in enumerate(msgs) if pos != index])
+            remain = max(1.0, budget - others)
+            msgs[index]["content"] = _clip_text_to_token_budget(
+                str(msgs[index].get("content", "")), remain
+            )
+
+        # 2) 仍超限：先截最近一条内容；再超限则截 system（整表硬截断兜底，
+        #    与 raw 提示词路径 _fit_prompt 的尾部截断同哲学；必然收敛到预算内）
+        if _est(msgs) > budget:
+            _clip_at(len(msgs) - 1)
+        if _est(msgs) > budget:
+            _clip_at(0)
+        return msgs
 
     def _external_generate(self, prompt, max_tokens, temperature) -> str:
         """经外部桥（llama-cli）生成一次文本。
@@ -623,12 +935,23 @@ class LlamaRuntime:
         return self._extract_embeddings(result)
 
     def close(self):
-        """回收外部嵌入服务进程（幂等；in-process 模型无需显式回收）。"""
+        """回收外部服务进程（幂等；in-process 模型无需显式回收）。
+
+        覆盖两块常驻子进程：嵌入服务（``_external_emb``）与常驻 chat 服务
+        （``_external_chat``，20260930）。回收失败不抛（进程随系统回收）。
+        """
         embedder = self._external_emb
         self._external_emb = None
         if embedder is not None:
             try:
                 embedder.close()
+            except Exception:  # noqa: BLE001 - 回收失败不抛（进程随系统回收）
+                pass
+        chat_server = self._external_chat
+        self._external_chat = None
+        if chat_server is not None:
+            try:
+                chat_server.close()
             except Exception:  # noqa: BLE001 - 回收失败不抛（进程随系统回收）
                 pass
 
@@ -704,20 +1027,31 @@ class LlamaRuntime:
         """本地小 LLM 判定：用户是否在对本助手说话、是否应当回复。
 
         使用中文提示词（见 ``JUDGE_PROMPT_TEMPLATE``）要求模型只答 是/否，
-        解析结果首词/首字（是/yes/y/true）命中即判为 True。in-process 与
-        外部（llama-cli 桥）两条路径共用同一提示词与解析口径。
+        解析结果首词/首字（是/yes/y/true）命中即判为 True。三条路径
+        （in-process / 常驻 chat 服务 / llama-cli 桥）共用同一提示词与解析口径：
+        常驻服务路径以「单条 user 消息」投递（走 chat template + 原生关思考），
+        其余两条走 raw 提示词 + ``NO_THINK_SUFFIX``。
 
         Args:
             user_text: 用户刚说的话。
         Returns:
             bool: True 表示应当回复；False 表示不回复（自言自语）。
         Raises:
-            LlamaNotReady: 本地小 LLM 未就绪（两条路径均不可用）时抛出。
+            LlamaNotReady: 本地小 LLM 未就绪（三条路径均不可用）时抛出。
         """
         if not self._llm_available():
             raise LlamaNotReady("本地小 LLM 未就绪：请先调用 load_local_llm 加载模型后再进行「是否回复」判定。")
         prompt = JUDGE_PROMPT_TEMPLATE.format(user_text=str(user_text).strip() or "（空输入）")
-        prompt = self._fit_prompt(prompt, JUDGE_MAX_TOKENS)
+        # 常驻 chat 服务路径：走 chat template（enable_thinking=false 原生关思考）
+        if self._external_chat is not None:
+            messages = self._fit_messages(
+                [{"role": "user", "content": prompt}], JUDGE_MAX_TOKENS
+            )
+            return self._parse_yes(
+                self._external_chat_generate(messages, JUDGE_MAX_TOKENS, 0.0)
+            )
+        # 关闭思维链（20260930）：判定要求一字作答，思考块会致首字解析错位
+        prompt = self._fit_prompt(prompt, JUDGE_MAX_TOKENS) + NO_THINK_SUFFIX
         if self._external_client is not None:
             return self._parse_yes(self._external_generate(prompt, JUDGE_MAX_TOKENS, 0.0))
         result = self._llm(prompt, max_tokens=JUDGE_MAX_TOKENS, temperature=0.0)
@@ -730,15 +1064,24 @@ class LlamaRuntime:
             messages: list[dict]，形如 ``[{"role": "system", "content": ...},
                 {"role": "user", "content": ...}]``。
         Returns:
-            str: 本地小 LLM 生成的纯文本回复（in-process 或外部桥路径）。
+            str: 本地小 LLM 生成的纯文本回复（in-process / 常驻 chat 服务 / 外部桥）。
         Raises:
-            LlamaNotReady: 本地小 LLM 未就绪（两条路径均不可用）时抛出。
+            LlamaNotReady: 本地小 LLM 未就绪（三条路径均不可用）时抛出。
         """
         if not self._llm_available():
             raise LlamaNotReady("本地小 LLM 未就绪：请先调用 load_local_llm 加载模型后再进行离线对话。")
+        # 常驻 chat 服务路径（20260930）：直接投递 messages（走 chat template +
+        # enable_thinking=false 原生关思考），n_ctx 预算由 _fit_messages 防护
+        if self._external_chat is not None:
+            fitted = self._fit_messages(messages, OFFLINE_CHAT_MAX_TOKENS)
+            return self._external_chat_generate(
+                fitted, OFFLINE_CHAT_MAX_TOKENS, OFFLINE_CHAT_TEMPERATURE
+            )
         prompt = self._fit_prompt(
             self._format_messages(messages), OFFLINE_CHAT_MAX_TOKENS, messages=messages
         )
+        # 关闭思维链（20260930）：思考块混入回复会被 TTS 当作正文朗读（见 NO_THINK_SUFFIX）
+        prompt = prompt + NO_THINK_SUFFIX
         if self._external_client is not None:
             return self._external_generate(
                 prompt, OFFLINE_CHAT_MAX_TOKENS, OFFLINE_CHAT_TEMPERATURE

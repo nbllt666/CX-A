@@ -143,9 +143,14 @@ function findOverlay(app: ElectronApplication): Page | null {
  *
  * 先清掉 `cx-a.petEnabled` 再 reload：用例之间共享同一 Electron userData，
  * 既有 app.e2e 场景 3 结尾会写入 '0'（关闭态）；不清则本次启动不会自动拉起悬浮窗。
+ * 同理清掉 `cx-a.petSize`（尺寸记忆档位）：上次运行若在大小切换段中途失败，
+ * 残留的非中档档位会让「canvas 宽 286」基线断言失真，一并清零保证用例自愈。
  */
 async function openOverlay(app: ElectronApplication, win: Page): Promise<Page> {
-  await win.evaluate(() => localStorage.removeItem('cx-a.petEnabled'));
+  await win.evaluate(() => {
+    localStorage.removeItem('cx-a.petEnabled');
+    localStorage.removeItem('cx-a.petSize');
+  });
   await win.reload();
   await win.waitForLoadState('domcontentloaded');
   await waitUntil(async () => findOverlay(app) !== null, 30_000, '桌宠悬浮窗出现');
@@ -211,15 +216,38 @@ test.describe.serial('VRM 桌宠渲染链路 E2E', () => {
       const pageBox = await pageCanvas.boundingBox();
       expect(Math.round(pageBox?.width ?? 0), '桌宠页 canvas 显示宽度应为 330').toBe(330);
 
-      // ---- 悬浮窗交互闭环：心情切换 / 说话口型开关 / 关闭即关窗 ----
-      await expect(overlay.getByRole('button', { name: '开心' })).toBeVisible();
+      // ---- 悬浮窗交互闭环（菜单改版）：默认菜单收起 → 点本体弹出 → 心情/说话/大小/关闭 ----
+      // 交互改版后无常驻按钮排：菜单默认收起（挂载后不可见），点击桌宠本体弹出
+      await expect(overlay.locator('.pet-overlay-menu')).toHaveCount(0);
+      await overlay.locator('.pet-overlay-stage').click();
+      await expect(overlay.locator('.pet-overlay-menu')).toBeVisible();
+
+      // 表情：菜单内点「开心」→ data-mood 写入本体（VRM 预设表情随之切换），选中态高亮
       await overlay.getByRole('button', { name: '开心' }).click();
-      // 按钮文案随心情翻转（开心 ↔ 平静），是「mood 真正写进组件」的可观测证据
-      await expect(overlay.getByRole('button', { name: '平静' })).toBeVisible();
+      await expect(overlay.locator('.pet-overlay-stage')).toHaveAttribute('data-mood', 'happy');
+      await overlay.getByRole('button', { name: '平静' }).click();
+      await expect(overlay.locator('.pet-overlay-stage')).toHaveAttribute('data-mood', 'calm');
+
+      // 说话 toggle：data-talking false → true（口型开合由 data-talking 驱动）
       await expect(overlay.locator('.pet-overlay')).toHaveAttribute('data-talking', 'false');
       await overlay.getByRole('button', { name: '说话' }).click();
       await expect(overlay.locator('.pet-overlay')).toHaveAttribute('data-talking', 'true');
-      // ready 态全程保持（交互不得把渲染打回失败/加载）
+
+      // 大小切换：点「小」→ .cx-vrm 内联样式宽变 220px，canvas 实宽跟随
+      // （VrmAvatar 以 key={size} 重挂载，模型字节走模块级缓存，无 loading 间隙）
+      await overlay.getByRole('button', { name: '小' }).click();
+      await expect(overlay.locator('.cx-vrm')).toHaveAttribute('style', /width:\s*220px/);
+      await expect(overlay.locator('.cx-vrm-host canvas')).toBeVisible();
+      const smallBox = await overlay.locator('.cx-vrm-host canvas').boundingBox();
+      expect(Math.round(smallBox?.width ?? 0), '小档 canvas 显示宽度应为 220').toBe(220);
+      // 切回中档：宽度回到 286px（applySize 同步写 localStorage『cx-a.petSize』）
+      await overlay.getByRole('button', { name: '中' }).click();
+      await expect(overlay.locator('.cx-vrm')).toHaveAttribute('style', /width:\s*286px/);
+      await expect(overlay.locator('.cx-vrm-host canvas')).toBeVisible();
+      const midBox = await overlay.locator('.cx-vrm-host canvas').boundingBox();
+      expect(Math.round(midBox?.width ?? 0), '中档 canvas 显示宽度应为 286').toBe(286);
+
+      // ready 态全程保持（交互 + 档位重挂载不得把渲染打回失败/加载）
       await expect(overlay.locator('[data-vrm-state="ready"]')).toBeAttached();
 
       // 关闭按钮：窗口从 2 收到 1，并把开关持久化为 '0'（尊重用户关闭选择）

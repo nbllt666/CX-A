@@ -107,6 +107,17 @@ const BLUSH_CANDIDATES = ['blush', 'Blush', 'cheek', 'Cheek', 'cheekColor'];
 const LOAD_ATTEMPTS = 6;
 const LOAD_RETRY_DELAY_MS = 1500;
 
+/**
+ * 模型字节的模块级缓存（约 15MB）。
+ *
+ * 为什么缓存：尺寸档位切换（PetOverlay 以 key={size} 重挂载本组件）与悬浮窗反复
+ * 开关会多次消费同一份 VRM 字节，逐次走 HTTP 会有可感知的 loading 间隙；缓存命中后
+ * 重挂载零请求、零等待（GN-004 F2）。缓存保存**原始字节原件**，永不直接外借——
+ * parse 前统一传 slice(0) 副本（见 loadModelBufferWithRetry / init 内说明）。
+ * 注意：主窗口与悬浮窗是两个渲染进程，各自持有独立缓存实例，互不影响。
+ */
+let modelBufferCache: ArrayBuffer | null = null;
+
 /** 可被 abort 打断的等待：中止时立即返回，避免卸载后仍挂着定时器。 */
 function delay(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -123,20 +134,27 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 /**
- * 取模型字节（带退避重试）。
+ * 取模型字节（模块缓存优先，未命中才走带退避重试的 HTTP）。
  *
  * 为什么要重试：Electron 启动链是「先建窗口、后端并行拉起」，渲染进程可能在
  * 后端 /api/health 就绪前就发起请求——若只尝试一次，用户会永久停在「显示不了」
  * 提示上（必须手动关开悬浮窗才能恢复），这正是「界面看起来不正常」的成因之一。
  * 这里按 LOAD_ATTEMPTS 次、每次间隔 LOAD_RETRY_DELAY_MS 重试；卸载（signal 中止）
  * 时立即结束，不产生悬挂定时器。全部失败才抛错，由外层给出中文不支持提示。
+ *
+ * 缓存语义：命中直接返回原件（调用方 parse 时自行 slice 副本）；未命中且 fetch
+ * 成功后写入缓存。同一 ArrayBuffer 可被多次消费——three 的 GLTFLoader.parse 不会
+ * transfer/detach 输入 buffer，但保守起见 parse 统一传副本，缓存原件零风险。
  */
 async function loadModelBufferWithRetry(signal: AbortSignal): Promise<ArrayBuffer> {
+  if (modelBufferCache) return modelBufferCache;
   let lastError: unknown = null;
   for (let attempt = 0; attempt < LOAD_ATTEMPTS; attempt += 1) {
     if (signal.aborted) break;
     try {
-      return await fetchPetModelBuffer(signal);
+      const buffer = await fetchPetModelBuffer(signal);
+      modelBufferCache = buffer; // fetch 成功 → 写入模块级缓存，后续挂载零请求
+      return buffer;
     } catch (err) {
       lastError = err;
       if (signal.aborted) break;
@@ -222,7 +240,8 @@ export default function VrmAvatar({ mood, talking, size = 220 }: VrmAvatarProps)
   const prevExprRef = useRef<string | null>(null);
 
   // ---- 初始化一次：创建渲染器 → 取模型 → 解析 → 自适应相机 → 启动动画循环 ----
-  // 依赖为空：model 只取一次；size 变化不重取（悬浮窗 / 桌宠页尺寸固定）。
+  // 依赖为空：模型只取一次。PetOverlay 换尺寸档位时经 key={size} 重挂载本组件、
+  // effect 会重跑，但模型字节命中模块级缓存（见 modelBufferCache），零请求零等待。
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -312,8 +331,9 @@ export default function VrmAvatar({ mood, talking, size = 220 }: VrmAvatarProps)
         stage = 'parse';
         const loader = new GLTFLoader();
         loader.register((parser) => new VRMLoaderPlugin(parser));
+        // parse 传 slice(0) 副本：缓存原件保持完好，可被后续档位切换 / 重挂载反复消费
         const gltf = await new Promise<GLTF>((resolve, reject) => {
-          loader.parse(buffer, '', resolve, (event) =>
+          loader.parse(buffer.slice(0), '', resolve, (event) =>
             reject(new Error(event?.message ? `VRM 解析失败：${event.message}` : 'VRM 解析失败')),
           );
         });

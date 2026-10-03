@@ -437,6 +437,7 @@ def test_load_passes_gpu_layers_to_constructor(emb_model, llm_model, fake_llama_
 from lite.runtime.llama_runtime import (  # noqa: E402
     EXTERNAL_CHAT_TIMEOUT_S,
     JUDGE_MAX_TOKENS,
+    NO_THINK_SUFFIX,
     OFFLINE_CHAT_MAX_TOKENS,
     OFFLINE_CHAT_TEMPERATURE,
 )
@@ -520,6 +521,208 @@ def test_external_path_judge_uses_bridge(external_env, llm_model):
     assert payload["max_tokens"] == JUDGE_MAX_TOKENS
     assert payload["temperature"] == 0.0
     assert "在吗" in payload["prompt"]
+
+
+def test_external_prompts_carry_no_think_suffix(external_env, llm_model):
+    """思维链关闭（20260930）：offline_chat / judge 两条路径投递的提示词均以
+    ``NO_THINK_SUFFIX`` 结尾（raw 补全通道下 Qwen3 软开关，防思考块混入回复）。"""
+    rt = LlamaRuntime(config=None, root=str(external_env))
+    assert rt.load_local_llm(llm_model) is True
+
+    rt.offline_chat([{"role": "user", "content": "你好"}])
+    chat_prompt = rt._external_client.calls[-1]["payload"]["prompt"]
+    assert chat_prompt.endswith(NO_THINK_SUFFIX)
+
+    rt.judge_should_reply("在吗")
+    judge_prompt = rt._external_client.calls[-1]["payload"]["prompt"]
+    assert judge_prompt.endswith(NO_THINK_SUFFIX)
+
+
+def test_inprocess_prompts_carry_no_think_suffix(llm_model, fake_llama_cpp):
+    """in-process 路径同口径（GN-004 O-1）：offline_chat / judge 投递的提示词
+    均以 ``NO_THINK_SUFFIX`` 结尾（与外部桥路径结构一致，独立断言）。"""
+    rt = LlamaRuntime(config=None)
+    assert rt.load_local_llm(llm_model) is True
+
+    rt.offline_chat([{"role": "user", "content": "你好"}])
+    assert FakeLlama.last_prompt.endswith(NO_THINK_SUFFIX)
+
+    rt.judge_should_reply("在吗")
+    assert FakeLlama.last_prompt.endswith(NO_THINK_SUFFIX)
+
+
+# ------------------------------------------------------------------ #
+# 9. 常驻 chat 服务路径（20260930 常驻化改造）                          #
+# ------------------------------------------------------------------ #
+
+from lite.runtime.llama_runtime import CHAT_DEFAULT_SEED  # noqa: E402
+
+
+class _StubChatServer:
+    """替身常驻 chat 服务：记录构造参数与 chat 调用，不启进程、不触网。"""
+
+    instances = []
+    reply_text = "我在呢"
+
+    def __init__(self, exe_path, model_path, n_gpu_layers=0, n_ctx=2048, **kwargs):
+        """记录构造参数（exe/model/n_gpu_layers/n_ctx 供断言）。"""
+        self.exe_path = exe_path
+        self.model_path = model_path
+        self.n_gpu_layers = n_gpu_layers
+        self.n_ctx = n_ctx
+        self.calls = []
+        self.started = 0
+        self.closed = 0
+        _StubChatServer.instances.append(self)
+
+    def ensure_started(self):
+        """记录预热调用（替身无真实进程）。"""
+        self.started += 1
+
+    def chat(self, messages, max_tokens=128, temperature=0.7, seed=None, timeout=None):
+        """记录请求并返回预设文本。"""
+        self.calls.append({
+            "messages": [dict(m) for m in messages],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "seed": seed,
+        })
+        return _StubChatServer.reply_text
+
+    def close(self):
+        """记录回收调用。"""
+        self.closed += 1
+
+
+@pytest.fixture
+def chat_server_env(external_env, monkeypatch):
+    """常驻 chat 服务环境：在 external_env 基础上补 llama-server.exe + 替身 chat 服务。
+
+    ``_try_load_chat_server`` 用函数内 ``from lite.runtime.llama_server import
+    LlamaServerChat``（调用时读模块属性），故 patch 模块属性即可拦截。
+    """
+    import lite.runtime.llama_server as llama_server_mod
+
+    (external_env / "runtime" / "llama" / "llama-server.exe").write_bytes(b"stub-server")
+    monkeypatch.setattr(llama_server_mod, "LlamaServerChat", _StubChatServer)
+    _StubChatServer.instances = []
+    _StubChatServer.reply_text = "我在呢"
+    return external_env
+
+
+def test_external_prefers_chat_server_over_bridge(chat_server_env, llm_model):
+    """llama-server 就位时优先选常驻 chat 服务（而非桥）；构造参数按配置透传。"""
+    rt = LlamaRuntime(
+        config={"local_llm": {"device": "gpu", "n_ctx": 512}}, root=str(chat_server_env)
+    )
+    assert rt.load_local_llm(llm_model) is True
+    assert rt._external_chat is not None
+    assert rt._external_client is None  # 桥路径未被选中
+    assert rt._llm is None
+
+    stub = rt._external_chat
+    assert stub.n_gpu_layers == GPU_LAYERS_ALL  # device=gpu 推导 -1
+    assert stub.n_ctx == 512
+
+    out = rt.offline_chat(
+        [{"role": "system", "content": "人设"}, {"role": "user", "content": "你好"}]
+    )
+    assert out == "我在呢"
+    call = stub.calls[-1]
+    assert call["messages"][0]["role"] == "system"
+    assert call["messages"][-1] == {"role": "user", "content": "你好"}
+    assert call["max_tokens"] == OFFLINE_CHAT_MAX_TOKENS
+    assert call["temperature"] == OFFLINE_CHAT_TEMPERATURE
+    assert call["seed"] == CHAT_DEFAULT_SEED  # 与桥路径 -s 42 同口径
+
+
+def test_chat_server_judge_uses_single_user_message(chat_server_env, llm_model):
+    """判定经常驻服务：单条 user 消息投递（走 chat template），temperature=0。"""
+    rt = LlamaRuntime(config=None, root=str(chat_server_env))
+    assert rt.load_local_llm(llm_model) is True
+    _StubChatServer.reply_text = "是"
+
+    assert rt.judge_should_reply("在吗") is True
+    call = rt._external_chat.calls[-1]
+    assert len(call["messages"]) == 1
+    assert call["messages"][0]["role"] == "user"
+    assert "是否回复" in call["messages"][0]["content"]
+    assert call["max_tokens"] == JUDGE_MAX_TOKENS
+    assert call["temperature"] == 0.0
+
+
+def test_chat_server_prompt_has_no_no_think_suffix(chat_server_env, llm_model):
+    """常驻服务路径关闭思考靠 ``enable_thinking=false``（请求体参数），
+    投递的 messages 内不再追加 ``NO_THINK_SUFFIX``（那是桥路径的手段）。"""
+    rt = LlamaRuntime(config=None, root=str(chat_server_env))
+    assert rt.load_local_llm(llm_model) is True
+
+    rt.offline_chat([{"role": "user", "content": "你好"}])
+    content = rt._external_chat.calls[-1]["messages"][-1]["content"]
+    assert not content.endswith(NO_THINK_SUFFIX)
+
+
+def test_warm_local_llm_prewarms_chat_server(chat_server_env, llm_model):
+    """预热：常驻路径调 ensure_started；桥路径为 no-op 且不抛。"""
+    rt = LlamaRuntime(config=None, root=str(chat_server_env))
+    assert rt.load_local_llm(llm_model) is True
+    assert rt.warm_local_llm() is True
+    assert rt._external_chat.started == 1
+
+
+def test_warm_local_llm_noop_without_chat_server(external_env, llm_model):
+    """无常驻服务（桥路径）：预热为 no-op（True，不触碰桥）。"""
+    rt = LlamaRuntime(config=None, root=str(external_env))
+    assert rt.load_local_llm(llm_model) is True
+    assert rt._external_chat is None
+    assert rt.warm_local_llm() is True
+
+
+def test_close_releases_chat_server(chat_server_env, llm_model):
+    """close 回收常驻 chat 服务（幂等；桥路径不受影响）。"""
+    rt = LlamaRuntime(config=None, root=str(chat_server_env))
+    assert rt.load_local_llm(llm_model) is True
+    stub = rt._external_chat
+
+    rt.close()
+    assert stub.closed == 1
+
+    rt.close()  # 已置 None，二次调用安全
+    assert stub.closed == 1
+
+
+def test_fit_messages_trims_history_and_clips(llm_model, fake_llama_cpp):
+    """_fit_messages：超预算时从最旧侧删非 system 消息，仍超限则硬截断最后一条。"""
+    from lite.runtime.llama_runtime import _estimate_prompt_tokens
+
+    rt = LlamaRuntime(config={"local_llm": {"n_ctx": 512}})
+    assert rt.load_local_llm(llm_model) is True
+    budget = rt._token_budget(OFFLINE_CHAT_MAX_TOKENS)
+
+    history = [{"role": "system", "content": "人设"}] + [
+        {"role": "user", "content": f"第{i}轮：" + "闲聊内容" * 40} for i in range(8)
+    ] + [{"role": "user", "content": "最后一句"}]
+    fitted = rt._fit_messages(history, OFFLINE_CHAT_MAX_TOKENS)
+
+    assert fitted[0]["role"] == "system"           # system 保底
+    assert fitted[-1]["content"] == "最后一句"      # 最近一条恒留
+    assert len(fitted) < len(history)              # 中间轮次被删减
+    assert _estimate_prompt_tokens(
+        "\n".join(str(m["content"]) for m in fitted)
+    ) <= budget
+
+    # 极端：单条即爆（无历史可删）→ 内容被硬截断到预算内
+    huge = rt._fit_messages([{"role": "user", "content": "长" * 5000}], OFFLINE_CHAT_MAX_TOKENS)
+    assert _estimate_prompt_tokens(huge[0]["content"]) <= budget
+
+    # 极端二：system 自身即爆 → 整表兜底（截最近一条后仍超限，再截 system；GN-004 E12）
+    two = rt._fit_messages(
+        [{"role": "system", "content": "设" * 6000}, {"role": "user", "content": "你好"}],
+        OFFLINE_CHAT_MAX_TOKENS,
+    )
+    assert _estimate_prompt_tokens(
+        "\n".join(str(m["content"]) for m in two)
+    ) <= budget
 
 
 def test_external_not_ready_raises_llama_not_ready(external_env, llm_model):
@@ -743,3 +946,132 @@ def test_resolve_embedding_model_path_missing_returns_empty(tmp_path):
     from lite.runtime.llama_runtime import resolve_embedding_model_path
 
     assert resolve_embedding_model_path(None, root=str(tmp_path)) == ""
+
+
+# ------------------------------------------------------------------ #
+# embedding.backend == "onnx"：嵌入桥路径（20261002 批 B）              #
+# ------------------------------------------------------------------ #
+
+
+class _StubBridgeEmbedder:
+    """VoiceBridgeEmbedder 替身：类级开关控制 ensure_started 是否失败。"""
+
+    instances = []
+    fail = False
+
+    def __init__(self, root=None, device="cpu", timeout=None):
+        self.root = root
+        self.device = device
+        self.closed = False
+        type(self).instances.append(self)
+
+    def ensure_started(self):
+        if type(self).fail:
+            raise RuntimeError("嵌入 ONNX 资产缺失（模拟）")
+
+    def embed(self, texts):
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+    def dim(self, probe_text="ping"):
+        return 3
+
+    def close(self):
+        self.closed = True
+
+
+def test_embedding_backend_onnx_prefers_bridge_path(emb_model, tmp_path, monkeypatch):
+    """backend="onnx" 且桥就绪 → 嵌入装配 VoiceBridgeEmbedder（emb_dim 探针确定）。"""
+    from lite.runtime import llama_runtime as lr
+
+    _StubBridgeEmbedder.instances.clear()
+    _StubBridgeEmbedder.fail = False
+    monkeypatch.setattr(lr, "VoiceBridgeEmbedder", _StubBridgeEmbedder)
+    rt = LlamaRuntime(config={"embedding": {"backend": "onnx"}}, root=str(tmp_path))
+    assert rt.load_embedding_model(emb_model) is True
+    assert rt._emb_ready is True
+    assert isinstance(rt._external_emb, _StubBridgeEmbedder)
+    assert rt.emb_dim == 3
+    assert _StubBridgeEmbedder.instances[-1].root == str(tmp_path)
+    vecs = rt.embed(["你好"])
+    assert len(vecs) == 1 and len(vecs[0]) == 3
+
+
+def test_embedding_backend_onnx_falls_back_to_llama_cpp(emb_model, fake_llama_cpp, tmp_path, monkeypatch):
+    """backend="onnx" 但桥路径失败 → 中文告警后回落 llama.cpp 既有路径（不中断）。"""
+    from lite.runtime import llama_runtime as lr
+
+    _StubBridgeEmbedder.instances.clear()
+    _StubBridgeEmbedder.fail = True
+    monkeypatch.setattr(lr, "VoiceBridgeEmbedder", _StubBridgeEmbedder)
+    rt = LlamaRuntime(config={"embedding": {"backend": "onnx"}}, root=str(tmp_path))
+    assert rt.load_embedding_model(emb_model) is True
+    assert any("嵌入 ONNX 桥路径不可用" in w for w in rt.warnings)
+    # 回退后走 in-process fake llama 路径（向量维度 3 与桥替身同形，属既有口径）
+    vecs = rt.embed(["你好"])
+    assert len(vecs[0]) == 3
+
+
+def test_embedding_backend_default_skips_bridge(emb_model, fake_llama_cpp, monkeypatch):
+    """缺省（backend=""）不触碰桥路径（embedder 构造即视为违例）。"""
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("缺省 backend 不应构造 VoiceBridgeEmbedder")
+
+    from lite.runtime import llama_runtime as lr
+
+    monkeypatch.setattr(lr, "VoiceBridgeEmbedder", _boom)
+    rt = LlamaRuntime(config=None)
+    assert rt.load_embedding_model(emb_model) is True
+    vecs = rt.embed(["你好"])
+    assert len(vecs[0]) == 3
+
+
+def test_bridge_embedder_validates_texts(tmp_path, monkeypatch):
+    """VoiceBridgeEmbedder.embed 输入校验：非列表 / 空列表抛中文 RuntimeError。"""
+    from lite.runtime.llama_runtime import VoiceBridgeEmbedder
+
+    class _ClientStub:
+        def __init__(self, **kwargs):
+            self.requests = []
+
+        def request(self, payload, timeout=None):
+            self.requests.append((dict(payload), timeout))
+            if payload.get("op") == "embed":
+                return {"ok": True, "dim": 3, "vectors": [[0.1, 0.2, 0.3]]}, b""
+            return {"ok": True, "pong": True}, b""
+
+        def close(self):
+            pass
+
+    import lite.audio.voice_bridge_client as vbc
+
+    monkeypatch.setattr(vbc, "VoiceBridgeClient", _ClientStub)
+    embedder = VoiceBridgeEmbedder(root=str(tmp_path))
+    with pytest.raises(RuntimeError):
+        embedder.embed("not-a-list")
+    with pytest.raises(RuntimeError):
+        embedder.embed([])
+    vectors = embedder.embed(["你好"])
+    assert vectors == [[0.1, 0.2, 0.3]]
+
+
+def test_bridge_embedder_close_is_idempotent_and_silent(tmp_path, monkeypatch):
+    """close 委托 client.close 且吞回收异常（幂等不抛）。"""
+    from lite.runtime.llama_runtime import VoiceBridgeEmbedder
+
+    class _ClientStub:
+        def __init__(self, **kwargs):
+            pass
+
+        def request(self, payload, timeout=None):
+            return {"ok": True, "dim": 3, "vectors": [[0.1, 0.2, 0.3]]}, b""
+
+        def close(self):
+            raise RuntimeError("模拟回收异常")
+
+    import lite.audio.voice_bridge_client as vbc
+
+    monkeypatch.setattr(vbc, "VoiceBridgeClient", _ClientStub)
+    embedder = VoiceBridgeEmbedder(root=str(tmp_path))
+    embedder.close()  # 不抛即通过
+    embedder.close()

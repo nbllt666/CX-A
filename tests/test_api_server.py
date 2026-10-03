@@ -136,6 +136,23 @@ def http_post(url, payload, method="POST"):
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
+def http_post_stream(url, payload):
+    """POST 请求并按 NDJSON 行解析流式响应，返回 (status, [obj,...])。"""
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8")
+            objs = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            return resp.status, objs
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
 def search_url(base, **params):
     """构造 search 端点 URL，查询参数做 URL 编码（支持中文 query）。"""
     querystring = urlencode({k: str(v) for k, v in params.items() if v is not None})
@@ -552,6 +569,93 @@ def test_settings_put_response_ok_true_and_applied(api_server):
     assert body["applied"] == ["tts.voice"]
 
 
+# ---------------------------------------------------------------- 本地模式动态接线（本地模式真正本地，20261002）
+class _StubLocalRuntime:
+    """本地聊天运行时桩：记录 close 调用（全 stub，绝不真实加载 GGUF）。"""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _wait_until(predicate, timeout=5.0):
+    """轮询等待后台加载线程生效（加载在 daemon 线程异步进行）。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_local_llm_toggle_updates_ready_view(api_server, monkeypatch):
+    """PUT local_llm.enabled=true 后 GET 返回 local_llm.ready=true；PUT false 后 ready=false。
+
+    mock build 路径（monkeypatch build_local_chat_runtime 返回桩）避免真实加载模型。
+    """
+    _store, _pipeline, base = api_server
+    stub = _StubLocalRuntime()
+    build_calls = {"n": 0}
+
+    def _fake_build(config):
+        build_calls["n"] += 1
+        return stub
+
+    monkeypatch.setattr(api_server_module, "build_local_chat_runtime", _fake_build)
+
+    # 初始：未启用未加载 → ready=false
+    _status, body, _raw = http_get(f"{base}/api/settings")
+    assert body["local_llm"]["enabled"] is False
+    assert body["local_llm"]["ready"] is False
+
+    # PUT true → applied；后台加载线程完成后 ready=true
+    status, body = http_post(
+        f"{base}/api/settings", {"local_llm": {"enabled": True}}, method="PUT"
+    )
+    assert status == 200
+    assert "local_llm.enabled" in body["applied"]
+    assert _wait_until(
+        lambda: http_get(f"{base}/api/settings")[1]["local_llm"]["ready"] is True
+    )
+    assert build_calls["n"] == 1
+
+    # PUT true 幂等去重：已有运行时 → 不再重复加载（禁止同一模型加载两份）
+    http_post(f"{base}/api/settings", {"local_llm": {"enabled": True}}, method="PUT")
+    assert _wait_until(
+        lambda: http_get(f"{base}/api/settings")[1]["local_llm"]["ready"] is True
+    )
+    assert build_calls["n"] == 1
+
+    # PUT false → release：ready=false，且运行时 close 被调用（幂等回收）
+    status, body = http_post(
+        f"{base}/api/settings", {"local_llm": {"enabled": False}}, method="PUT"
+    )
+    assert status == 200
+    assert "local_llm.enabled" in body["applied"]
+    assert _wait_until(
+        lambda: http_get(f"{base}/api/settings")[1]["local_llm"]["ready"] is False
+    )
+    assert stub.closed is True
+
+
+def test_local_llm_toggle_false_before_load_release_idempotent(api_server, monkeypatch):
+    """PUT false（无运行时）→ release 幂等无副作用，ready 保持 false。"""
+    _store, _pipeline, base = api_server
+
+    def _fail_build(config):  # 不应被调用（enabled=false 时 ensure_started 不触发）
+        raise AssertionError("PUT false 不应触发后台加载")
+
+    monkeypatch.setattr(api_server_module, "build_local_chat_runtime", _fail_build)
+    status, body = http_post(
+        f"{base}/api/settings", {"local_llm": {"enabled": False}}, method="PUT"
+    )
+    assert status == 200
+    assert "local_llm.enabled" in body["applied"]
+    assert body["config"]["local_llm"]["ready"] is False
+
+
 def test_computer_call_plugin_error_without_authorized_field(computer_env):
     """L3：非授权类 PluginError 不误标 authorized 字段（键不存在）。"""
     base, authorizer, _kb = computer_env
@@ -793,6 +897,62 @@ def test_voice_transcribe_bad_base64_400(api_server):
     assert body2["error"] == "bad_request"
 
 
+def test_voice_synthesize_stream_returns_ndjson_chunks(api_server):
+    """POST /api/voice/synthesize_stream：逐句 NDJSON + 末帧 done。"""
+    _store, _pipeline, base = api_server
+    status, objs = http_post_stream(
+        f"{base}/api/voice/synthesize_stream",
+        {"text": "你好，世界。今天天气不错。"},
+    )
+    assert status == 200
+    assert isinstance(objs, list)
+    # 末帧必须是 done
+    assert objs[-1].get("done") is True
+    assert objs[-1].get("total") == 2
+    # 前两帧为音频帧，seq 连续
+    audio_frames = [o for o in objs if "audio_base64" in o]
+    assert len(audio_frames) == 2
+    assert [f["seq"] for f in audio_frames] == [0, 1]
+    for f in audio_frames:
+        assert base64.b64decode(f["audio_base64"])  # 非空
+
+
+def test_voice_synthesize_stream_empty_text_400(api_server):
+    """POST /api/voice/synthesize_stream：text 为空 → 400 bad_request。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/voice/synthesize_stream", {"text": ""})
+    assert status == 400
+    assert body["error"] == "bad_request"
+
+
+def test_voice_synthesize_stream_segment_failure_continues(api_server, monkeypatch):
+    """流式端点：单句合成失败发 error 帧，后续句仍成功，done 帧 total 正确。"""
+    from lite.audio.tts import MockTTSBackend
+
+    original = MockTTSBackend.synthesize
+
+    def flaky(self, text, voice="cx-open"):
+        if "失败" in text:
+            raise RuntimeError("模拟合成失败")
+        return original(self, text, voice)
+
+    monkeypatch.setattr(MockTTSBackend, "synthesize", flaky)
+    _store, _pipeline, base = api_server
+    status, objs = http_post_stream(
+        f"{base}/api/voice/synthesize_stream",
+        {"text": "第一句。这句会失败。第三句。"},
+    )
+    assert status == 200
+    assert objs[-1].get("done") is True
+    assert objs[-1].get("total") == 3
+    error_frames = [o for o in objs if "error" in o]
+    audio_frames = [o for o in objs if "audio_base64" in o]
+    assert len(error_frames) == 1
+    assert error_frames[0]["seq"] == 1
+    assert len(audio_frames) == 2
+    assert [f["seq"] for f in audio_frames] == [0, 2]
+
+
 def test_new_endpoints_require_token_in_token_mode(api_server, monkeypatch):
     """批次E：令牌模式下五个新端点无令牌 → 403 unauthorized_client（自动继承令牌闸）。"""
     monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
@@ -801,11 +961,12 @@ def test_new_endpoints_require_token_in_token_mode(api_server, monkeypatch):
     status, body = http_get_json(f"{base}/api/tools")
     assert status == 403
     assert body["error"] == "unauthorized_client"
-    # POST 四端点
+    # POST 五端点
     for path, payload in [
         ("/api/tools/call", {"name": "system_info"}),
         ("/api/memory/distill", {"messages": [{"role": "user", "content": "hi"}]}),
         ("/api/voice/synthesize", {"text": "hi"}),
+        ("/api/voice/synthesize_stream", {"text": "hi"}),
         ("/api/voice/transcribe", {"audio_base64": "AAAA"}),
     ]:
         status, body = http_post(f"{base}{path}", payload)
@@ -1896,6 +2057,564 @@ def test_build_deps_lancedb_degrade_to_sqlite_for_real_embedding(tmp_path, monke
         _store, pipeline, _manager, _remote = api.build_deps(data_dir=str(tmp_path))
     assert any("已降级为 SQLite 持久向量库" in rec.getMessage() for rec in caplog.records)
     assert isinstance(pipeline.vector_store, SQLiteVectorStore)
+
+
+# ---------------------------------------------------------------- Task 5：模式入口
+#: 无核显 N 卡画像（性能优先 → tts.accel=cuda；节能 → cpu）。
+_T5_PROFILE_NVIDIA = {
+    "cpu_cores": 8,
+    "ram_gb": 16.0,
+    "gpu_vendor": "nvidia",
+    "vram_gb": 8.0,
+    "cuda_version": "12.4",
+    "disk_free_gb": 200.0,
+    "probe_notes": [],
+    "gpus": [{"vendor": "nvidia", "name": "RTX 4060", "type": "dgpu", "vram_hint": ""}],
+    "has_igpu": False,
+    "dgpu_vendor": "nvidia",
+}
+
+
+def _t5_stub_profile(monkeypatch, profile=None):
+    """把 api_server 的硬件探测替换为确定性画像（不触碰真实硬件）。"""
+    fixed = dict(profile or _T5_PROFILE_NVIDIA)
+    monkeypatch.setattr(api_server_module, "detect_profile", lambda *a, **k: dict(fixed))
+
+
+def test_t5_setup_recommend_contains_accel_profile(tmp_path, monkeypatch):
+    """GET /api/setup/recommend 响应含加速剖面（顶层 accel + recommendation.accel）。"""
+    _t5_stub_profile(monkeypatch)
+    with setup_server(tmp_path) as (base, _config, _handler):
+        status, body, _raw = http_get(f"{base}/api/setup/recommend")
+    assert status == 200
+    assert {"profile", "recommendation", "accel", "tiers", "suggested_source"} <= set(body)
+    assert body["accel"]["mode"] == "performance"
+    assert body["accel"]["tts"]["accel"] == "cuda"
+    assert body["recommendation"]["accel"]["mode"] == "performance"
+    assert isinstance(body["accel"]["reasons"], list) and body["accel"]["reasons"]
+
+
+def test_t5_setup_complete_accel_whitelist_applies_and_ignores(tmp_path):
+    """POST /api/setup/complete 白名单：合法应用 accel.mode / tts.accel / tts.accel_device，非法入 ignored。"""
+    with setup_server(tmp_path) as (base, config, _handler):
+        status, body = http_post(
+            f"{base}/api/setup/complete",
+            {"accel": {"mode": "eco"}, "tts": {"accel": "dml", "accel_device": "igpu"}},
+        )
+        assert status == 200
+        assert body["ok"] is True
+        assert body["setup"]["completed"] is True
+        for key in ("accel.mode", "tts.accel", "tts.accel_device"):
+            assert key in body["applied"], f"{key} 应在 applied 中"
+        assert body["ignored"] == []
+        assert config.get("accel", "mode") == "eco"
+        assert config.get("tts", "accel") == "dml"
+        assert config.get("tts", "accel_device") == "igpu"
+        # 落盘真相与内存一致
+        on_disk = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+        assert on_disk["accel"]["mode"] == "eco"
+        assert on_disk["tts"]["accel_device"] == "igpu"
+
+        # 非法值：不生效（配置不被覆盖）且入 ignored 显式回显
+        status2, body2 = http_post(
+            f"{base}/api/setup/complete",
+            {"accel": {"mode": "turbo"}, "tts": {"accel": "vulkan", "accel_device": "xpu"}},
+        )
+        assert status2 == 200
+        assert body2["applied"] == []
+        ignored_text = "\n".join(body2["ignored"])
+        assert "accel.mode" in ignored_text and "turbo" in ignored_text
+        assert "tts.accel" in ignored_text and "vulkan" in ignored_text
+        assert "tts.accel_device" in ignored_text and "xpu" in ignored_text
+    assert config.get("accel", "mode") == "eco"  # 非法值未覆盖合法值
+    assert config.get("tts", "accel") == "dml"
+
+
+def test_t5_settings_accel_mode_applies_all_landings_in_write_lock(tmp_path, monkeypatch):
+    """PUT /api/settings 保存 accel.mode：经 accel_plan 展开全部落点并落盘；非法入 ignored。"""
+    _t5_stub_profile(monkeypatch)
+    with setup_server(tmp_path) as (base, config, _handler):
+        status, body = http_post(
+            f"{base}/api/settings", {"accel": {"mode": "eco"}}, method="PUT"
+        )
+        assert status == 200
+        assert body["ok"] is True
+        for key in ("accel.mode", "tts.accel", "tts.accel_device",
+                    "asr.device", "local_llm.device", "embedding.device"):
+            assert key in body["applied"], f"{key} 应在 applied 中"
+        # 无核显 → 节能落点全 CPU
+        assert config.get("accel", "mode") == "eco"
+        assert config.get("tts", "accel") == "cpu"
+        assert config.get("tts", "accel_device") == ""
+        assert config.get("asr", "device") == "cpu"
+        assert config.get("local_llm", "device") == "cpu"
+        assert config.get("embedding", "device") == "cpu"
+        # 未落盘前配置在写锁内 save（响应 config 回显新值）
+        assert body["config"]["accel"]["mode"] == "eco"
+        assert body["config"]["tts"]["accel"] == "cpu"
+
+        # 非法 accel.mode：不产生部分写入
+        status2, body2 = http_post(
+            f"{base}/api/settings", {"accel": {"mode": "turbo"}}, method="PUT"
+        )
+        assert status2 == 200
+        assert body2["applied"] == []
+        assert any("accel.mode" in item for item in body2["ignored"])
+    assert config.get("accel", "mode") == "eco"
+    on_disk = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert on_disk["accel"]["mode"] == "eco"
+
+
+class _T5FakeClient:
+    """sidecar 客户端替身：记录 close 次数（不启动真实进程）。"""
+
+    def __init__(self):
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
+class _T5FakeBackend:
+    """桥后端替身：暴露 ``client`` 供 _close_voice_backends 识别。"""
+
+    def __init__(self, client):
+        self.client = client
+
+
+class _T5FakeFacade:
+    """LiteASR / LiteTTS 替身：暴露 ``backend.client``。"""
+
+    def __init__(self, client):
+        self.backend = _T5FakeBackend(client)
+
+
+class _T5FakeVoice:
+    """语音编排器替身：持有假 sidecar 客户端与对话历史。"""
+
+    def __init__(self, client):
+        self.asr = _T5FakeFacade(client)
+        self.tts = _T5FakeFacade(client)
+        self.messages = [{"role": "user", "content": "你好"}]
+
+
+@contextmanager
+def _t5_server_with_voice(tmp_path, voice, config):
+    """起一个注入指定 voice 的测试服务（与 setup_server 同口径，额外注入 voice）。"""
+    store, pipeline, manager, _remote = build_deps(data_dir=str(tmp_path))
+    authorizer = ControlAuthorizer(data_dir=str(tmp_path))
+    computer = ComputerControl(authorized=authorizer.is_authorized())
+    bridge = ToolBridge(computer=computer, authorizer=authorizer)
+    handler = make_handler(
+        store, pipeline, manager,
+        computer=computer, authorizer=authorizer, bridge=bridge, config=config, voice=voice,
+    )
+    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}", config, handler
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_t5_settings_accel_rebuild_closes_old_sidecar_and_uses_new_params(tmp_path, monkeypatch):
+    """语音桥重建路径：关闭旧 sidecar → 按新 tts.accel 重建（新参数捕获）+ 历史保留。"""
+    _t5_stub_profile(monkeypatch)
+    client = _T5FakeClient()
+    old_voice = _T5FakeVoice(client)
+    config = ConfigManager(config_path=str(tmp_path / "config.json"), data_dir=str(tmp_path))
+    captured = {}
+
+    def _fake_build(cfg):
+        """替身工厂：捕获重建时的新参数（不真启动 sidecar）。"""
+        captured["tts_accel"] = cfg.get("tts", "accel")
+        captured["tts_accel_device"] = cfg.get("tts", "accel_device")
+        tts_obj = object()
+        captured["tts_obj"] = tts_obj
+        return {"vad": object(), "asr": object(), "tts": tts_obj, "judge": None}
+
+    monkeypatch.setattr(api_server_module, "build_default_pipeline", _fake_build)
+    with _t5_server_with_voice(tmp_path, old_voice, config) as (base, _cfg, handler):
+        status, body = http_post(f"{base}/api/settings", {"accel": {"mode": "eco"}}, method="PUT")
+
+    assert status == 200
+    assert body["voice_backend"]["rebuilt"] is True
+    assert body["voice_backend"]["needs_restart"] is False
+    assert client.closed >= 1  # 旧 sidecar 已关闭
+    assert captured["tts_accel"] == "cpu"  # 新参数捕获（eco 无核显 → cpu）
+    assert captured["tts_accel_device"] == ""
+    assert handler._voice.tts is captured["tts_obj"]  # 已替换为新后端
+    assert handler._voice.messages == [{"role": "user", "content": "你好"}]  # 历史保留
+
+
+def test_t5_settings_accel_rebuild_failure_reports_needs_restart(tmp_path, monkeypatch):
+    """重建失败不静默：响应附 voice_backend.needs_restart=true 与中文提示；配置仍已落盘。"""
+    _t5_stub_profile(monkeypatch)
+    with setup_server(tmp_path) as (base, config, _handler):
+
+        def _boom(_cfg):
+            raise RuntimeError("sidecar 启动失败")
+
+        monkeypatch.setattr(api_server_module, "build_default_pipeline", _boom)
+        status, body = http_post(f"{base}/api/settings", {"accel": {"mode": "eco"}}, method="PUT")
+
+    assert status == 200
+    assert body["applied"] and "accel.mode" in body["applied"]
+    assert body["voice_backend"]["rebuilt"] is False
+    assert body["voice_backend"]["needs_restart"] is True
+    assert "重启" in body["voice_backend"]["message"]
+    # 重建失败不丢配置
+    assert config.get("accel", "mode") == "eco"
+
+
+# ---------------------------------------------------------------- Task B「音色自由选」：voices API + 音色热切换
+
+
+@pytest.fixture()
+def voices_env(api_server, monkeypatch, tmp_path):
+    """音色目录隔离：``default_voices_dir`` 重定向到临时目录，返回 (base, voices_dir)。
+
+    VoiceManager 缺省扫描项目根 ``data/voices``——直接 monkeypatch 模块内
+    ``default_voices_dir``，使端点的 VoiceManager 构造回落到 tmp 隔离目录。
+    """
+    import lite.audio.voice_manager as vm_module
+
+    voices_dir = tmp_path / "voices"
+    monkeypatch.setattr(vm_module, "default_voices_dir", lambda: str(voices_dir))
+    _store, _pipeline, base = api_server
+    return base, voices_dir
+
+
+def _make_voice_pack(root, name, artifact="config.json", content="{}"):
+    """在 root 下造一个含训练产物的假音色包目录，返回其路径。"""
+    pack = Path(root) / name
+    pack.mkdir(parents=True, exist_ok=True)
+    (pack / artifact).write_text(content, encoding="utf-8")
+    return pack
+
+
+def test_voices_list_builtin_only(voices_env):
+    """GET /api/voices：目录为空/不存在时仅返回内置 cx-open 项（builtin=true）。"""
+    base, _voices_dir = voices_env
+    status, body, _raw = http_get(f"{base}/api/voices")
+    assert status == 200
+    assert body["ok"] is True
+    assert len(body["voices"]) == 1
+    item = body["voices"][0]
+    assert item["id"] == "cx-open"
+    assert item["builtin"] is True
+    assert item["is_default"] is True
+    assert item["size"] == 0
+
+
+def test_voices_list_contains_custom_package(voices_env):
+    """GET /api/voices：目录里的自定义音色包出现在列表中（builtin=false、size>0）。"""
+    base, voices_dir = voices_env
+    pack = _make_voice_pack(voices_dir, "mypack")
+    status, body, _raw = http_get(f"{base}/api/voices")
+    assert status == 200
+    ids = [v["id"] for v in body["voices"]]
+    assert ids == ["cx-open", "mypack"]  # 升序 + 内置项在列
+    custom = body["voices"][1]
+    assert custom["builtin"] is False
+    assert custom["path"] == str(pack)
+    assert custom["size"] > 0
+    assert custom["is_default"] is False
+
+
+def test_voices_list_marks_config_default(voices_env):
+    """GET /api/voices：is_default 以 config tts.voice 为口径（默认音色切换后回显一致）。"""
+    base, voices_dir = voices_env
+    _make_voice_pack(voices_dir, "mypack")
+    status, body = http_post(f"{base}/api/settings", {"tts": {"voice": "mypack"}}, method="PUT")
+    assert status == 200
+    status, body, _raw = http_get(f"{base}/api/voices")
+    assert status == 200
+    by_id = {v["id"]: v for v in body["voices"]}
+    assert by_id["mypack"]["is_default"] is True
+    assert by_id["cx-open"]["is_default"] is False
+
+
+def test_voices_list_dedupes_builtin_with_dir_item(voices_env):
+    """GET /api/voices：目录中已有 cx-open 包时与内置项合并去重（保留目录 size/path）。"""
+    base, voices_dir = voices_env
+    pack = _make_voice_pack(voices_dir, "cx-open", artifact="ckpt.txt", content="weights")
+    status, body, _raw = http_get(f"{base}/api/voices")
+    assert status == 200
+    cx_items = [v for v in body["voices"] if v["id"] == "cx-open"]
+    assert len(cx_items) == 1  # 去重：仅一项
+    merged = cx_items[0]
+    assert merged["builtin"] is True  # 保留内置身份
+    assert merged["path"] == str(pack)  # 保留目录项 path/size
+    assert merged["size"] > 0
+
+
+def test_voices_import_success_copies_pack(voices_env):
+    """POST /api/voices/import：成功复制（name 缺省取 basename），列表可查。"""
+    base, voices_dir = voices_env
+    source = _make_voice_pack(voices_dir.parent, "src_pack", artifact="ckpt.txt", content="w")
+    target = voices_dir / "src_pack"
+    status, body = http_post(f"{base}/api/voices/import", {"source_path": str(source)})
+    assert status == 200
+    assert body["ok"] is True
+    assert body["voice"]["id"] == "src_pack"
+    assert body["voice"]["path"] == str(target)
+    assert body["voice"]["size"] > 0
+    assert body["voice"]["builtin"] is False
+    assert target.is_dir() and (target / "ckpt.txt").exists()
+    # 导入后列表可查
+    _status, listing, _raw = http_get(f"{base}/api/voices")
+    assert "src_pack" in [v["id"] for v in listing["voices"]]
+
+
+def test_voices_import_no_artifacts_400_no_side_effect(voices_env):
+    """POST /api/voices/import：目录无训练产物 → 400 中文提示，且目标目录不产生。"""
+    base, voices_dir = voices_env
+    source = voices_dir.parent / "empty_pack"
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "readme.txt").write_text("说明文本不是音色产物", encoding="utf-8")
+    status, body = http_post(f"{base}/api/voices/import", {"source_path": str(source)})
+    assert status == 400
+    assert body["error"] == "bad_request"
+    assert "音色模型文件" in body["message"]
+    assert not (voices_dir / "empty_pack").exists()
+
+
+def test_voices_import_unsafe_name_400(voices_env):
+    """POST /api/voices/import：name 含路径穿越特征（../evil）→ 400 且不写目标。"""
+    base, voices_dir = voices_env
+    source = _make_voice_pack(voices_dir.parent, "good_pack")
+    for bad_name in ("../evil", "a:b", ""):
+        status, body = http_post(
+            f"{base}/api/voices/import", {"source_path": str(source), "name": bad_name}
+        )
+        assert status == 400, f"name={bad_name!r} 应 400"
+        assert body["error"] == "bad_request"
+    assert not (voices_dir.parent / "evil").exists()
+    assert list(voices_dir.glob("*")) == []  # 无任何写入副作用
+
+
+def test_voices_import_missing_source_400(voices_env):
+    """POST /api/voices/import：source_path 不存在 / 缺失 → 400。"""
+    base, _voices_dir = voices_env
+    status, body = http_post(f"{base}/api/voices/import", {"source_path": str(Path("Z:/no/such/dir"))})
+    assert status == 400
+    status2, body2 = http_post(f"{base}/api/voices/import", {})
+    assert status2 == 400
+    assert body2["error"] == "bad_request"
+
+
+def test_voices_import_overwrite_semantics(voices_env):
+    """POST /api/voices/import：重名无 overwrite 400；overwrite=true 删旧再复制。"""
+    base, voices_dir = voices_env
+    source_a = _make_voice_pack(voices_dir.parent, "pack_a", artifact="ckpt.txt", content="AAA")
+    source_b = _make_voice_pack(voices_dir.parent, "pack_b", artifact="ckpt.txt", content="BBB")
+    # 第一次导入成功
+    status, _body = http_post(
+        f"{base}/api/voices/import", {"source_path": str(source_a), "name": "dual"}
+    )
+    assert status == 200
+    target = voices_dir / "dual"
+    assert (target / "ckpt.txt").read_text(encoding="utf-8") == "AAA"
+    # 重名无 overwrite → 400
+    status, body = http_post(
+        f"{base}/api/voices/import", {"source_path": str(source_b), "name": "dual"}
+    )
+    assert status == 400
+    assert "已存在" in body["message"]
+    # overwrite=true → 覆盖为 pack_b 内容
+    status, body = http_post(
+        f"{base}/api/voices/import",
+        {"source_path": str(source_b), "name": "dual", "overwrite": True},
+    )
+    assert status == 200
+    assert (target / "ckpt.txt").read_text(encoding="utf-8") == "BBB"
+
+
+def test_voice_synthesize_hot_reloads_config_voice(api_server, monkeypatch):
+    """音色热切换：PUT 改 tts.voice 后 synthesize 端点现读 config 收到新音色 id。"""
+    from lite.audio.tts import MockTTSBackend
+
+    received = []
+    original = MockTTSBackend.synthesize
+
+    def spy(self, text, voice="cx-open"):
+        received.append(voice)
+        return original(self, text, voice)
+
+    monkeypatch.setattr(MockTTSBackend, "synthesize", spy)
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/settings", {"tts": {"voice": "my-hot-voice"}}, method="PUT")
+    assert status == 200 and "tts.voice" in body["applied"]
+    status, body = http_post(f"{base}/api/voice/synthesize", {"text": "你好"})
+    assert status == 200 and body["ok"] is True
+    # 未显式指定音色 → 现读 config（新默认音色），无需重启/重建后端
+    assert received[-1] == "my-hot-voice"
+    # 显式指定音色仍优先于 config 默认
+    status, _body = http_post(f"{base}/api/voice/synthesize", {"text": "你好", "voice": "explicit"})
+    assert status == 200
+    assert received[-1] == "explicit"
+
+
+def test_voice_synthesize_stream_hot_reloads_config_voice(api_server, monkeypatch):
+    """音色热切换（流式端点）：与整段合成同口径，现读 config tts.voice。"""
+    from lite.audio.tts import MockTTSBackend
+
+    received = []
+    original = MockTTSBackend.synthesize
+
+    def spy(self, text, voice="cx-open"):
+        received.append(voice)
+        return original(self, text, voice)
+
+    monkeypatch.setattr(MockTTSBackend, "synthesize", spy)
+    _store, _pipeline, base = api_server
+    status, _body = http_post(f"{base}/api/settings", {"tts": {"voice": "stream-voice"}}, method="PUT")
+    assert status == 200
+    status, objs = http_post_stream(
+        f"{base}/api/voice/synthesize_stream", {"text": "第一句。第二句。"}
+    )
+    assert status == 200
+    assert objs[-1].get("done") is True
+    assert received, "流式合成应至少调用一次 TTS"
+    assert all(v == "stream-voice" for v in received)
+
+
+# ---------------------------------------------------------------- Task C「主动视觉接线」：装配 + settings 热更新
+
+
+class _CountingScreenBackend:
+    """mock 屏幕后端：计数 capture 调用，可脚本化失败（单测绝不真实抓屏）。"""
+
+    def __init__(self, fail=False):
+        self.calls = 0
+        self.fail = fail
+
+    def capture(self):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("模拟抓屏失败")
+        return [128] * 2304
+
+
+@pytest.fixture()
+def vision_env(tmp_path, monkeypatch):
+    """注入 mock 屏幕后端的视觉装配环境：返回 (base, handler, backend, config)。
+
+    - tick 节拍 monkeypatch 为 0.05s（真实装配为 1.0s 常量）；
+    - config 与 make_handler 注入同一 ConfigManager 实例（PUT settings 的
+      vision.enabled 经它即时生效——VisionPipeline 每拍现读）；
+    - 理解注入固定摘要（零网络零云端）；memory_store 用 tmp 隔离真实库。
+    """
+    from lite.vision.pipeline import VisionPipeline
+    from lite.vision.sampler import AdaptiveSampler
+
+    monkeypatch.setattr(api_server_module, "_VISION_TICK_INTERVAL_S", 0.05)
+    store, mem_pipeline, manager, _remote = build_deps(data_dir=str(tmp_path))
+    config = ConfigManager(config_path=str(tmp_path / "config.json"))
+    backend = _CountingScreenBackend()
+    sampler = AdaptiveSampler(backend, min_interval_s=0.05, max_interval_s=0.02)
+    vision = VisionPipeline(
+        sampler=sampler, cloud=None, memory_store=store, config=config,
+        understanding=lambda item: "测试摘要",
+    )
+    handler = make_handler(store, mem_pipeline, manager, config=config, vision_pipeline=vision)
+    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield base, handler, backend, config
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_vision_default_disabled_capture_zero_calls(vision_env):
+    """隐私红线：默认 vision.enabled=False，tick 线程多拍驱动下 capture 零调用。"""
+    base, handler, backend, _config = vision_env
+    assert handler._vision is not None
+    assert handler._vision_thread is not None
+    assert handler._vision_thread.is_alive()
+    time.sleep(0.3)  # ≈6 拍：enabled=False 时 run_once 零开销返回，绝不触碰采样
+    assert backend.calls == 0
+
+
+def test_vision_put_enabled_drives_capture(vision_env):
+    """PUT vision.enabled=true 后 tick 线程下一拍驱动 capture（mock 计数增长）。"""
+    base, _handler, backend, _config = vision_env
+    status, body = http_post(f"{base}/api/settings", {"vision": {"enabled": True}}, method="PUT")
+    assert status == 200
+    assert body["ok"] is True and "vision.enabled" in body["applied"]
+    deadline = time.time() + 5
+    while time.time() < deadline and backend.calls == 0:
+        time.sleep(0.05)
+    assert backend.calls > 0, "开启视觉后 tick 线程应驱动 capture"
+
+
+def test_vision_tick_thread_survives_capture_exception(vision_env):
+    """capture 连续抛异常 → tick 循环整体兜底告警，线程存活不自灭。"""
+    base, handler, backend, _config = vision_env
+    backend.fail = True
+    status, _body = http_post(f"{base}/api/settings", {"vision": {"enabled": True}}, method="PUT")
+    assert status == 200
+    deadline = time.time() + 5
+    while time.time() < deadline and backend.calls < 4:  # 连续失败 ≥4 拍
+        time.sleep(0.05)
+    assert backend.calls >= 4
+    assert handler._vision_thread.is_alive(), "tick 线程不得因 capture 异常退出"
+
+
+def test_settings_view_contains_vision_enabled(api_server):
+    """GET /api/settings：vision.enabled 默认 False 出现在视图中。"""
+    _store, _pipeline, base = api_server
+    status, body, _raw = http_get(f"{base}/api/settings")
+    assert status == 200
+    assert body["vision"] == {"enabled": False}
+
+
+def test_settings_put_vision_enabled_applied_and_echoed(api_server):
+    """PUT vision.enabled=true → applied 回显 + GET 视图翻转 + 落盘生效。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/settings", {"vision": {"enabled": True}}, method="PUT")
+    assert status == 200
+    assert "vision.enabled" in body["applied"]
+    assert body["config"]["vision"]["enabled"] is True
+    status, body, _raw = http_get(f"{base}/api/settings")
+    assert body["vision"]["enabled"] is True
+
+
+def test_settings_put_vision_invalid_value_ignored(api_server):
+    """PUT vision.enabled="yes"（非布尔）→ ignored 显式回显，config 不变。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/settings", {"vision": {"enabled": "yes"}}, method="PUT")
+    assert status == 200
+    assert not body["applied"]
+    assert any("vision.enabled" in item for item in body["ignored"])
+    assert body["config"]["vision"]["enabled"] is False
+
+
+def test_settings_put_vision_section_non_dict_400(api_server):
+    """PUT {"vision": "abc"}（段非 dict）→ 400 invalid section type。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/settings", {"vision": "abc"}, method="PUT")
+    assert status == 400
+    assert body["error"] == "invalid section type: vision"
+
+
+def test_create_app_wires_vision_pipeline(tmp_path):
+    """create_app 生产装配：默认视觉管线 + daemon tick 线程均已就绪。"""
+    _store, _pipeline, handler = create_app(data_dir=str(tmp_path))
+    assert handler._vision is not None
+    assert handler._vision_thread is not None
+    assert handler._vision_thread.is_alive()
+    assert handler._vision_thread.daemon is True
+    assert handler._vision_thread.name == "vision-tick"
+
 
 
 

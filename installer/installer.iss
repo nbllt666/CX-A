@@ -76,6 +76,11 @@ Source: "{#BundledDir}\sensevoice\*"; DestDir: "{app}\data\SenseVoiceSmall"; Fla
 ; 直接落位最终路径（运行时按 <root>/runtime/llama/llama-cli.exe 推导；见
 ; 20260925_模块0_llama二进制随包分发.md），不进便携 zip；本地小 LLM 模型不由本安装集携带。
 Source: "{#BundledDir}\llama_cpp\*"; DestDir: "{app}\runtime\llama"; Flags: recursesubdirs createallsubdirs ignoreversion
+; llama.cpp Vulkan 预编译二进制（约 88 MB，build 11178 与上者同版本）：AMD/Intel 独显
+; 与核显机器的本地推理路径（accel_plan 产出 backend=vulkan 时由 resolve_llama_dir
+; 选用 runtime/llama_vulkan/llama-server.exe，目录缺失回退上者），不进便携 zip；
+; 见 20261002_模块0_加速未闭合项收口.md 批 A。
+Source: "{#BundledDir}\llama_cpp_vulkan\*"; DestDir: "{app}\runtime\llama_vulkan"; Flags: recursesubdirs createallsubdirs ignoreversion
 ; 嵌入模型（约 609 MB，Qwen3-Embedding-0.6B-Q8_0.gguf，1024 维）：记忆检索真实语义嵌入
 ; （主进程拉起 runtime/llama/llama-server.exe 常驻子进程经 /v1/embeddings 取向量），
 ; 直接落位最终路径（运行时按 <root>/data/local_llm/qwen3-embedding-0.6b/*.gguf 解析；

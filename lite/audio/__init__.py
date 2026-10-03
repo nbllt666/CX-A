@@ -111,6 +111,9 @@ def _try_voice_bridge(asr_cfg, tts_cfg, root=None):
     设备口径：bridge 为单进程单设备参数，取 ``tts.device`` 优先、``asr.device``
     次之、缺省 ``cpu``（"gpu" 由客户端归一为 auto，交由 sidecar 的 torch 判定）。
 
+    加速口径（双模式 spec）：``tts.accel`` / ``tts.accel_device`` 透传客户端
+    （缺键缺省 ``auto`` / ``""``；非法值由客户端归一）；旧配置零修改时等价缺省。
+
     :param asr_cfg: 配置的 asr 段 dict。
     :param tts_cfg: 配置的 tts 段 dict。
     :param root: 便携根显式覆盖（测试注入）；None 表示由客户端经 ``app_root()`` 推导。
@@ -125,7 +128,12 @@ def _try_voice_bridge(asr_cfg, tts_cfg, root=None):
         return None
 
     device = tts_cfg.get("device") or asr_cfg.get("device") or "cpu"
-    client = VoiceBridgeClient(root=root, device=device)
+    # 加速后端与 DML 设备提示：缺键缺省（auto / ""），非法值由客户端归一
+    accel = tts_cfg.get("accel", "auto")
+    accel_device = tts_cfg.get("accel_device", "")
+    client = VoiceBridgeClient(
+        root=root, device=device, accel=accel, accel_device=accel_device
+    )
     if not client.available():
         return None
     return (

@@ -2,15 +2,18 @@
 """Task C3 断网兜底机制单元测试（OfflineFallbackManager）。
 
 覆盖（全 mock，无网络）：
-- 在线 → cloud 流式透传，mode 保持 "cloud"；
-- 离线 + 本地模式开 → 切 "local"、offline_chat 文本单块产出、listener 收到变化；
+- 本地优先路由：本地模式开启 → 完全不探测网络、不连云端（refresh_online /
+  cloud.chat 零调用），就绪走本地、未就绪产 LOCAL_NOT_READY_PROMPT 引导提示；
+- resolver 形态：local_llm 传零参可调用对象，运行时从 None 变可用动态生效；
+- 在线 + 本地模式未开启 → cloud 流式透传，mode 保持 "cloud"（既有行为不变）；
+- 离线 + 本地模式开（实例形态）→ 切 "local"、offline_chat 文本单块产出；
 - 离线 + 未开本地 → 提示文案、mode 保持 "cloud"（不切换）、status=offline_hint；
 - 云端调用抛 CloudUnavailableError → 自动降级（切本地 / 提示）；
-- 恢复：先离线切 local，网络恢复后下次 chat 自动回 cloud 并通知；
+- 恢复：本地模式关闭后网络恢复，下次 chat 自动回 cloud 并通知；
 - 节流：多次 refresh_online 只在超间隔 / force 时真正调 cloud.is_online；
-- 本地未就绪：offline_chat 抛 LlamaNotReady → 产提示文案不崩；
+- 本地未就绪：offline_chat 抛 LlamaNotReady → 产引导提示文案不崩；
 - 导出：OfflineFallbackManager / OFFLINE_PROMPT 可由 lite.cloud 导入；
-- G-3：流中途 CloudUnavailableError 不再追加离线提示，保留半截真实回复；
+- G-3：云端路径流中途 CloudUnavailableError 不再追加离线提示（本地模式未开启）；
 - N5：CloudConfigError 置配置错误诊断态，提示"配置未完成"而非误诊断网。
 """
 
@@ -19,7 +22,12 @@ from unittest.mock import Mock
 import pytest
 
 from lite.cloud.adapter import CloudConfigError, CloudUnavailableError
-from lite.cloud.fallback import CONFIG_ERROR_PROMPT, OFFLINE_PROMPT, OfflineFallbackManager
+from lite.cloud.fallback import (
+    CONFIG_ERROR_PROMPT,
+    LOCAL_NOT_READY_PROMPT,
+    OFFLINE_PROMPT,
+    OfflineFallbackManager,
+)
 from lite.runtime import LlamaNotReady
 
 
@@ -78,12 +86,110 @@ class StubLocalLLM:
 
 
 # ------------------------------------------------------------------ #
-# 1. 在线 → cloud 流式透传，mode=cloud                               #
+# 1. 本地优先路由：本地模式开启 → 不探测、不连云                       #
+# ------------------------------------------------------------------ #
+
+def test_local_mode_ready_bypasses_probe_and_cloud():
+    """本地模式开 + 就绪（resolver 形态）→ 走本地，refresh_online / cloud.chat 零调用。"""
+    local = StubLocalLLM(text="本地优先回复")
+    mgr, cloud = _make_manager(online=True, local_enabled=True, local_llm=lambda: local)
+    events = []
+    mgr.add_listener(lambda m: events.append(m))
+
+    out = list(mgr.chat([{"role": "user", "content": "hi"}]))
+    assert out == ["本地优先回复"]
+    assert mgr.mode == "local"
+    assert mgr.status == "local"
+    assert events == ["local"]
+    # 隐私红线：本地模式下既不探测网络也不连云端
+    assert cloud.is_online.call_count == 0
+    assert cloud.chat.call_count == 0
+
+
+def test_local_mode_not_ready_yields_local_prompt_without_cloud():
+    """本地模式开 + 未就绪（resolver 返回 None）→ 引导提示、mode 不切换、云端零调用。"""
+    mgr, cloud = _make_manager(online=True, local_enabled=True, local_llm=lambda: None)
+    events = []
+    mgr.add_listener(lambda m: events.append(m))
+
+    out = list(mgr.chat([{"role": "user", "content": "hi"}]))
+    assert out == [LOCAL_NOT_READY_PROMPT]
+    assert LOCAL_NOT_READY_PROMPT == "本地大脑还没准备好，先去下载好它（设置页或新手引导里可以下）"
+    assert mgr.mode == "cloud"                   # 未真正承接，不切换状态机
+    assert mgr.status == "offline_hint"
+    assert events == []                          # 无模式变化
+    # 隐私红线：未就绪也绝不静默回落云端
+    assert cloud.is_online.call_count == 0
+    assert cloud.chat.call_count == 0
+
+
+def test_local_mode_ready_but_chat_fails_yields_local_prompt():
+    """就绪判定通过但本地调用中途失败 → 产引导提示（不抛、不回落云端）。"""
+    local = StubLocalLLM(raise_not_ready=True)
+    mgr, cloud = _make_manager(online=True, local_enabled=True, local_llm=lambda: local)
+    out = list(mgr.chat([{"role": "user", "content": "hi"}]))
+    assert out == [LOCAL_NOT_READY_PROMPT]
+    assert mgr.mode == "local"                   # 已切本地承接
+    assert mgr.status == "offline_hint"
+    assert cloud.is_online.call_count == 0
+    assert cloud.chat.call_count == 0
+
+
+def test_resolver_runtime_becomes_available_midway():
+    """resolver 形态：运行时从 None 变可用 → 两次 chat 结果不同，动态生效。"""
+    state = {"runtime": None}
+    mgr, cloud = _make_manager(
+        online=True, local_enabled=True, local_llm=lambda: state["runtime"]
+    )
+    # 第一次：运行时未加载 → 引导提示
+    out1 = list(mgr.chat([{"role": "user", "content": "你好"}]))
+    assert out1 == [LOCAL_NOT_READY_PROMPT]
+    assert mgr.mode == "cloud"
+
+    # 模型后台加载完成（模拟运行中变为可用）
+    state["runtime"] = StubLocalLLM(text="本地大脑上线了")
+
+    # 第二次：无需重建管理器即走本地
+    out2 = list(mgr.chat([{"role": "user", "content": "你好"}]))
+    assert out2 == ["本地大脑上线了"]
+    assert mgr.mode == "local"
+    assert mgr.status == "local"
+    assert cloud.is_online.call_count == 0
+    assert cloud.chat.call_count == 0
+
+
+def test_local_llm_ready_flag_variants():
+    """local_llm_ready：暴露 is_ready / model_ready 属性时须为真；resolver 异常视为未就绪。"""
+
+    class _Flagged:
+        def __init__(self, **flags):
+            for k, v in flags.items():
+                setattr(self, k, v)
+
+        def offline_chat(self, messages):
+            return "ok"
+
+    # 无就绪属性：非 None 即就绪
+    assert _make_manager(local_enabled=True, local_llm=lambda: _Flagged())[0].local_llm_ready() is True
+    # is_ready=False / model_ready=False → 未就绪
+    assert _make_manager(local_enabled=True, local_llm=lambda: _Flagged(is_ready=False))[0].local_llm_ready() is False
+    assert _make_manager(local_enabled=True, local_llm=lambda: _Flagged(model_ready=False))[0].local_llm_ready() is False
+    # is_ready=True → 就绪
+    assert _make_manager(local_enabled=True, local_llm=lambda: _Flagged(is_ready=True))[0].local_llm_ready() is True
+
+    def _boom():
+        raise RuntimeError("resolver 炸了")
+
+    assert _make_manager(local_enabled=True, local_llm=_boom)[0].local_llm_ready() is False
+
+
+# ------------------------------------------------------------------ #
+# 1b. 本地模式未开启 → 既有云端路径行为不变                            #
 # ------------------------------------------------------------------ #
 
 def test_online_streams_cloud_and_mode_cloud():
-    """在线时 chat 应流式透传 cloud 各文本块，mode 保持 "cloud"。"""
-    mgr, cloud = _make_manager(online=True, local_enabled=True,
+    """本地模式未开 + 在线 → 流式透传 cloud 各文本块，mode 保持 "cloud"。"""
+    mgr, cloud = _make_manager(online=True, local_enabled=False,
                                 cloud_chunks=["你", "好", "世界"])
     out = "".join(mgr.chat([{"role": "user", "content": "hi"}]))
     assert out == "你好世界"
@@ -155,26 +261,27 @@ def test_cloud_unavailable_no_local_yields_hint():
 
 
 # ------------------------------------------------------------------ #
-# 5. 恢复：先离线切 local，网络恢复后下次 chat 自动回 cloud 并通知   #
+# 5. 恢复：本地模式关闭 + 网络恢复 → 下次 chat 自动回 cloud 并通知   #
 # ------------------------------------------------------------------ #
 
 def test_auto_recover_back_to_cloud():
-    """先离线切 local，网络恢复后下次 chat 自动回 cloud 并通知监听者。"""
+    """本地模式开启时走本地；用户关闭本地模式且网络恢复 → 下次 chat 自动回 cloud 并通知。"""
     local = StubLocalLLM(text="离线应答")
     mgr, cloud = _make_manager(online=False, local_enabled=True, local_llm=local,
                                interval=0.0)  # 关闭节流，每次重探
 
-    # 第一次：离线 → 切 local
+    # 第一次：本地模式开启 → 本地优先直连本地（不探测）
     events = []
     mgr.add_listener(lambda m: events.append(m))
     assert list(mgr.chat([{"role": "user", "content": "你好"}])) == ["离线应答"]
     assert mgr.mode == "local"
     assert events == ["local"]
 
-    # 网络恢复
+    # 用户关闭本地模式 + 网络恢复（config dict 原地翻转，模拟设置页热更）
+    mgr._config["local_llm"]["enabled"] = False
     cloud.is_online.return_value = True
 
-    # 第二次：恢复在线 → 自动切回 cloud 并通知
+    # 第二次：云端路径 → 自动切回 cloud 并通知
     out = "".join(mgr.chat([{"role": "user", "content": "在吗"}]))
     assert out == "你好世界"
     assert mgr.mode == "cloud"
@@ -216,23 +323,23 @@ def test_refresh_online_probe_interval_elapsed_resets():
 
 
 # ------------------------------------------------------------------ #
-# 7. 本地未就绪：offline_chat 抛 LlamaNotReady → 提示不崩             #
+# 7. 本地未就绪：offline_chat 抛 LlamaNotReady → 引导提示不崩          #
 # ------------------------------------------------------------------ #
 
 def test_local_not_ready_yields_hint():
-    """本地模式开但 offline_chat 抛 LlamaNotReady → 产提示文案且不崩溃。"""
+    """本地模式开但 offline_chat 抛 LlamaNotReady → 产本地引导提示且不崩溃。"""
     local = StubLocalLLM(raise_not_ready=True)
     mgr, _ = _make_manager(online=False, local_enabled=True, local_llm=local)
     out = list(mgr.chat([{"role": "user", "content": "你好"}]))
-    assert out == [OFFLINE_PROMPT]
+    assert out == [LOCAL_NOT_READY_PROMPT]
     assert mgr.status == "offline_hint"
 
 
 def test_local_llm_none_yields_hint():
-    """开启本地模式但未注入 local_llm → 产提示文案不崩。"""
+    """开启本地模式但未注入 local_llm → 产本地引导提示不崩。"""
     mgr, _ = _make_manager(online=False, local_enabled=True, local_llm=None)
     out = list(mgr.chat([{"role": "user", "content": "你好"}]))
-    assert out == [OFFLINE_PROMPT]
+    assert out == [LOCAL_NOT_READY_PROMPT]
 
 
 # ------------------------------------------------------------------ #
@@ -298,11 +405,11 @@ def _make_midstream_cloud(chunks_before_error):
 
 
 def test_midstream_error_keeps_partial_reply_without_hint():
-    """G-3：已产出 chunk 后流中途故障 → 保留半截真实回复即止，不追加离线提示。"""
+    """G-3（云端路径）：本地模式未开时已产出 chunk 后流中途故障 → 保留半截真实回复即止，不追加离线提示。"""
     cloud = _make_midstream_cloud(["部分", "回复"])
     local = StubLocalLLM(text="本地兜底")
     mgr = OfflineFallbackManager(
-        cloud=cloud, local_llm=local, config={"local_llm": {"enabled": True}}
+        cloud=cloud, local_llm=local, config={"local_llm": {"enabled": False}}
     )
     out = list(mgr.chat([{"role": "user", "content": "hi"}]))
 

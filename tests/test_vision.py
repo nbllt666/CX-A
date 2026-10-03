@@ -14,6 +14,7 @@
 """
 
 import json
+import sys
 
 import pytest
 
@@ -581,3 +582,100 @@ def test_vision_config_env_override(monkeypatch, tmp_path):
         data_dir=str(tmp_path / "data"),
     )
     assert cfg.get("vision", "enabled") is True
+
+
+# ------------------------------------------------------------------ #
+# 6. WindowsGrayscaleScreenBackend（Task C：纯标准库屏幕后端）          #
+#    GDI 真实抓屏不测（单测不触碰真实屏幕）；注入 _capture_gdi 脚本化    #
+# ------------------------------------------------------------------ #
+
+from lite.vision.screen_backend import WindowsGrayscaleScreenBackend  # noqa: E402
+
+#: 定长帧目标长度（64x36）
+_BACKEND_FRAME_SIZE = 64 * 36
+
+
+def _boom(reason="gdi boom"):
+    """返回一个抛异常的零参 callable（脚本化 _capture_gdi 失败）。"""
+    def _raise():
+        raise RuntimeError(reason)
+    return _raise
+
+
+class TestWindowsGrayscaleScreenBackend:
+    """屏幕后端容错契约：失败回退上一帧 / 首帧 None / last_error 记录。"""
+
+    def test_capture_success_then_failure_returns_last_frame_copy(self, monkeypatch):
+        """成功建帧后抓屏失败 → 返回上一帧副本（失败帧零抖动），last_error 记录原因。"""
+        backend = WindowsGrayscaleScreenBackend()
+        good = [7] * _BACKEND_FRAME_SIZE
+        monkeypatch.setattr(backend, "_capture_gdi", lambda: good)
+        assert backend.capture() == good
+        monkeypatch.setattr(backend, "_capture_gdi", _boom("模拟 BitBlt 失败"))
+        result = backend.capture()
+        assert result == good  # 回退上一帧（变化率为 0，不误报剧变）
+        assert "模拟 BitBlt 失败" in (backend.last_error or "")
+        assert result is not good  # 副本而非缓存本体
+
+    def test_capture_first_failure_returns_none(self, monkeypatch):
+        """首帧前抓屏失败 → 返回 None（sampler 首帧仅建基线，无事件产出）。"""
+        backend = WindowsGrayscaleScreenBackend()
+        monkeypatch.setattr(backend, "_capture_gdi", _boom("首屏 DC 拿不到"))
+        assert backend.capture() is None
+        assert "首屏 DC 拿不到" in (backend.last_error or "")
+
+    def test_capture_success_clears_last_error(self, monkeypatch):
+        """失败后再次成功 → last_error 清 None（观测口径：当前健康）。"""
+        backend = WindowsGrayscaleScreenBackend()
+        monkeypatch.setattr(backend, "_capture_gdi", _boom())
+        backend.capture()
+        assert backend.last_error is not None
+        monkeypatch.setattr(backend, "_capture_gdi", lambda: [1] * _BACKEND_FRAME_SIZE)
+        frame = backend.capture()
+        assert frame == [1] * _BACKEND_FRAME_SIZE
+        assert backend.last_error is None
+
+    def test_capture_consecutive_failures_never_raise(self, monkeypatch):
+        """连续失败不抛出：多次调用稳定返回上一帧副本（容错契约）。"""
+        backend = WindowsGrayscaleScreenBackend()
+        monkeypatch.setattr(backend, "_capture_gdi", lambda: [3] * _BACKEND_FRAME_SIZE)
+        assert backend.capture() == [3] * _BACKEND_FRAME_SIZE
+        monkeypatch.setattr(backend, "_capture_gdi", _boom())
+        for _ in range(5):
+            assert backend.capture() == [3] * _BACKEND_FRAME_SIZE
+
+    def test_capture_return_copy_does_not_pollute_cache(self, monkeypatch):
+        """调用方修改返回的帧列表不污染内部缓存（回退值仍为原帧）。"""
+        backend = WindowsGrayscaleScreenBackend()
+        monkeypatch.setattr(backend, "_capture_gdi", lambda: [5] * _BACKEND_FRAME_SIZE)
+        frame = backend.capture()
+        frame[0] = 999
+        monkeypatch.setattr(backend, "_capture_gdi", _boom())
+        assert backend.capture() == [5] * _BACKEND_FRAME_SIZE
+
+    def test_capture_non_windows_returns_none(self, monkeypatch):
+        """非 Windows 平台：_capture_gdi 抛 OSError → capture 兜底返回 None 不抛。"""
+        backend = WindowsGrayscaleScreenBackend()
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert backend.capture() is None
+        assert "非 Windows" in (backend.last_error or "")
+
+    def test_grid_grayscale_length_and_formula(self):
+        """网格降采样：64x36 最小屏逐点唯一映射，长度 2304，灰度公式校验。"""
+        w, h = 64, 36
+        # 构造 BGRA 缓冲：每像素 (b,g,r)=(30,20,10) → 灰度 (10*299+20*587+30*114)//1000
+        pixel = bytes((30, 20, 10, 255))
+        buf = pixel * (w * h)
+        gray = WindowsGrayscaleScreenBackend._grid_grayscale(buf, w, h)
+        expected = (10 * 299 + 20 * 587 + 30 * 114) // 1000
+        assert len(gray) == _BACKEND_FRAME_SIZE
+        assert gray == [expected] * _BACKEND_FRAME_SIZE
+
+    def test_grid_grayscale_oversized_screen_maps_inside(self):
+        """超采样屏（128x72）：网格点全部落在位图范围内且长度恒定。"""
+        w, h = 128, 72
+        buf = bytes(4 * w * h)  # 全黑屏
+        gray = WindowsGrayscaleScreenBackend._grid_grayscale(buf, w, h)
+        assert len(gray) == _BACKEND_FRAME_SIZE
+        assert all(v == 0 for v in gray)
+

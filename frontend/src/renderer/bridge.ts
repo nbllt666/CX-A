@@ -15,6 +15,12 @@ interface CxaBridge {
   openPetOverlay: () => Promise<boolean>;
   /** 关闭桌宠透明悬浮窗 */
   closePetOverlay: () => Promise<boolean>;
+  /** 平移桌宠透明悬浮窗（dx/dy 像素增量，拖拽手势用） */
+  movePetOverlay: (dx: number, dy: number) => Promise<boolean>;
+  /** 调整桌宠透明悬浮窗尺寸档位（220/286/360，主进程映射为窗口宽高） */
+  resizePetOverlay: (size: number) => Promise<boolean>;
+  /** 打开系统目录选择器选音色文件夹；取消返回 null */
+  pickVoiceFolder: () => Promise<string | null>;
   /** 获取后端启动令牌（N1 鉴权：API 请求附带 X-Client-Token 头） */
   getBackendToken: () => Promise<string>;
 }
@@ -62,4 +68,38 @@ export function closePetOverlay(): Promise<boolean> {
     return window.cxaAPI.closePetOverlay();
   }
   return Promise.resolve(false);
+}
+
+/**
+ * 平移桌宠透明悬浮窗（经 IPC pet-overlay:move，dx/dy 为像素增量）。
+ * 仅 Electron 环境且白名单方法存在时生效；否则安全降级返回 false（不抛异常）。
+ */
+export function movePetOverlay(dx: number, dy: number): Promise<boolean> {
+  if (isElectron() && window.cxaAPI?.movePetOverlay) {
+    return window.cxaAPI.movePetOverlay(dx, dy);
+  }
+  return Promise.resolve(false);
+}
+
+/**
+ * 调整桌宠透明悬浮窗尺寸档位（经 IPC pet-overlay:resize，档位 220/286/360）。
+ * 仅 Electron 环境且白名单方法存在时生效；否则安全降级返回 false（不抛异常）。
+ */
+export function resizePetOverlay(size: number): Promise<boolean> {
+  if (isElectron() && window.cxaAPI?.resizePetOverlay) {
+    return window.cxaAPI.resizePetOverlay(size);
+  }
+  return Promise.resolve(false);
+}
+
+/**
+ * 打开系统目录选择器选音色文件夹（经 IPC voice:pick-folder）。
+ * 仅 Electron 环境且白名单方法存在时生效；用户取消返回 null；
+ * 非 Electron / 方法缺失安全降级返回 null（不抛异常）。
+ */
+export function pickVoiceFolder(): Promise<string | null> {
+  if (isElectron() && window.cxaAPI?.pickVoiceFolder) {
+    return window.cxaAPI.pickVoiceFolder();
+  }
+  return Promise.resolve(null);
 }

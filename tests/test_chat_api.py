@@ -14,7 +14,12 @@ from contextlib import contextmanager
 from http.server import HTTPServer
 
 from lite.cloud.adapter import CloudConfigError, CloudUnavailableError
-from lite.cloud.fallback import CONFIG_ERROR_PROMPT, OFFLINE_PROMPT, OfflineFallbackManager
+from lite.cloud.fallback import (
+    CONFIG_ERROR_PROMPT,
+    LOCAL_NOT_READY_PROMPT,
+    OFFLINE_PROMPT,
+    OfflineFallbackManager,
+)
 from lite.computer_control import ComputerControl, ToolBridge
 from lite.computer_control.security import ControlAuthorizer
 from lite.server.api_server import build_deps, build_local_chat_runtime, make_handler
@@ -221,7 +226,7 @@ class TestChatMessageFallbackWiring:
         assert local.calls[0][-1] == {"role": "user", "content": "你好"}
 
     def test_local_not_ready_yields_prompt(self, tmp_path):
-        """离线 + 本地模式开但 local_llm 缺省 → 提示文案（不抛错、状态码 200）。"""
+        """本地模式开但 local_llm 缺省 → 本地引导提示（不抛错、状态码 200）。"""
         cloud = _FakeCloud(online=False)
         fallback = OfflineFallbackManager(
             cloud=cloud,
@@ -232,7 +237,7 @@ class TestChatMessageFallbackWiring:
             status, body = http_post(f"{base}/api/chat/message", {"message": "你好"})
         assert status == 200
         assert body["ok"] is True
-        assert body["clean_text"] == OFFLINE_PROMPT
+        assert body["clean_text"] == LOCAL_NOT_READY_PROMPT
         assert body["mood"] == "calm"
         assert body["offline"] is True
 

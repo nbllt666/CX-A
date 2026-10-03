@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { GlassCard } from '../components/GlassCard';
 import Toggle from '../components/Toggle';
+import BrandMark from '../components/BrandMark';
 import {
   cancelModelDownload,
   completeSetup,
@@ -10,6 +11,8 @@ import {
   startModelDownload,
 } from '../api';
 import type {
+  AccelMode,
+  AccelProfile,
   DownloadChannel,
   ModelProgress,
   SetupRecommendResult,
@@ -19,9 +22,10 @@ import type {
 /**
  * 首启向导（`#/setup` / 首次启动覆盖层）。
  *
- * 五步（单页组件内 `step` 状态机，不引入路由库）：
- *   ① 欢迎 + 硬件体检（可一键采纳推荐 / 自己挑，推荐不可用则跳过）
- *   ② 云端服务商与钥匙（钥匙可留空，提示以后在设置里补）
+ * 五步（单页组件内 `step` 状态机，不引入路由库；导航随推荐自适应）：
+ *   ① 欢迎 + 硬件体检（可一键采纳推荐 / 自己挑 / 直接选云端大脑，推荐不可用则跳过；
+ *      推荐为本地可跑时「就用推荐的」跳过云端步骤直达线路）
+ *   ② 云端服务商与钥匙（本地开关已开时可「跳过，先用本地」；钥匙可留空，提示以后在设置里补）
  *   ③ 下载线路（国内 / 海外，一个问题定全部；模型仓库由线路决定）
  *   ④ 可选下载（进度 / 取消 / 失败重试 / 以后再说）
  *   ⑤ 完成（提交选择；失败不把用户卡死，可先进去用）
@@ -52,6 +56,36 @@ const CHANNEL_OPTIONS: Array<{ value: DownloadChannel; label: string; desc: stri
   { value: 'mirror', label: '国内线路（魔塔，推荐）', desc: '下载更快更稳，模型从国内的魔塔拿' },
   { value: 'official', label: '海外线路（HuggingFace）', desc: '直连海外站点，模型从 HuggingFace 拿' },
 ];
+
+/**
+ * 运行偏好（口语化，零术语）：省电优先 / 性能优先。
+ * 默认选中由后端按硬件画像推导（`accel.mode`），用户可改。
+ */
+const ACCEL_MODE_OPTIONS: Array<{ value: AccelMode; label: string; desc: string }> = [
+  { value: 'eco', label: '省电优先', desc: '日常更省电更安静，够用就好' },
+  { value: 'performance', label: '性能优先', desc: '需要时火力全开，反应更快' },
+];
+
+/** 模式取值 → 口语化标签 */
+function accelModeLabel(mode: AccelMode): string {
+  return mode === 'eco' ? '省电优先' : '性能优先';
+}
+
+/**
+ * 由加速剖面生成口语化结论（零术语，禁止出现 EP / ORT / DirectML / CUDA 等词）。
+ * 后端 `accel.reasons` 含技术术语，仅作诊断，界面不直接展示。
+ */
+function accelSummary(accel: AccelProfile | null | undefined): string {
+  if (!accel) return '会根据你的电脑自动挑一个合适的跑法';
+  const backend = accel.tts?.accel;
+  const device = accel.tts?.accel_device;
+  if (backend === 'cuda') return '检测到独立显卡，已为语音合成开启显卡加速';
+  if (backend === 'dml' && device === 'dgpu') return '检测到独立显卡，已为语音合成开启显卡加速';
+  if (backend === 'dml' && device === 'igpu') return '检测到核显，已为语音合成开启省电加速';
+  if (backend === 'dml') return '检测到可用显卡，已为语音合成开启显卡加速';
+  if (backend === 'off') return '已关闭额外加速，语音合成用电脑本身运行';
+  return '没有可用的独立显卡，语音合成先用电脑本身运行（更稳更省电）';
+}
 
 const PRIMARY_BTN =
   'inline-flex items-center justify-center rounded-full bg-gradient-to-r from-[var(--color-secondary)] to-[var(--color-primary)] px-5 py-2 text-sm font-medium text-[var(--color-primary-foreground)] transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50';
@@ -106,6 +140,9 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
   const [recState, setRecState] = useState<'loading' | 'ok' | 'failed'>('loading');
   const [applyRecommended, setApplyRecommended] = useState(false);
   const [manual, setManual] = useState(false);
+  // 本次提交不含云端：快车道采纳推荐 / 云端步骤「跳过，先用本地」时置真；
+  // 云端步骤正常「下一步」推进时清除（覆盖「快车道后回云端补钥匙」的组合）
+  const [cloudSkipped, setCloudSkipped] = useState(false);
 
   // 选择项
   const [provider, setProvider] = useState('deepseek');
@@ -115,6 +152,8 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
   const [localEnabled, setLocalEnabled] = useState(false);
   const [device, setDevice] = useState<'cpu' | 'gpu'>('cpu');
   const [tier, setTier] = useState('');
+  // 运行偏好（省电优先 / 性能优先）：默认由后端按画像推导，用户可改
+  const [accelMode, setAccelMode] = useState<AccelMode>('performance');
 
   // ④ 下载
   const [progress, setProgress] = useState<ModelProgress | null>(null);
@@ -171,6 +210,9 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
           setLocalEnabled(Boolean(r.recommendation.use_local));
           setDevice(r.recommendation.device === 'gpu' ? 'gpu' : 'cpu');
           setTier(r.recommendation.tier || r.tiers?.[0]?.tier || '');
+          // 运行偏好默认值：以后端画像推导为准（顶层 accel 优先，兼容 recommendation.accel）
+          const defaultMode = r.accel?.mode ?? r.recommendation.accel?.mode;
+          if (defaultMode === 'eco' || defaultMode === 'performance') setAccelMode(defaultMode);
         }
       } catch {
         if (alive) setRecState('failed');
@@ -184,6 +226,8 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
   const tiers = rec?.tiers ?? [];
   const recommendation = rec?.recommendation ?? null;
   const recommendedSize = recommendation?.model?.approximate_size_gb ?? null;
+  // 加速剖面（顶层优先，兼容 recommendation.accel）：用于口语化结论展示
+  const accelProfile: AccelProfile | null = rec?.accel ?? recommendation?.accel ?? null;
 
   const stopPolling = () => {
     if (pollTimerRef.current !== null) {
@@ -245,10 +289,15 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
     setSubmitError(null);
     try {
       await completeSetup({
-        cloud: { provider, ...(apiKey ? { api_key: apiKey } : {}) },
+        // 本次提交不含云端（快车道 / 「跳过，先用本地」）→ cloud 段整体省略（后端契约已支持）
+        ...(cloudSkipped
+          ? {}
+          : { cloud: { provider, ...(apiKey ? { api_key: apiKey } : {}) } }),
         download: { channel },
         // 不提交模型仓库：由线路在服务端派生
         local_llm: { enabled: localEnabled },
+        // 运行偏好：服务端据此展开各组件落点（省电优先 / 性能优先）
+        accel: { mode: accelMode },
         apply_recommended: applyRecommended,
       });
       if (!aliveRef.current) return;
@@ -272,7 +321,13 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
       setDevice(recommendation.device === 'gpu' ? 'gpu' : 'cpu');
       setTier(recommendation.tier || tiers[0]?.tier || '');
     }
-    goNext();
+    if (recommendation?.use_local) {
+      // 快车道：推荐本地可跑 → 跳过云端步骤直达线路步骤，本次提交不含云端
+      setCloudSkipped(true);
+      setStep(2);
+    } else {
+      goNext();
+    }
   };
 
   const pct = progress ? progressPercent(progress) : 0;
@@ -280,7 +335,11 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
   return (
     <div className="app-surface flex h-full w-full items-center justify-center overflow-y-auto p-6">
       <div className="w-full max-w-2xl">
-        <div className="mb-4 flex flex-col gap-1">
+        <div className="mb-4 flex flex-col gap-2">
+          <div className="flex items-center gap-2.5">
+            <BrandMark size={34} />
+            <span className="text-sm font-medium text-[var(--text-secondary)]">CX-A 赛博伴侣</span>
+          </div>
           <h1 className="text-xl font-bold text-gradient">欢迎来到 CX-A</h1>
           <p className="text-sm text-[var(--text-secondary)]">
             花一分钟把它调成你的样子，之后随时能在设置里改
@@ -352,6 +411,27 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
                       </div>
                     )}
 
+                    {/* 加速结论（口语化、零术语） */}
+                    <p className="text-sm text-[var(--text-secondary)]">{accelSummary(accelProfile)}</p>
+
+                    {/* 运行偏好询问（省电优先 / 性能优先）：默认按画像选中 */}
+                    <div className="flex flex-col gap-1.5">
+                      <p className="text-sm font-medium">平时更看重哪一点？</p>
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        {ACCEL_MODE_OPTIONS.map((opt) => (
+                          <button
+                            key={opt.value}
+                            type="button"
+                            className={optionClass(accelMode === opt.value)}
+                            onClick={() => setAccelMode(opt.value)}
+                          >
+                            <span>{opt.label}</span>
+                            <span className="text-xs text-[var(--text-tertiary)]">{opt.desc}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
                     {!manual && (
                       <div className="flex flex-wrap gap-2">
                         <button type="button" className={PRIMARY_BTN} onClick={adoptRecommendation}>
@@ -366,6 +446,16 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
                           }}
                         >
                           我自己挑
+                        </button>
+                        <button
+                          type="button"
+                          className={GHOST_BTN}
+                          onClick={() => {
+                            setCloudSkipped(false);
+                            goNext();
+                          }}
+                        >
+                          我想用云端大脑
                         </button>
                       </div>
                     )}
@@ -450,7 +540,10 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
             {/* ── ② 云端服务商与钥匙 ── */}
             {step === 1 && (
               <>
-                <StepTitle title="想让它用哪个云端大脑？" desc="选一个你信任的，随时能换" />
+                <StepTitle
+                  title="想让它用哪个云端大脑？"
+                  desc="选一个你信任的，随时能换；也可以先跳过，用本地就够"
+                />
                 <select
                   value={provider}
                   onChange={(e) => setProvider(e.target.value)}
@@ -479,7 +572,28 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
                     留空也没关系，以后可以在设置里补上
                   </p>
                 </div>
-                <NavRow onBack={goBack} onNext={goNext} />
+                <NavRow
+                  onBack={goBack}
+                  onNext={() => {
+                    // 云端步骤正常推进 → 清除「本次不含云端」（覆盖快车道后回补钥匙的组合）
+                    setCloudSkipped(false);
+                    goNext();
+                  }}
+                />
+                {localEnabled && (
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      className={GHOST_BTN}
+                      onClick={() => {
+                        setCloudSkipped(true);
+                        setStep(2);
+                      }}
+                    >
+                      跳过，先用本地
+                    </button>
+                  </div>
+                )}
               </>
             )}
 
@@ -487,8 +601,8 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
             {step === 2 && (
               <>
                 <StepTitle
-                  title="走哪条线路？"
-                  desc="选一条顺的，下载和模型都跟着它走"
+                  title="下载要用哪条线路？"
+                  desc="选一条顺的，国内更快更稳"
                 />
                 <div className="flex flex-col gap-2">
                   {CHANNEL_OPTIONS.map((opt) => (
@@ -582,19 +696,28 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
                 )}
 
                 <div className="flex flex-wrap gap-2">
-                  {(progress?.state !== 'downloading' && progress?.state !== 'done') && (
-                    <button
-                      type="button"
-                      className={PRIMARY_BTN}
-                      disabled={starting || tiers.length === 0}
-                      onClick={() => void handleStartDownload()}
-                    >
-                      {starting ? '正在开始…' : canceled ? '重新开始下载' : '现在下载'}
+                  {progress?.state === 'done' ? (
+                    // 下载完成：正确动作是去确认页，不再显示「以后再说」（避免完成态语义错位）
+                    <button type="button" className={PRIMARY_BTN} onClick={goNext}>
+                      下一步
+                    </button>
+                  ) : (
+                    (progress?.state !== 'downloading') && (
+                      <button
+                        type="button"
+                        className={PRIMARY_BTN}
+                        disabled={starting || tiers.length === 0}
+                        onClick={() => void handleStartDownload()}
+                      >
+                        {starting ? '正在开始…' : canceled ? '重新开始下载' : '现在下载'}
+                      </button>
+                    )
+                  )}
+                  {progress?.state !== 'done' && (
+                    <button type="button" className={GHOST_BTN} onClick={goNext}>
+                      以后再说
                     </button>
                   )}
-                  <button type="button" className={GHOST_BTN} onClick={goNext}>
-                    以后再说
-                  </button>
                   <button type="button" className={GHOST_BTN} onClick={goBack}>
                     上一步
                   </button>
@@ -607,12 +730,18 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
               <>
                 <StepTitle title="快好了，确认一下" desc="点下去就按这些设置开始用" />
                 <ul className="flex flex-col gap-1 text-sm text-[var(--text-secondary)]">
-                  <li>云端大脑：{CLOUD_PROVIDERS.find((p) => p.value === provider)?.label ?? provider}</li>
+                  <li>
+                    云端大脑：
+                    {cloudSkipped
+                      ? '先不用云端（本地就能聊，以后在设置里补）'
+                      : CLOUD_PROVIDERS.find((p) => p.value === provider)?.label ?? provider}
+                  </li>
                   <li>钥匙：{apiKey ? '已经填好' : '先空着，回头在设置里补'}</li>
                   <li>
                     下载线路：{channel === 'mirror' ? '国内线路（魔塔）' : '海外线路（HuggingFace）'}
                   </li>
                   <li>本地小模型：{localEnabled ? '开着' : '先关着'}</li>
+                  <li>运行偏好：{accelModeLabel(accelMode)}</li>
                 </ul>
 
                 {submitError && (

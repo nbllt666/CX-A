@@ -48,11 +48,15 @@ DEFAULTS = {
     },
     # device：推理设备开关（"cpu"(默认)/"gpu"）。gpu 时 LlamaRuntime 以
     # n_gpu_layers=-1 全层卸载（可用 local_llm.n_gpu_layers 高级覆盖）。
+    # backend：llama.cpp 后端构建选择（""(默认=CUDA/CPU 构建)/"cuda"/"vulkan"），
+    # 由 accel_plan 产出（20261002 批 A）：vulkan 时 llama-server 取
+    # runtime/llama_vulkan 目录（缺失回退默认目录），非法值归一 ""。
     "local_llm": {
         "enabled": False,
         "model_path": "",
         "source": "modelscope",
         "device": "cpu",
+        "backend": "",
     },
     #: 统一下载源（首启向导 spec「统一下载源配置」）：channel 为镜像 / 官方通道的
     #: 单一真相源，同时决定 pip 依赖索引与 HuggingFace 端点；派生规则集中在
@@ -64,20 +68,34 @@ DEFAULTS = {
     #: 嵌入运行时（20260926_模块0_真实嵌入与向量持久化）：model=模型标识；
     #: model_path=GGUF 路径（绝对路径或相对应用根；空串时按约定目录
     #: <root>/data/local_llm/qwen3-embedding-0.6b/*.gguf 解析）；
-    #: device=cpu/gpu（gpu 经 embedding.n_gpu_layers 高级键覆盖，缺省 -1 全层卸载）。
+    #: device=cpu/gpu（gpu 经 embedding.n_gpu_layers 高级键覆盖，缺省 -1 全层卸载）；
+    #: backend=llama.cpp 后端构建（""(默认)/"cuda"/"vulkan"，20261002 批 A，非法归一 ""）。
     "embedding": {
         "model": "qwen3-embedding:0.6b",
         "runtime": "llama.cpp",
         "device": "cpu",
         "model_path": "",
+        "backend": "",
     },
     #: 向量库后端（20260926 起默认 sqlite：<data>/memories.db 内持久向量表，
     #: 检索口径与 InMemoryVectorStore 逐位一致（cosine））；path 仅在
     #: backend=lancedb（保留旧口径，要求环境装有 lancedb）时作为 LanceDB 目录。
     "vector": {"backend": "sqlite", "path": "data/lancedb"},
+    #: 全组件加速模式（性能/节能双模式 spec）：mode 为静态默认；
+    #: 安装/首启期由画像经 accel_plan 推导落盘（有独显 → performance；仅核显/无 → eco）。
+    #: 归为热更新段——模式切换保存后由应用层按新落点重建语音桥生效。
+    "accel": {"mode": "performance"},
     # device：推理设备开关（"cpu"(默认)/"gpu"）。gpu 时按各引擎能力切 GPU，
     # CUDA 不可用自动回落 cpu（llama 侧全层卸载、torch 侧 resolve_torch_device）。
-    "tts": {"engine": "melotts", "voice": "cx-open", "device": "cpu"},
+    # accel：TTS 加速后端（"auto"(默认)/"cpu"/"cuda"/"dml"/"rocm"/"off"），非法归一 auto；
+    # accel_device：DirectML 设备提示（""(默认)/"igpu"/"dgpu"），由 accel_plan 产出。
+    "tts": {
+        "engine": "melotts",
+        "voice": "cx-open",
+        "device": "cpu",
+        "accel": "auto",
+        "accel_device": "",
+    },
     "asr": {"engine": "sensevoice", "device": "cpu"},
     "vad": {"mode": "webrtc"},
     "memory": {"max_memories": 30, "dedup": 0.85, "permanent_threshold": 0.95},
@@ -128,6 +146,9 @@ HOT_RELOAD_SECTIONS = (
     #: 覆盖，故一并列入热更新段（reloadable("setup") 为 True，不引入副作用）。
     "download",
     "setup",
+    #: accel 段（全组件加速模式）纳入热更新——模式切换保存后由应用层按新
+    #: accel_plan 落点重建语音桥生效（其余组件遵循各自既有热更新语义）。
+    "accel",
     "tts",
     "asr",
     "vad",

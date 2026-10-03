@@ -44,6 +44,10 @@ _PROTOCOL_NOISE_LIMIT = 20
 _STDERR_KEEP_LINES = 200
 #: Windows CREATE_NO_WINDOW（避免桥进程弹控制台窗口）。
 _CREATE_NO_WINDOW = 0x08000000
+#: ``accel`` 值域（与 bridge ``--accel`` 对齐；缺省 ``auto``，非法归一 ``auto``）。
+_ACCEL_VALUES = ("off", "cpu", "auto", "cuda", "dml", "rocm")
+#: ``accel_device`` 值域（与 bridge ``--accel-device`` 对齐；缺省 ``""``，非法归一 ``""``）。
+_ACCEL_DEVICE_VALUES = ("", "igpu", "dgpu")
 
 
 class VoiceBridgeError(RuntimeError):
@@ -59,6 +63,8 @@ class VoiceBridgeClient:
         python_exe=None,
         script_path=None,
         device="cpu",
+        accel="auto",
+        accel_device="",
         timeout=DEFAULT_TIMEOUT_S,
         hf_endpoint="",
         hf_home=None,
@@ -69,6 +75,11 @@ class VoiceBridgeClient:
         :param python_exe: sidecar 解释器显式路径；缺省 ``<root>/runtime/voice/python.exe``。
         :param script_path: bridge 脚本显式路径；缺省按"分发落点 → 源码兜底"解析。
         :param device: 推理设备串（cpu / cuda / cuda:0）。
+        :param accel: TTS ORT 加速后端（off / cpu / auto / cuda / dml / rocm）；
+            缺省 ``"auto"``，非法值归一 ``"auto"``（与 bridge ``--accel`` 对齐；
+            非缺省时才向子进程注入 ``--accel``，缺省行为与旧版本逐字等价）。
+        :param accel_device: DirectML 设备提示（``""``（默认，自动）/ ``igpu`` / ``dgpu``；
+            非法值归一 ``""``）；非空时才注入 ``--accel-device``（仅 dml 后端消费）。
         :param timeout: 单请求超时秒数（读写整体）。
         :param hf_endpoint: HF 镜像端点（注入子进程 ``HF_ENDPOINT``）；**缺省空串 =
             不注入、走官方端点**。实测（2026-09-25）：hf-mirror 对未缓存文件返回
@@ -81,6 +92,8 @@ class VoiceBridgeClient:
         self.python_exe = python_exe or os.path.join(self.root, "runtime", "voice", "python.exe")
         self.script_path = script_path or self._resolve_script()
         self.device = self._normalize_device(device)
+        self.accel = self._normalize_accel(accel)
+        self.accel_device = self._normalize_accel_device(accel_device)
         self.timeout = timeout
         self.hf_endpoint = hf_endpoint
         self.hf_home = hf_home or os.path.join(self.root, "data", "hf_cache")
@@ -99,6 +112,18 @@ class VoiceBridgeClient:
         """
         value = str(device or "cpu").strip().lower() or "cpu"
         return "auto" if value == "gpu" else value
+
+    @staticmethod
+    def _normalize_accel(accel):
+        """加速后端归一：值域内小写原样；非法/缺省一律回 ``"auto"``（与 bridge 对齐）。"""
+        value = str(accel if accel is not None else "").strip().lower()
+        return value if value in _ACCEL_VALUES else "auto"
+
+    @staticmethod
+    def _normalize_accel_device(accel_device):
+        """设备提示归一：值域内小写原样；非法一律回 ``""``（自动）。"""
+        value = str(accel_device if accel_device is not None else "").strip().lower()
+        return value if value in _ACCEL_DEVICE_VALUES else ""
 
     def _resolve_script(self):
         """解析 bridge 脚本路径（**仅认分发落点**）。
@@ -144,6 +169,27 @@ class VoiceBridgeClient:
         env["TMP"] = tmp_dir
         return env
 
+    def _bridge_argv(self):
+        """构造 bridge 子进程命令行（stdin/stdout 帧协议口径与 bridge 对齐）。
+
+        ``--accel`` / ``--accel-device`` **仅在非缺省时注入**（缺省 ``auto`` / 空）——
+        保证旧调用零修改时命令行与历史逐字等价（向后兼容）；``--hf-endpoint`` 沿用
+        既有"缺省不注入"口径。
+        """
+        argv = [
+            self.python_exe,
+            self.script_path,
+            "--root", self.root,
+            "--device", self.device,
+        ]
+        if self.accel != "auto":
+            argv += ["--accel", self.accel]
+        if self.accel_device:
+            argv += ["--accel-device", self.accel_device]
+        if self.hf_endpoint:
+            argv += ["--hf-endpoint", self.hf_endpoint]
+        return argv
+
     def _ensure_process(self):
         """确保常驻桥进程已启动（已存活则直接返回）。
 
@@ -159,13 +205,7 @@ class VoiceBridgeClient:
         os.makedirs(os.path.join(self.root, "data", "tmp"), exist_ok=True)
         creationflags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
         proc = subprocess.Popen(
-            [
-                self.python_exe,
-                self.script_path,
-                "--root", self.root,
-                "--device", self.device,
-                *(["--hf-endpoint", self.hf_endpoint] if self.hf_endpoint else []),
-            ],
+            self._bridge_argv(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

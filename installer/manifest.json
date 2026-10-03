@@ -13,6 +13,14 @@
       "notes": "本地推理运行时（预编译二进制：llama-cli.exe + ggml-cuda.dll 等，经语音桥 chat op 子进程推理，见 20260925_模块0_接入llama本地推理.md）。status=runtime：不进便携 zip、不参与 bundled 拷贝，由 installer.iss [Files] 从 bundled/llama_cpp 直接落位 runtime/llama；本地小 LLM 模型不在本组件内（由首启向导按档位下载）。"
     },
     {
+      "name": "llama.cpp Vulkan",
+      "key": "llama_cpp_vulkan",
+      "size_estimate": "约 88 MB",
+      "status": "runtime",
+      "install_target": "runtime/llama_vulkan",
+      "notes": "本地推理运行时 Vulkan 构建（预编译二进制：llama-server.exe + ggml-vulkan.dll 等，版本 0.5.0-dev build 11178 commit f9af9be21，与 llama_cpp 的 CUDA 构建同版本；20261002_模块0_加速未闭合项收口 批 A 引入）。供 AMD/Intel 独显与核显机器走 llama.cpp Vulkan GPU 路径（accel_plan 产出 local_llm.backend/embedding.backend=vulkan 时由 resolve_llama_dir 选用，目录缺失回退 runtime/llama）。status=runtime：不进便携 zip、不参与 bundled 拷贝，由 installer.iss [Files] 从 bundled/llama_cpp_vulkan 直接落位 runtime/llama_vulkan。"
+    },
+    {
       "name": "qwen3-embedding:0.6b (GGUF)",
       "key": "embedding_model",
       "size_estimate": "约 609 MB",

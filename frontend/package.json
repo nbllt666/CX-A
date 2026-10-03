@@ -34,6 +34,7 @@
     "files": [
       "dist/**/*",
       "src/main/**/*",
+      "build/icon.ico",
       "package.json",
       "!node_modules/**/*",
       "!tests/**",
@@ -49,6 +50,7 @@
           ]
         }
       ],
+      "icon": "build/icon.ico",
       "signAndEditExecutable": false
     },
     "electronDownload": {
@@ -77,6 +79,7 @@
     "electron-builder": "^25.1.8",
     "jsdom": "^29.1.1",
     "postcss": "^8.4.49",
+    "rcedit": "^5.0.1",
     "tailwindcss": "^3.4.15",
     "typescript": "^5.9.3",
     "vite": "^5.4.11",

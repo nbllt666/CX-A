@@ -120,7 +120,8 @@ test.describe.serial('打包态全新安装实跑', () => {
       timeout: 60_000,
     });
     await clickAny(first.win, ['就用推荐的', '跳过推荐，直接下一步']);
-    await expect(first.win.getByText(/第 2 \/ 5 步/)).toBeVisible({ timeout: 30_000 });
+    // 分支无关：不写死步号（推荐为本地时快车道直达线路步骤），只断言已离开第 1 步
+    await expect(first.win.getByText(/第 [2-5] \/ 5 步/)).toBeVisible({ timeout: 30_000 });
     await first.app.close();
     await waitUntil(async () => !(await probeHealth()), 20_000, '退出后 8600 释放');
 
@@ -175,9 +176,15 @@ test.describe.serial('打包态全新安装实跑', () => {
     // ── ② 走完 5 步（步 0 视体检结果有两种按钮，逐个探测） ──
     const first = await clickAny(win, ['就用推荐的', '跳过推荐，直接下一步']);
     console.log(`[packaged] 步骤0 点击：${first}；点击后状态 ${await dumpWizardState(win)}`);
-    // 步 1/2 的推进键是「下一步」，步 3（本地模型）的推进键是「以后再说」（不下载直接过）
-    for (let i = 0; i < 3; i += 1) {
-      const clicked = await clickAny(win, ['下一步', '以后再说']);
+    // 中间步推进改为条件驱动：快车道可能跳过云端步骤，打包态步数不写死
+    // （本地快车道 2 步、云端主路径 3 步；上限 6 次防死循环；「跳过，先用本地」作兜底候选）
+    for (let i = 0; i < 6; i += 1) {
+      const confirmVisible = await win
+        .getByRole('heading', { name: '快好了，确认一下' })
+        .isVisible()
+        .catch(() => false);
+      if (confirmVisible) break;
+      const clicked = await clickAny(win, ['下一步', '以后再说', '跳过，先用本地']);
       console.log(`[packaged] 第 ${i + 2} 步点击：${clicked}；状态 ${await dumpWizardState(win)}`);
     }
     await expect(win.getByRole('heading', { name: '快好了，确认一下' })).toBeVisible();
@@ -190,8 +197,12 @@ test.describe.serial('打包态全新安装实跑', () => {
     await expect(win.getByRole('heading', { name: '欢迎来到 CX-A' })).toHaveCount(0);
 
     // ── ④ 主界面自动拉起悬浮窗（默认开启），且 VRM 真就位 ──
-    //    历史 localStorage 可能残留 '0'（同一 userData 被其它用例写过），清掉后 reload 复原默认开启
-    await win.evaluate(() => localStorage.removeItem('cx-a.petEnabled'));
+    //    历史 localStorage 可能残留 '0'（同一 userData 被其它用例写过），清掉后 reload 复原默认开启；
+    //    同理清掉尺寸偏好（cx-a.petSize 与已安装副本共享 userData，残留会使默认档位断言失真）
+    await win.evaluate(() => {
+      localStorage.removeItem('cx-a.petEnabled');
+      localStorage.removeItem('cx-a.petSize');
+    });
     await win.reload();
     await win.waitForLoadState('domcontentloaded');
     await expect(win.getByRole('heading', { name: '聊天' })).toBeVisible({ timeout: 60_000 });

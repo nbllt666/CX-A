@@ -33,6 +33,14 @@
         .dim(probe_text="ping") -> int
         .running -> bool
         .close() -> None
+
+    LlamaServerChat(exe_path, model_path, n_gpu_layers=0, n_ctx=2048,
+                    host="127.0.0.1", ready_timeout=300.0, request_timeout=120.0,
+                    popen_factory=None, http_factory=None)
+        .ensure_started() -> None
+        .chat(messages: list, max_tokens=128, temperature=0.7, seed=None, timeout=None) -> str
+        .running -> bool
+        .close() -> None
 """
 
 import json
@@ -66,9 +74,10 @@ SNIPPET_LIMIT = 200
 MAX_INPUT_TOKENS = 1800
 
 #: 每字符 token 折算（**仅作回退的近似口径**；权威口径为服务端 ``/tokenize`` 真实分词）：
-#: 20260926 四审实测（真实 Qwen3 分词器）：自然中文 0.601 / ASCII 自然文本 ≈0.21，
-#: 但**重复字/生僻字 CJK 可达 1.0~2.0、随机可打印 ASCII 可达 0.76、emoji 与 CJK 扩展 B~H 达 3.0**
-#: ——字符启发式无法给出可靠上界，故仅当 ``/tokenize`` 不可用时回退使用本表（近似、非保证）。
+#: 参考量级（真实 Qwen3 分词器实测样本）：自然中文 ≈0.6~0.65 / ASCII 自然文本 ≈0.21 /
+#: 重复字·生僻字 CJK 1.0~2.0 / 随机可打印 ASCII ≈0.76——字符启发式无法给出可靠上界，
+#: 故本表为近似取值：emoji 取 3.0（保守高估；实测约 1.0~1.4）；CJK 扩展 B~H 取 3.0
+#: （实测约 3.0~4.0，扩展 G 更高、存在低估）——仅当 ``/tokenize`` 不可用时回退使用本表（近似、非保证）。
 _TOKENS_PER_CJK_CHAR = 0.75
 _TOKENS_PER_ASCII_CHAR = 0.4
 _TOKENS_PER_WIDE_CHAR = 1.0
@@ -79,6 +88,75 @@ CLIP_SEPARATOR = "\n…\n"
 
 #: ``/tokenize`` 探测单次超时（秒）——本机回环极轻调用（毫秒级）；失败即回退启发式
 TOKENIZE_TIMEOUT_S = 30
+
+#: chat 服务就绪等待上限（秒）——8B Q4 GPU 实测冷加载 5.3~5.5s，放宽覆盖慢盘 / CPU 加载
+CHAT_READY_TIMEOUT_S = 300
+
+#: chat 单次请求超时（秒）——常驻服务已加载模型，仅需覆盖生成本身（慢机留足余量）
+CHAT_REQUEST_TIMEOUT_S = 120
+
+# ------------------------------------------------------------------ #
+# 后端目录解析（20261002 批 A：Vulkan 构建路径选择）                    #
+# ------------------------------------------------------------------ #
+
+#: 默认 llama.cpp 预编译二进制目录（相对便携根）：CUDA 构建与 CPU 兜底共用。
+DEFAULT_LLAMA_DIR_REL = ("runtime", "llama")
+
+#: Vulkan 后端 llama.cpp 预编译二进制目录（相对便携根）：AMD/Intel 独显与核显
+#: 机器走该构建（accel_plan ``local_llm.backend`` / ``embedding.backend`` =
+#: ``"vulkan"`` 时经 :func:`resolve_llama_dir` 选用）。
+VULKAN_LLAMA_DIR_REL = ("runtime", "llama_vulkan")
+
+#: llama-server 可执行文件名（两目录同名，仅构建后端不同）。
+LLAMA_SERVER_EXE_NAME = "llama-server.exe"
+
+
+def resolve_llama_dir(root, backend="") -> str:
+    """按后端意图解析 llama.cpp 预编译二进制目录（stdlib-only，唯一选择口径）。
+
+    规则（20261002 批 A；同日补充 N 卡 Vulkan 兜底）：
+
+    - ``backend == "vulkan"`` → ``<root>/runtime/llama_vulkan``；该目录下
+      ``llama-server.exe`` **不存在**时回退默认目录 ``<root>/runtime/llama``
+      并输出中文日志告警（Vulkan 组件未随包分发时的兜底，保持可用性优先）；
+    - ``backend == "cuda"`` → 默认目录 ``<root>/runtime/llama``；该目录下
+      ``llama-server.exe`` **不存在**时回退 Vulkan 目录（Vulkan 为跨厂商后端、
+      NVIDIA 亦可运行——CUDA 构建缺失时的 GPU 兜底，优于直接落 CPU）并输出
+      中文日志告警；Vulkan 目录同样缺失时返回默认目录（交由上层报中文错误）；
+    - 其余（``""`` / 未知值）→ 默认目录 ``<root>/runtime/llama``
+      （与历史行为逐字等价，不做兜底探测）。
+
+    :param root: 便携根绝对路径。
+    :param backend: 后端意图（``"cuda"`` / ``"vulkan"`` / ``""``；大小写与
+        首尾空白不敏感，非法值按默认目录处理）。
+    :return: llama.cpp 二进制目录绝对路径（str）。
+    """
+    root_str = str(root or "")
+    base_dir = os.path.join(root_str, *DEFAULT_LLAMA_DIR_REL)
+    normalized = str(backend or "").strip().lower()
+    if normalized == "cuda":
+        # Vulkan 为跨厂商后端（NVIDIA 亦可运行）：CUDA 构建缺失时优先兜底
+        # Vulkan 目录（GPU 路径），两者皆缺才返回默认目录（上层报中文错误）
+        if os.path.isfile(os.path.join(base_dir, LLAMA_SERVER_EXE_NAME)):
+            return base_dir
+        vulkan_dir = os.path.join(root_str, *VULKAN_LLAMA_DIR_REL)
+        if os.path.isfile(os.path.join(vulkan_dir, LLAMA_SERVER_EXE_NAME)):
+            LOGGER.warning(
+                "默认 llama.cpp 目录缺失 %s（期望：%s），回退 Vulkan 构建（NVIDIA 亦可运行）：%s",
+                LLAMA_SERVER_EXE_NAME, base_dir, vulkan_dir,
+            )
+            return vulkan_dir
+        return base_dir
+    if normalized != "vulkan":
+        return base_dir
+    vulkan_dir = os.path.join(root_str, *VULKAN_LLAMA_DIR_REL)
+    if os.path.isfile(os.path.join(vulkan_dir, LLAMA_SERVER_EXE_NAME)):
+        return vulkan_dir
+    LOGGER.warning(
+        "Vulkan 运行时目录缺失或不含 %s（期望：%s），回退默认 llama.cpp 目录：%s",
+        LLAMA_SERVER_EXE_NAME, vulkan_dir, base_dir,
+    )
+    return base_dir
 
 
 def _char_cost(ch):
@@ -246,8 +324,8 @@ def _default_http(url, payload, timeout):
         return int(exc.code), body
 
 
-class _EmbedRequestError(RuntimeError):
-    """嵌入请求失败（携带"是否值得重启服务重试"标记）。
+class _ServerRequestError(RuntimeError):
+    """llama-server 请求失败（携带"是否值得重启服务重试"标记；嵌入/chat 共用）。
 
     ``retriable=False`` 表示业务性错误（4xx：输入非法 / 超上下文等）——重启
     llama-server 无益。20260926 深挖实测：一条超长文本触发的 HTTP 400 曾导致
@@ -260,36 +338,25 @@ class _EmbedRequestError(RuntimeError):
         self.retriable = bool(retriable)
 
 
-class LlamaServerEmbedder:
-    """llama-server.exe 常驻子进程 + /v1/embeddings HTTP 客户端（主进程 stdlib-only）。
+class _LlamaServerProcess:
+    """llama-server.exe 常驻子进程的公共生命周期（嵌入器 / chat 客户端共用）。
 
-    实测口径（2026-09-26）：``-m <gguf> --embeddings --pooling last --host 127.0.0.1
-    --port <随机空闲端口> -c 2048 -ngl 0 --no-webui``；``/health`` 返回
-    ``{"status":"ok"}`` 即就绪；``POST /v1/embeddings {"input":[...]}`` 返回
-    ``{"data":[{"embedding":[...]},...]}``。
+    流程（两处一致，仅启动 argv 不同——由子类 :meth:`_build_argv` 提供）：
+    校验 exe / model 文件存在 → 取空闲端口 → 拉起子进程（DEVNULL 吞输出）→
+    轮询 ``GET /health``（间隔 0.25s，上限 ``ready_timeout``）直至 200 且
+    body JSON ``status == "ok"``。失败均清理子进程引用并抛中文 RuntimeError。
 
-    Args:
-        exe_path: llama-server.exe 绝对路径（随包分发于 ``runtime/llama/``）。
-        model_path: 嵌入模型 GGUF 绝对路径。
-        n_gpu_layers: GPU 卸载层数（默认 0 = 纯 CPU）。
-        n_ctx: 上下文窗口大小（默认 2048）。
-        host: 本机回环地址（默认 127.0.0.1）。
-        ready_timeout: 冷启动就绪轮询上限（秒，默认 120）。
-        request_timeout: 单次 HTTP 请求超时（秒，默认 120）。
-        popen_factory: 子进程工厂注入点 ``(argv) -> proc``；默认
-            :func:`_default_popen`。替身需具备 ``.poll()`` / ``.terminate()``
-            / ``.kill()`` / ``.wait(timeout=...)`` / ``.returncode``。
-        http_factory: HTTP 注入点 ``(url, payload_bytes_or_None, timeout)
-            -> (status_code, body_bytes)``；默认 :func:`_default_http`。
+    注入点（``popen_factory`` / ``http_factory``）与生命周期语义见
+    :class:`LlamaServerEmbedder` 的 Args 说明（两子类同口径）。
     """
 
     def __init__(self, exe_path, model_path, n_gpu_layers=0, n_ctx=2048,
                  host="127.0.0.1", ready_timeout=120.0, request_timeout=120.0,
                  popen_factory=None, http_factory=None):
-        """初始化嵌入器（不启动任何进程，懒启动由 ``ensure_started`` 触发）。"""
+        """初始化（不启动任何进程，懒启动由 ``ensure_started`` 触发）。"""
         #: llama-server.exe 绝对路径
         self._exe_path = str(exe_path)
-        #: 嵌入模型 GGUF 绝对路径
+        #: 模型 GGUF 绝对路径
         self._model_path = str(model_path)
         #: GPU 卸载层数
         self._n_gpu_layers = int(n_gpu_layers)
@@ -305,7 +372,7 @@ class LlamaServerEmbedder:
         self._popen_factory = popen_factory or _default_popen
         #: HTTP 客户端（注入点）
         self._http_factory = http_factory or _default_http
-        #: 并发互斥锁（串行化启动 / 嵌入 / 关闭）
+        #: 并发互斥锁（串行化启动 / 请求 / 关闭）
         self._lock = threading.Lock()
         #: 常驻子进程句柄（未启动为 None）
         self._proc = None
@@ -313,8 +380,10 @@ class LlamaServerEmbedder:
         self._port = None
         #: 子进程是否已完成 /health 就绪确认
         self._ready = False
-        #: 超长输入截断告警去重标记（首次截断时告警一次，避免逐请求刷屏）
-        self._clip_warned = False
+
+    def _build_argv(self, port):
+        """构造启动 argv（子类实现；``port`` 为已探测的空闲端口）。"""
+        raise NotImplementedError
 
     # ------------------------------------------------------------------ #
     # 生命周期：启动 / 关闭                                                #
@@ -322,10 +391,6 @@ class LlamaServerEmbedder:
 
     def ensure_started(self):
         """确保常驻子进程已就绪（幂等：进程存活且已就绪直接返回）。
-
-        流程：校验 exe / model 文件存在 → 取空闲端口 → 按固定 argv 拉起子进程
-        → 轮询 ``GET /health``（间隔 0.25s，上限 ``ready_timeout``）直至 200 且
-        body JSON ``status == "ok"``。
 
         Raises:
             RuntimeError: exe / model 文件缺失；子进程启动过程中退出（附
@@ -342,17 +407,13 @@ class LlamaServerEmbedder:
         if not os.path.isfile(self._exe_path):
             raise RuntimeError(f"llama-server 可执行文件不存在：{self._exe_path}")
         if not os.path.isfile(self._model_path):
-            raise RuntimeError(f"嵌入模型文件不存在：{self._model_path}")
+            raise RuntimeError(f"模型文件不存在：{self._model_path}")
 
         if self._proc is not None:
             self._stop_process()  # 清理残留（已退或未就绪）引用
 
         port = _free_port(self._host)
-        argv = [
-            self._exe_path, "-m", self._model_path, "--embeddings",
-            "--pooling", "last", "--host", self._host, "--port", str(port),
-            "-c", str(self._n_ctx), "-ngl", str(self._n_gpu_layers), "--no-webui",
-        ]
+        argv = self._build_argv(port)
         try:
             proc = self._popen_factory(argv)
         except Exception as exc:  # noqa: BLE001 - 拉起失败转为中文错误
@@ -433,6 +494,50 @@ class LlamaServerEmbedder:
             proc = self._proc
             return proc is not None and proc.poll() is None
 
+
+class LlamaServerEmbedder(_LlamaServerProcess):
+    """llama-server.exe 常驻子进程 + /v1/embeddings HTTP 客户端（主进程 stdlib-only）。
+
+    实测口径（2026-09-26）：``-m <gguf> --embeddings --pooling last --host 127.0.0.1
+    --port <随机空闲端口> -c 2048 -ngl 0 --no-webui``；``/health`` 返回
+    ``{"status":"ok"}`` 即就绪；``POST /v1/embeddings {"input":[...]}`` 返回
+    ``{"data":[{"embedding":[...]},...]}``。
+
+    Args:
+        exe_path: llama-server.exe 绝对路径（随包分发于 ``runtime/llama/``）。
+        model_path: 嵌入模型 GGUF 绝对路径。
+        n_gpu_layers: GPU 卸载层数（默认 0 = 纯 CPU）。
+        n_ctx: 上下文窗口大小（默认 2048）。
+        host: 本机回环地址（默认 127.0.0.1）。
+        ready_timeout: 冷启动就绪轮询上限（秒，默认 120）。
+        request_timeout: 单次 HTTP 请求超时（秒，默认 120）。
+        popen_factory: 子进程工厂注入点 ``(argv) -> proc``；默认
+            :func:`_default_popen`。替身需具备 ``.poll()`` / ``.terminate()``
+            / ``.kill()`` / ``.wait(timeout=...)`` / ``.returncode``。
+        http_factory: HTTP 注入点 ``(url, payload_bytes_or_None, timeout)
+            -> (status_code, body_bytes)``；默认 :func:`_default_http`。
+    """
+
+    def __init__(self, exe_path, model_path, n_gpu_layers=0, n_ctx=2048,
+                 host="127.0.0.1", ready_timeout=120.0, request_timeout=120.0,
+                 popen_factory=None, http_factory=None):
+        """初始化嵌入器（不启动任何进程，懒启动由 ``ensure_started`` 触发）。"""
+        super().__init__(
+            exe_path, model_path, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx,
+            host=host, ready_timeout=ready_timeout, request_timeout=request_timeout,
+            popen_factory=popen_factory, http_factory=http_factory,
+        )
+        #: 超长输入截断告警去重标记（首次截断时告警一次，避免逐请求刷屏）
+        self._clip_warned = False
+
+    def _build_argv(self, port):
+        """嵌入服务启动 argv（``--embeddings --pooling last`` 为嵌入专用开关）。"""
+        return [
+            self._exe_path, "-m", self._model_path, "--embeddings",
+            "--pooling", "last", "--host", self._host, "--port", str(port),
+            "-c", str(self._n_ctx), "-ngl", str(self._n_gpu_layers), "--no-webui",
+        ]
+
     # ------------------------------------------------------------------ #
     # 嵌入                                                                #
     # ------------------------------------------------------------------ #
@@ -484,7 +589,7 @@ class LlamaServerEmbedder:
             first_exc = None
             try:
                 return self._embed_once(fitted)
-            except _EmbedRequestError as exc:
+            except _ServerRequestError as exc:
                 if not exc.retriable:
                     # 业务性错误：重启 llama-server 无益，直接上抛（不产生服务抖动）
                     raise RuntimeError(str(exc)) from exc
@@ -594,7 +699,7 @@ class LlamaServerEmbedder:
         return head, True
 
     def _embed_once(self, texts):
-        """单次嵌入请求（不做重试）；失败抛 ``_EmbedRequestError`` 供调用方分流。
+        """单次嵌入请求（不做重试）；失败抛 ``_ServerRequestError`` 供调用方分流。
 
         ``retriable`` 标记口径：HTTP 4xx（输入非法 / 超上下文等业务性错误）→ False；
         HTTP 5xx / 408 / 429 与响应结构异常 → True（重启服务可能恢复）。
@@ -608,25 +713,25 @@ class LlamaServerEmbedder:
         if int(status) != 200:
             code = int(status)
             retriable = code >= 500 or code in (408, 429)
-            raise _EmbedRequestError(
+            raise _ServerRequestError(
                 f"嵌入接口返回 HTTP {code}：{_clip_bytes(body)}", retriable=retriable
             )
         try:
             data = json.loads(_decode_body(body))
         except Exception as exc:  # noqa: BLE001 - 响应非 JSON 归为失败
-            raise _EmbedRequestError(f"嵌入响应非合法 JSON：{_clip_bytes(body)}") from exc
+            raise _ServerRequestError(f"嵌入响应非合法 JSON：{_clip_bytes(body)}") from exc
 
         items = data.get("data") if isinstance(data, dict) else None
         if not isinstance(items, list) or not items:
-            raise _EmbedRequestError(f"嵌入响应缺少 data 条目：{_clip_bytes(body)}")
+            raise _ServerRequestError(f"嵌入响应缺少 data 条目：{_clip_bytes(body)}")
 
         parsed = []
         for pos, item in enumerate(items):
             if not isinstance(item, dict):
-                raise _EmbedRequestError(f"嵌入响应条目格式非法：{_clip_text(item)}")
+                raise _ServerRequestError(f"嵌入响应条目格式非法：{_clip_text(item)}")
             vector = item.get("embedding")
             if not isinstance(vector, list) or not vector:
-                raise _EmbedRequestError(f"嵌入响应存在空条目：{_clip_text(item)}")
+                raise _ServerRequestError(f"嵌入响应存在空条目：{_clip_text(item)}")
             parsed.append((item.get("index"), [float(v) for v in vector]))
 
         # 各项均带 index 时按 index 排序保序；否则维持响应原顺序
@@ -635,7 +740,7 @@ class LlamaServerEmbedder:
         result = [vector for _index, vector in parsed]
 
         if len(result) != len(texts):
-            raise _EmbedRequestError(
+            raise _ServerRequestError(
                 f"嵌入返回条数（{len(result)}）与输入条数（{len(texts)}）不一致。"
             )
         return result
@@ -647,6 +752,149 @@ class LlamaServerEmbedder:
         :return: 向量维度（int，实测为 1024）
         """
         return len(self.embed([probe_text])[0])
+
+
+class LlamaServerChat(_LlamaServerProcess):
+    """llama-server.exe 常驻子进程 + /v1/chat/completions 客户端（主进程 stdlib-only）。
+
+    背景（20260930_模块0_本地LLM常驻推理改造）：本地小 LLM 原经语音桥 llama-cli
+    单次子进程推理，**每次请求重载 5GB GGUF**（实测单次全流程 6.4~7.4s，其中生成
+    仅 ~0.2~1s）。改为常驻 llama-server 后单次请求实测 **0.41~0.43s**。
+
+    两个关键口径（均由 20260930 变体矩阵实测定案，脚本
+    ``.trae/documents/test_reports/voice_no_think_20260930/server_variant_probe.py``）：
+    - 请求走 ``/v1/chat/completions``（应用模型内嵌 chat template）；**同口径
+      raw ``/completion`` 在 server 侧实测出现"复读提示词"异常，故本类只走 chat 端点**；
+    - 以 ``chat_template_kwargs={"enable_thinking": false}`` 原生关闭 Qwen3 思考
+      （实测：开启思考时 128 token 预算被思考吞掉、content 为空；关闭后直接作答）。
+
+    Args:
+        exe_path: llama-server.exe 绝对路径（随包分发于 ``runtime/llama/``）。
+        model_path: 本地小 LLM GGUF 绝对路径。
+        n_gpu_layers: GPU 卸载层数（默认 0 = 纯 CPU）。
+        n_ctx: 上下文窗口大小（默认 2048）。
+        host: 本机回环地址（默认 127.0.0.1）。
+        ready_timeout: 冷启动就绪轮询上限（秒，默认 300——8B Q4 GPU 实测 5.3~5.5s，
+            放宽覆盖慢盘 / CPU 加载）。
+        request_timeout: 单次 HTTP 请求超时（秒，默认 120——常驻服务已加载模型，
+            仅覆盖生成时间）。
+        popen_factory / http_factory: 注入点（口径同 :class:`LlamaServerEmbedder`）。
+    """
+
+    def __init__(self, exe_path, model_path, n_gpu_layers=0, n_ctx=2048,
+                 host="127.0.0.1", ready_timeout=CHAT_READY_TIMEOUT_S,
+                 request_timeout=CHAT_REQUEST_TIMEOUT_S,
+                 popen_factory=None, http_factory=None):
+        """初始化 chat 客户端（不启动任何进程，懒启动由 ``ensure_started`` 触发）。"""
+        super().__init__(
+            exe_path, model_path, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx,
+            host=host, ready_timeout=ready_timeout, request_timeout=request_timeout,
+            popen_factory=popen_factory, http_factory=http_factory,
+        )
+
+    def _build_argv(self, port):
+        """chat 服务启动 argv（无嵌入专用开关；其余同嵌入服务口径）。"""
+        return [
+            self._exe_path, "-m", self._model_path,
+            "--host", self._host, "--port", str(port),
+            "-c", str(self._n_ctx), "-ngl", str(self._n_gpu_layers), "--no-webui",
+        ]
+
+    # ------------------------------------------------------------------ #
+    # chat 补全                                                            #
+    # ------------------------------------------------------------------ #
+
+    def chat(self, messages, max_tokens=128, temperature=0.7, seed=None, timeout=None):
+        """一次 chat 补全，返回助手回复文本。
+
+        失败分流（与 :meth:`LlamaServerEmbedder.embed` 同口径）：
+        - **业务性错误**（HTTP 4xx：消息非法 / 超上下文等）→ 直接抛中文
+          ``RuntimeError``（重启服务无益）；
+        - **传输级 / 服务端级失败**（连接异常 / 超时 / 5xx / 响应非法）→
+          ``_stop_process()`` + ``ensure_started()`` 重启并**重试一次**。
+
+        Args:
+            messages: OpenAI 兼容消息列表（``[{"role", "content"}, ...]``，非空）。
+            max_tokens: 生成长度上限（默认 128）。
+            temperature: 采样温度（默认 0.7）。
+            seed: 随机种子（None = 不传，由服务端默认；传入则固定复现）。
+            timeout: 本次请求超时（秒）；缺省用构造时的 ``request_timeout``。
+        Returns:
+            str: 助手回复纯文本（可能为空串——由调用方按业务判定）。
+        Raises:
+            RuntimeError: 输入非法、业务性错误、或重启重试后仍失败（中文消息）。
+        """
+        if not isinstance(messages, list) or not messages:
+            raise RuntimeError("chat 的 messages 必须为非空列表。")
+        effective_timeout = self._request_timeout if timeout is None else timeout
+        args = (list(messages), max_tokens, temperature, seed, effective_timeout)
+        with self._lock:
+            self._ensure_started_locked()
+            # 注意：不能沿用 ``except ... as first_exc`` 后直接引用——PEP 3110 规定
+            # except 变量在离开处理块时即被删除（UnboundLocalError）。故显式回填。
+            first_exc = None
+            try:
+                return self._chat_once(*args)
+            except _ServerRequestError as exc:
+                if not exc.retriable:
+                    # 业务性错误：重启 llama-server 无益，直接上抛（不产生服务抖动）
+                    raise RuntimeError(str(exc)) from exc
+                first_exc = exc
+            except Exception as exc:  # noqa: BLE001 - 未知异常按可重试处理
+                first_exc = exc
+            # 传输级 / 服务端级失败：重启进程并重试一次
+            self._stop_process()
+            try:
+                self._ensure_started_locked()
+                return self._chat_once(*args)
+            except Exception as second_exc:  # noqa: BLE001 - 重试仍失败
+                self._stop_process()
+                raise RuntimeError(
+                    "chat 请求失败且已重启重试仍失败："
+                    f"{_clip_text(second_exc)}（首次错误：{_clip_text(first_exc)}）"
+                ) from second_exc
+
+    def _chat_once(self, messages, max_tokens, temperature, seed, timeout):
+        """单次 chat 补全请求（不做重试）；失败抛 ``_ServerRequestError`` 供调用方分流。
+
+        ``retriable`` 标记口径：HTTP 4xx（业务性错误）→ False；
+        HTTP 5xx / 408 / 429 与响应结构异常 → True（重启服务可能恢复）。
+
+        :return: str 助手回复文本
+        """
+        url = f"http://{self._host}:{self._port}/v1/chat/completions"
+        payload = {
+            "messages": list(messages),
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            # 原生关闭思考链（见类 docstring 实测依据）
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        if seed is not None:
+            payload["seed"] = int(seed)
+        status, body = self._http_factory(
+            url, json.dumps(payload).encode("utf-8"), timeout
+        )
+        if int(status) != 200:
+            code = int(status)
+            retriable = code >= 500 or code in (408, 429)
+            raise _ServerRequestError(
+                f"chat 接口返回 HTTP {code}：{_clip_bytes(body)}", retriable=retriable
+            )
+        try:
+            data = json.loads(_decode_body(body))
+        except Exception as exc:  # noqa: BLE001 - 响应非 JSON 归为失败
+            raise _ServerRequestError(f"chat 响应非合法 JSON：{_clip_bytes(body)}") from exc
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not choices:
+            raise _ServerRequestError(f"chat 响应缺少 choices 条目：{_clip_bytes(body)}")
+        first = choices[0]
+        message = first.get("message") if isinstance(first, dict) else None
+        if not isinstance(message, dict) or "content" not in message:
+            raise _ServerRequestError(
+                f"chat 响应缺少 choices[0].message.content：{_clip_bytes(body)}"
+            )
+        return str(message.get("content") or "")
 
 
 def _decode_body(body):

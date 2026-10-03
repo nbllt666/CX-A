@@ -18,6 +18,7 @@
 - 依赖外部命令一律经 ``runner`` 注入点，测试可完全 mock，不触碰真实硬件。
 """
 
+import json
 import os
 import re
 import shutil
@@ -43,6 +44,17 @@ _AMD_WMIC_CMD = "wmic path win32_VideoController get name"
 #: AMD 探测命令 2：pnputil 枚举 Display 类设备（wmic 被移除的新版 Windows 兜底）。
 _AMD_PNPUTIL_CMD = "pnputil /enum-devices /class Display"
 
+#: GPU 清单枚举命令（onnxruntime / 核显识别扩展）：PowerShell 经 WMI 枚举
+#: ``Win32_VideoController``，输出 Name + PNPDeviceID 的 JSON。
+#: 采用 **argv 列表** 形式——``-Command`` 参数含引号与管道，若按空格切分会破坏
+#: 语义；``default_runner`` 对 list/tuple 直接作为 argv 执行。
+_POWERSHELL_VIDEO_CMD = [
+    "powershell",
+    "-NoProfile",
+    "-Command",
+    "Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID | ConvertTo-Json -Depth 2",
+]
+
 #: nvidia-smi 输出中的 CUDA 版本提取（经典格式，形如 "CUDA Version: 12.4"）。
 _CUDA_VERSION_RE = re.compile(r"CUDA Version:\s*(\d+(?:\.\d+)?)")
 
@@ -61,13 +73,15 @@ def default_runner(cmd):
     - Windows 下注入 ``CREATE_NO_WINDOW``，避免安装器界面弹出黑色控制台窗口；
     - 解码失败以 replace 兜底（wmic 等命令输出编码随系统区域变化）。
 
-    :param cmd: 命令字符串（以空格切分为 argv）。
+    :param cmd: 命令字符串（以空格切分为 argv），或已切分好的 argv 列表/元组
+        （PowerShell 等含引号与管道的命令需以列表传入，避免切分破坏语义）。
     :return: (returncode, stdout) 二元组。
     """
+    argv = list(cmd) if isinstance(cmd, (list, tuple)) else cmd.split()
     creationflags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
         completed = subprocess.run(
-            cmd.split(),
+            argv,
             capture_output=True,
             text=True,
             errors="replace",
@@ -143,6 +157,132 @@ class GpuDetector:
         :return: :func:`detect_via_runner` 同构的检测报告 dict。
         """
         return detect_via_runner(runner if runner is not None else self._runner)
+
+
+# ------------------------------------------------------------------ #
+# GPU 清单枚举与核显识别（加速画像扩展）                              #
+# ------------------------------------------------------------------ #
+
+#: 独显厂商白名单（用于 ``dgpu_vendor`` 结论；other/unknown 不计入）。
+_KNOWN_DGPU_VENDORS = ("nvidia", "amd", "intel")
+
+
+def _vendor_from_name(name_upper: str) -> str:
+    """由适配器名称启发式判定厂商（``nvidia`` / ``amd`` / ``intel`` / ``other``）。"""
+    if "NVIDIA" in name_upper:
+        return "nvidia"
+    if "AMD" in name_upper or "RADEON" in name_upper:
+        return "amd"
+    if "INTEL" in name_upper:
+        return "intel"
+    return "other"
+
+
+def _gpu_type_from_name(vendor: str, name_upper: str) -> str:
+    """由厂商 + 名称启发式判定适配器类型（``igpu`` / ``dgpu`` / ``unknown``）。
+
+    口径（spec「硬件加速画像」）：
+    - NVIDIA → 独显；
+    - Intel → 核显（名称含 UHD / Iris / Graphics）；
+    - AMD：含 ``RX`` / ``Radeon Pro`` → 独显；含 ``Graphics`` / ``Vega``（无 RX）→ 核显；
+    - 无法判定 → ``unknown``（标注不确定，不猜测）。
+    """
+    if vendor == "nvidia":
+        return "dgpu"
+    if vendor == "intel":
+        return "igpu"
+    if vendor == "amd":
+        if "RX" in name_upper or "RADEON PRO" in name_upper:
+            return "dgpu"
+        if "GRAPHICS" in name_upper or "VEGA" in name_upper:
+            return "igpu"
+        return "unknown"
+    if "GRAPHICS" in name_upper or "UHD" in name_upper or "IRIS" in name_upper:
+        return "igpu"
+    return "unknown"
+
+
+def _classify_gpu(name: str, pnp_id: str) -> tuple[str, str]:
+    """按名称 + PNPDeviceID 判定 ``(vendor, type)``。
+
+    - ``ROOT\\DISPLAY``（虚拟显示适配器）/ Microsoft Basic Display → ``virtual``；
+    - 其余走名称启发式。
+    """
+    name_upper = (name or "").upper()
+    pnp_upper = (pnp_id or "").upper()
+    if (
+        "ROOT\\DISPLAY" in pnp_upper
+        or "MICROSOFT BASIC DISPLAY" in name_upper
+        or "BASIC RENDER DRIVER" in name_upper
+    ):
+        return _vendor_from_name(name_upper), "virtual"
+    vendor = _vendor_from_name(name_upper)
+    return vendor, _gpu_type_from_name(vendor, name_upper)
+
+
+def probe_gpu_inventory(runner=None) -> tuple[list, list]:
+    """枚举 GPU 清单（WMI ``Win32_VideoController`` → JSON 解析）。
+
+    容错口径（对齐 ``probe_notes``）：命令不可用 / 返回为空 / 输出非 JSON /
+    解析异常一律降级为**空清单 + 中文说明**，绝不抛错；虚拟适配器（``ROOT\\DISPLAY``）
+    照常识别为 ``virtual`` 类型但不会被计入核显 / 独显结论。
+
+    :param runner: 命令执行器（缺省 :func:`default_runner`）；
+        以 argv 列表形式收到 ``_POWERSHELL_VIDEO_CMD`` 的副本。
+    :return: ``(gpus, notes)``——gpus 为 ``list[dict]``，每项含
+        ``vendor`` / ``name`` / ``type``（``igpu`` / ``dgpu`` / ``virtual`` / ``unknown``）
+        / ``vram_hint``（名称线索，默认空串，不使用 32-bit 的 AdapterRAM）；
+        notes 为中文降级说明列表（空表示枚举成功）。
+    """
+    exe = runner if runner is not None else default_runner
+    try:
+        returncode, stdout = exe(list(_POWERSHELL_VIDEO_CMD))
+    except Exception as exc:  # noqa: BLE001 - runner 异常统一降级
+        return [], [f"GPU 清单枚举异常（{exc}），跳过核显识别"]
+
+    if returncode != 0 or not (stdout or "").strip():
+        return [], ["未能枚举 GPU 清单（WMI 命令不可用或返回为空），跳过核显识别"]
+
+    try:
+        data = json.loads(stdout)
+    except (ValueError, TypeError):
+        return [], ["GPU 清单枚举输出无法解析为 JSON，跳过核显识别"]
+
+    items = data if isinstance(data, list) else [data]
+    gpus: list = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("Name") or "").strip()
+        if not name:
+            continue
+        pnp_id = str(item.get("PNPDeviceID") or "").strip()
+        vendor, gpu_type = _classify_gpu(name, pnp_id)
+        gpus.append({
+            "vendor": vendor,
+            "name": name,
+            "type": gpu_type,
+            "vram_hint": "",  # 名称线索（留空）；AdapterRAM 为 32-bit 不可用
+        })
+
+    if not gpus:
+        return [], ["GPU 清单枚举为空，跳过核显识别"]
+    return gpus, []
+
+
+def _summarize_gpus(gpus) -> tuple[bool, str | None]:
+    """由 GPU 清单汇总 ``(has_igpu, dgpu_vendor)``。
+
+    - ``has_igpu``：清单中存在 ``igpu`` 类型；
+    - ``dgpu_vendor``：首个已知独显厂商（nvidia/amd/intel），无则 None。
+    """
+    has_igpu = any(g.get("type") == "igpu" for g in gpus)
+    dgpu_vendor = None
+    for gpu in gpus:
+        if gpu.get("type") == "dgpu" and gpu.get("vendor") in _KNOWN_DGPU_VENDORS:
+            dgpu_vendor = gpu.get("vendor")
+            break
+    return has_igpu, dgpu_vendor
 
 
 # ------------------------------------------------------------------ #
@@ -273,7 +413,8 @@ def detect_profile(root=None, runner=None) -> dict:
     :param runner: 命令执行器；缺省使用 :func:`default_runner`（GPU / 显存探测）。
     :return: dict，字段：``cpu_cores`` / ``ram_gb`` / ``gpu_vendor`` /
         ``vram_gb`` / ``cuda_version`` / ``disk_free_gb`` / ``probe_notes``
-        （中文说明，空表示探测全部成功）。
+        （中文说明，空表示探测全部成功）；增量字段 ``gpus``（GPU 清单）/
+        ``has_igpu``（是否含核显）/ ``dgpu_vendor``（首个已知独显厂商或 None）。
     """
     exe = runner if runner is not None else default_runner
     notes: list[str] = []
@@ -304,6 +445,11 @@ def detect_profile(root=None, runner=None) -> dict:
         if vram_gb is None:
             notes.append("检测到 NVIDIA GPU 但未能读取显存，按显存未知处理")
 
+    # ---- GPU 清单枚举（核显识别扩展）：失败降级不抛，仅记 probe_notes ----
+    gpus, gpu_notes = probe_gpu_inventory(exe)
+    notes.extend(gpu_notes)
+    has_igpu, dgpu_vendor = _summarize_gpus(gpus)
+
     disk_free_gb = probe_disk_free_gb(root)
     if disk_free_gb is None:
         notes.append("未能获取磁盘可用空间")
@@ -315,7 +461,274 @@ def detect_profile(root=None, runner=None) -> dict:
         "vram_gb": vram_gb,
         "cuda_version": cuda_version,
         "disk_free_gb": disk_free_gb,
+        #: 增量字段（既有字段与行为不变）：GPU 清单 + 核显 / 独显结论
+        "gpus": gpus,
+        "has_igpu": has_igpu,
+        "dgpu_vendor": dgpu_vendor,
         "probe_notes": notes,
+    }
+
+
+# ------------------------------------------------------------------ #
+# 加速方案决策（唯一真相源）                                          #
+# ------------------------------------------------------------------ #
+
+#: 合法加速模式（性能 / 节能）。
+_ACCEL_MODES = ("performance", "eco")
+
+
+def normalize_mode(mode) -> str:
+    """归一加速模式：合法值原样返回，非法 / 缺失归一 ``"performance"``。
+
+    :param mode: ``"performance"`` / ``"eco"``（大小写与首尾空白容忍）。
+    :return: 归一后的模式字符串。
+    """
+    if isinstance(mode, str) and mode.strip().lower() in _ACCEL_MODES:
+        return mode.strip().lower()
+    return "performance"
+
+
+def derive_default_mode(hardware) -> str:
+    """按硬件画像推导默认加速模式（有独显 → performance；仅核显 / 无 → eco）。
+
+    :param hardware: 画像 dict（含 ``dgpu_vendor`` / ``has_igpu`` / ``gpu_vendor``）。
+    :return: ``"performance"`` / ``"eco"``。
+    """
+    hardware = hardware if isinstance(hardware, dict) else {}
+    if hardware.get("dgpu_vendor") in _KNOWN_DGPU_VENDORS:
+        return "performance"
+    if bool(hardware.get("has_igpu")):
+        return "eco"  # 仅核显（含被既有探测判为 amd 的核显场景）
+    if hardware.get("gpu_vendor") in ("nvidia", "amd"):
+        return "performance"
+    return "eco"
+
+
+def _resolve_recommend(hardware) -> str:
+    """取画像推荐口径（优先显式 ``recommend``，否则由 ``gpu_vendor`` 派生）。"""
+    recommend = hardware.get("recommend")
+    if isinstance(recommend, str) and recommend:
+        return recommend
+    vendor = hardware.get("gpu_vendor")
+    if vendor == "nvidia":
+        return "cuda"
+    if vendor == "amd":
+        return "rocm"
+    return "cpu"
+
+
+def _resolve_dgpu_vendor(hardware, recommend) -> str | None:
+    """取首个已知独显厂商（优先显式 ``dgpu_vendor``，否则由推荐口径兜底）。"""
+    dgpu = hardware.get("dgpu_vendor")
+    if dgpu in _KNOWN_DGPU_VENDORS:
+        return dgpu
+    if recommend == "cuda":
+        return "nvidia"
+    if recommend == "rocm":
+        return "amd"
+    return None
+
+
+def _resolve_igpu_vendor(hardware) -> str | None:
+    """取首个已知**核显**厂商（来自 GPU 清单；缺失 / 未知 → None）。
+
+    20261002 用户裁决（AMD 核显优先）：用于「AMD 核显机器 TTS 目标核显、独显留给
+    游戏」的判定。清单缺失 / 厂商未知时返回 None——调用方保守回退既有口径
+    （不猜测），与画像「无法判定时标注不确定」的口径一致。
+    """
+    for gpu in hardware.get("gpus") or []:
+        if isinstance(gpu, dict) and gpu.get("type") == "igpu":
+            vendor = str(gpu.get("vendor") or "").strip().lower()
+            if vendor in _KNOWN_DGPU_VENDORS:
+                return vendor
+    return None
+
+
+def _llm_gpu_available(hardware, recommend) -> bool:
+    """本地 LLM / 嵌入是否走 GPU——**保真复现既有 ``recommend_for`` 规则**。
+
+    既有口径：``gpu_vendor == "nvidia"`` 且显存可得且 ``vram_gb >= 4``。
+    """
+    vendor = hardware.get("gpu_vendor")
+    if vendor is None and recommend == "cuda":
+        vendor = "nvidia"
+    vram_gb = hardware.get("vram_gb")
+    try:
+        vram_ok = vram_gb is not None and float(vram_gb) >= 4
+    except (TypeError, ValueError):  # noqa: PERF203 - 异常值保守降级
+        vram_ok = False
+    return vendor == "nvidia" and vram_ok
+
+
+def accel_plan(hardware, mode, platform=None) -> dict:
+    """加速方案决策（纯函数、唯一真相源）——产出各组件落点。
+
+    映射遵循 spec What Changes §3 表（20261002 批 A 扩展 backend / ROCm 面；
+    同日用户裁决：**AMD 核显优先**——TTS 目标核显（Linux ROCm / Windows DML-igpu，
+    跨模式一致），独显留给游戏与显示；清单缺失或非 AMD 核显保守回退既有分支）：
+
+    - ``tts.accel`` / ``tts.accel_device``：性能模式先判核显（有核显 → ``dml`` +
+      ``dgpu``，双模式前提）；无核显 N 卡 → ``cuda``；无核显 A/Intel → ``dml``；
+      无 GPU → ``cpu``。节能模式：有核显 → ``dml`` + ``igpu``；无核显 → ``cpu``。
+      **Linux 例外**：Linux + 性能 + AMD 独显 → ``rocm``（DirectML 为 Windows
+      专有技术，Linux 走 onnxruntime-rocm）。
+    - ``asr.device``：性能且 N 卡 → ``gpu``；否则 ``cpu``。**Linux 例外**：
+      Linux + 性能 + AMD 独显 → ``gpu``（torch ROCm 路径）。
+    - ``local_llm.device`` / ``embedding.device``：性能且 NVIDIA 显存 ≥4 GB →
+      ``gpu``；性能 + AMD/Intel 独显或仅核显 → ``gpu``（llama.cpp Vulkan 路径；
+      核显无显存数据不设显存门槛）；否则 ``cpu``（节能模式 / 无 GPU 保真既有行为）。
+      **Linux 例外**：Linux + 性能 + AMD/Intel 独显维持 ``cpu``（llama.cpp
+      ROCm/HIP 构建未纳入，登记为已闭合项外的平台差异）。
+    - ``local_llm.backend`` / ``embedding.backend``：``"cuda"``（N 卡路径）/
+      ``"vulkan"``（AMD/Intel 独显与核显路径）/ ``""``（CPU 路径），与 device
+      同步产出，仅 device=gpu 时非空。
+
+    非法 ``mode`` 归一 ``"performance"``；探测字段缺失 / 异常一律保守降级为
+    ``cpu``，绝不抛错。
+
+    :param hardware: 画像 dict（``recommend`` / ``has_igpu`` / ``dgpu_vendor`` /
+        ``gpu_vendor`` / ``vram_gb`` 等）。
+    :param mode: ``"performance"`` / ``"eco"``（非法归一 performance）。
+    :param platform: 平台标识（``sys.platform`` 同构串，如 ``"win32"`` /
+        ``"linux"``）；None 缺省取当前 ``sys.platform``。测试可注入以驱动
+        Linux ROCm 分支（Linux 真机未验证，代码路径 + 单测覆盖口径）。
+    :return: 落点 dict，键：``accel.mode`` / ``tts.accel`` / ``tts.accel_device`` /
+        ``asr.device`` / ``local_llm.device`` / ``local_llm.backend`` /
+        ``embedding.device`` / ``embedding.backend`` / ``reasons``（中文理由列表）。
+    """
+    hardware = hardware if isinstance(hardware, dict) else {}
+    normalized = normalize_mode(mode)
+    reasons: list[str] = []
+    sys_platform = sys.platform if platform is None else str(platform)
+    is_linux = sys_platform.startswith("linux")
+
+    recommend = _resolve_recommend(hardware)
+    has_igpu = bool(hardware.get("has_igpu"))
+    dgpu_vendor = _resolve_dgpu_vendor(hardware, recommend)
+    igpu_vendor = _resolve_igpu_vendor(hardware)
+
+    # ---- TTS（ORT）：AMD 核显优先（20261002 用户裁决：防独显被游戏占用）----
+    # 有 AMD 核显 → TTS 目标核显（跨模式一致）：Linux 走 ROCm（无 DML）；
+    # Windows 走 DML 并指向核显设备。清单缺失 / 非 AMD 核显 → 保守回退既有分支。
+    # Linux 例外（20261002 批 A）：Linux + 性能 + AMD 独显 → rocm（DirectML 为
+    # Windows 专有技术；ROCm EP 缺失时由 bridge 既有回退链兜底）
+    if igpu_vendor == "amd":
+        if is_linux:
+            tts_accel, tts_device = "rocm", ""
+            reasons.append("检测到 AMD 核显，TTS 优先走核显（ROCm 路径），独显留给游戏与显示")
+        else:
+            tts_accel, tts_device = "dml", "igpu"
+            reasons.append("检测到 AMD 核显，TTS 优先指向核显（DirectML），独显留给游戏与显示")
+    elif is_linux and normalized == "performance" and dgpu_vendor == "amd":
+        tts_accel, tts_device = "rocm", ""
+        reasons.append("性能模式：Linux 平台 AMD 独显，TTS 走 ROCm 路径（onnxruntime-rocm）")
+    elif normalized == "performance":
+        if has_igpu:
+            tts_accel, tts_device = "dml", "dgpu"
+            reasons.append("性能模式：检测到核显，统一装 DirectML 运行时并以独显设备建会话（双模式前提）")
+        elif dgpu_vendor == "nvidia":
+            tts_accel, tts_device = "cuda", ""
+            reasons.append("性能模式：无核显的 NVIDIA 独显，走 CUDA 满速路径")
+        elif dgpu_vendor in ("amd", "intel"):
+            tts_accel, tts_device = "dml", ""
+            reasons.append("性能模式：无核显的 AMD/Intel 独显，Windows 现实路径走 DirectML")
+        else:
+            tts_accel, tts_device = "cpu", ""
+            reasons.append("性能模式：未检测到可用 GPU，回退 CPU 推理")
+    else:
+        if has_igpu:
+            tts_accel, tts_device = "dml", "igpu"
+            reasons.append("节能模式：检测到核显，走 DirectML 并指向核显设备")
+        else:
+            tts_accel, tts_device = "cpu", ""
+            reasons.append("节能模式：无核显可用，回退 CPU 推理")
+
+    # ---- ASR（torch）：仅 N 卡有 GPU 路径；Linux + AMD 独显走 ROCm GPU ----
+    if is_linux and normalized == "performance" and dgpu_vendor == "amd":
+        asr_device = "gpu"
+        reasons.append("ASR：性能模式 Linux 平台 AMD 独显走 GPU（torch ROCm 路径）")
+    elif normalized == "performance" and dgpu_vendor == "nvidia":
+        asr_device = "gpu"
+        reasons.append("ASR：性能模式 NVIDIA 独显走 GPU（torch CUDA）")
+    else:
+        asr_device = "cpu"
+        reasons.append("ASR：按 CPU 推理（节能模式，或非 NVIDIA 后端无 GPU 路径）")
+
+    # ---- 本地 LLM / 嵌入（llama.cpp）：device 与 backend 同步决策 ----
+    # （20261002 批 A：N 卡 → cuda；AMD/Intel 独显或仅核显 → vulkan；Linux AMD
+    # 独显例外维持 cpu——llama.cpp ROCm/HIP 构建不纳入；其余保真既有行为）
+    if normalized == "performance" and _llm_gpu_available(hardware, recommend):
+        llm_device, llm_backend = "gpu", "cuda"
+        reasons.append("本地 LLM / 嵌入：性能模式 NVIDIA 显存满足阈值（≥4 GB），走 GPU（llama.cpp CUDA）")
+    elif normalized == "performance" and is_linux and dgpu_vendor in ("amd", "intel"):
+        llm_device, llm_backend = "cpu", ""
+        reasons.append(
+            "本地 LLM / 嵌入：Linux 平台 AMD/Intel 独显维持 CPU"
+            "（llama.cpp ROCm/HIP 构建未纳入，Vulkan 为替代路径）"
+        )
+    elif normalized == "performance" and (
+        dgpu_vendor in ("amd", "intel") or (not dgpu_vendor and has_igpu)
+    ):
+        llm_device, llm_backend = "gpu", "vulkan"
+        reasons.append(
+            "本地 LLM / 嵌入：性能模式 AMD/Intel 独显或核显，走 GPU"
+            "（llama.cpp Vulkan 路径；核显无显存数据不设显存门槛）"
+        )
+    else:
+        llm_device, llm_backend = "cpu", ""
+        reasons.append("本地 LLM / 嵌入：按 CPU 推理（节能模式、显存不足或无可用 GPU 后端）")
+
+    return {
+        "accel.mode": normalized,
+        "tts.accel": tts_accel,
+        "tts.accel_device": tts_device,
+        "asr.device": asr_device,
+        "local_llm.device": llm_device,
+        "local_llm.backend": llm_backend,
+        "embedding.device": llm_device,
+        "embedding.backend": llm_backend,
+        "reasons": reasons,
+    }
+
+
+def _build_config_patch(use_local, device, plan, embedding_gpu) -> dict:
+    """由 ``accel_plan`` 落点组装 ``recommend_for`` 的 config_patch。
+
+    ``local_llm`` / ``embedding`` 保留既有结构（``embedding`` 仅在走 GPU 时出现），
+    并追加 ``asr`` / ``tts``（``accel`` + ``accel_device``）/ ``accel``（``mode``）。
+    backend（20261002 批 A）仅在非空**且**对应组件实际走 GPU 时并入 patch——
+    走云 / 显存不足等 device=cpu 场景不带 backend，避免语义矛盾。
+    """
+    patch = {"local_llm": {"enabled": bool(use_local), "device": device}}
+    llm_backend = str(plan.get("local_llm.backend") or "")
+    if llm_backend and device == "gpu":
+        patch["local_llm"]["backend"] = llm_backend
+    if embedding_gpu:
+        embedding_patch = {"device": "gpu"}
+        emb_backend = str(plan.get("embedding.backend") or "")
+        if emb_backend:
+            embedding_patch["backend"] = emb_backend
+        patch["embedding"] = embedding_patch
+    patch["asr"] = {"device": plan["asr.device"]}
+    patch["tts"] = {"accel": plan["tts.accel"], "accel_device": plan["tts.accel_device"]}
+    patch["accel"] = {"mode": plan["accel.mode"]}
+    return patch
+
+
+def _accel_profile(plan, device, use_local) -> dict:
+    """组装加速剖面（模式默认 + 各组件落点 + 中文理由）。
+
+    走云（``use_local=False``）时本地 LLM / 嵌入落点强制 ``cpu``（与 config_patch 一致）。
+    """
+    llm_device = device if use_local else "cpu"
+    embedding_device = "gpu" if (use_local and device == "gpu") else "cpu"
+    return {
+        "mode": plan["accel.mode"],
+        "tts": {"accel": plan["tts.accel"], "accel_device": plan["tts.accel_device"]},
+        "asr": {"device": plan["asr.device"]},
+        "local_llm": {"device": llm_device},
+        "embedding": {"device": embedding_device},
+        "reasons": list(plan["reasons"]),
     }
 
 
@@ -344,7 +757,12 @@ def recommend_for(profile, disk_free_gb=None) -> dict:
     :param disk_free_gb: 磁盘可用空间（GB）覆盖值；None 时取
         ``profile["disk_free_gb"]``。
     :return: dict，字段：``use_local`` / ``device`` / ``tier`` /
-        ``config_patch`` / ``model`` / ``reasons`` / ``probe_notes``。
+        ``config_patch`` / ``model`` / ``reasons`` / ``probe_notes``；
+        增量字段 ``accel``（加速剖面：模式默认 + 各组件落点 + 中文理由）。
+
+    说明：``local_llm.device`` / ``embedding.device`` / ``asr.device`` 的取值
+    **委托** :func:`accel_plan` 产出（收敛单一真相源），本函数仅做内存 / 显存
+    档位与磁盘约束判定。
     """
     notes: list[str] = list(profile.get("probe_notes") or [])
     reasons: list[str] = []
@@ -355,6 +773,10 @@ def recommend_for(profile, disk_free_gb=None) -> dict:
     vram_gb = profile.get("vram_gb")
     free_gb = disk_free_gb if disk_free_gb is not None else profile.get("disk_free_gb")
 
+    # ---- 加速剖面（唯一真相源：accel_plan，模式默认按画像推导）----
+    mode = derive_default_mode(profile)
+    plan = accel_plan(profile, mode)
+
     # ---- 内存不可得：未知，走云保守处理 ----
     if ram_gb is None:
         note = "内存总量未知，无法评估本地推理可行性，建议先走云端"
@@ -362,8 +784,11 @@ def recommend_for(profile, disk_free_gb=None) -> dict:
         reasons.append(note)
         return _make_recommendation(
             use_local=False, device="cpu", tier="0.5B",
-            config_patch={"local_llm": {"enabled": False, "device": "cpu"}},
+            config_patch=_build_config_patch(
+                use_local=False, device="cpu", plan=plan, embedding_gpu=False,
+            ),
             reasons=reasons, notes=notes,
+            accel=_accel_profile(plan, device="cpu", use_local=False),
         )
 
     # ---- 内存不足：走云 ----
@@ -372,13 +797,17 @@ def recommend_for(profile, disk_free_gb=None) -> dict:
         reasons.append(reason)
         return _make_recommendation(
             use_local=False, device="cpu", tier="0.5B",
-            config_patch={"local_llm": {"enabled": False, "device": "cpu"}},
+            config_patch=_build_config_patch(
+                use_local=False, device="cpu", plan=plan, embedding_gpu=False,
+            ),
             reasons=reasons, notes=notes,
+            accel=_accel_profile(plan, device="cpu", use_local=False),
         )
 
     # ---- 内存充足：默认本机 cpu + 1.7B ----
     use_local = True
-    device = "cpu"
+    # device 委托 accel_plan（唯一真相源）：NVIDIA 显存 ≥4 GB → gpu，否则 cpu
+    device = plan["local_llm.device"]
     tier = "1.7B"
     reasons.append("内存满足本地推理阈值（≥ 8 GB），推荐本机运行本地小 LLM")
 
@@ -393,7 +822,6 @@ def recommend_for(profile, disk_free_gb=None) -> dict:
         else:
             tier = "1.7B"  # 显存 < 4：维持 cpu + 1.7B，不上 GPU
         if vram_gb >= 4:
-            device = "gpu"
             # 内存上限约束：ram < 16 时档位最高不超过 4B
             if ram_gb < 16 and tier == "8B":
                 tier = "4B"
@@ -446,16 +874,19 @@ def recommend_for(profile, disk_free_gb=None) -> dict:
         notes.append(note)
         reasons.append(note)
 
+    # 磁盘不足时 use_local 可能被翻转为 False → 本地 LLM / 嵌入落点回到 cpu
     if not use_local:
-        config_patch = {"local_llm": {"enabled": False, "device": device}}
-    else:
-        config_patch = {"local_llm": {"enabled": True, "device": device}}
-        if device == "gpu":
-            config_patch["embedding"] = {"device": "gpu"}
+        device = "cpu"
+
+    embedding_gpu = use_local and device == "gpu"
+    config_patch = _build_config_patch(
+        use_local=use_local, device=device, plan=plan, embedding_gpu=embedding_gpu,
+    )
 
     return _make_recommendation(
         use_local=use_local, device=device, tier=tier,
         config_patch=config_patch, reasons=reasons, notes=notes,
+        accel=_accel_profile(plan, device=device, use_local=use_local),
     )
 
 
@@ -482,8 +913,11 @@ def _tier_size_gb(tier: str) -> float | None:
     return size if size and size > 0 else None
 
 
-def _make_recommendation(use_local, device, tier, config_patch, reasons, notes) -> dict:
-    """组装推荐结果 dict 并填充 model 字段（延迟取档、失败降级）。"""
+def _make_recommendation(use_local, device, tier, config_patch, reasons, notes, accel=None) -> dict:
+    """组装推荐结果 dict 并填充 model 字段（延迟取档、失败降级）。
+
+    :param accel: 加速剖面（:func:`_accel_profile` 产出）；缺省为空 dict 兜底。
+    """
     model = None
     if use_local:
         model = _resolve_model(tier)
@@ -499,6 +933,7 @@ def _make_recommendation(use_local, device, tier, config_patch, reasons, notes) 
         "model": model,
         "reasons": reasons,
         "probe_notes": notes,
+        "accel": accel if accel is not None else {},
     }
 
 

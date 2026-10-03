@@ -496,7 +496,8 @@ def test_provision_runtime_order_log_and_report(tmp_path, monkeypatch):
 
     result = conda_runtime.provision_runtime(root)
 
-    assert order == ["conda", "env", "deps", "nltk", "warmup:cuda"]
+    # 预热设备固定 CPU（20261001 全组件加速 spec：隔离 melo torch-GPU 风险路径）
+    assert order == ["conda", "env", "deps", "nltk", "warmup:cpu"]
     assert result["recommend"] == "cuda"
     # 日志与报告落盘
     log_path = os.path.join(root, "runtime", "provision.log")

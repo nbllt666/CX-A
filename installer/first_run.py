@@ -31,7 +31,13 @@ import os
 from lite.cloud.adapter import PROVIDER_BASE_URLS
 from lite.config.config_manager import ConfigManager
 from lite.config.download_sources import model_repo_for_channel, normalize_channel
-from lite.runtime.hardware_profile import detect_profile, recommend_for
+from lite.runtime.hardware_profile import (
+    accel_plan,
+    derive_default_mode,
+    detect_profile,
+    normalize_mode,
+    recommend_for,
+)
 from lite.runtime.model_downloader import LlmDownloader
 
 from .bootstrap import PROJECT_ROOT
@@ -41,6 +47,32 @@ DEFAULT_PROVIDERS = tuple(PROVIDER_BASE_URLS.keys())
 
 #: 下载线路候选展示文案（国内魔塔 / 海外 HuggingFace）。
 _CHANNEL_OPTIONS = "国内（魔塔，推荐）/ 海外（HuggingFace）"
+
+#: 运行偏好询问文案（口语化，零术语；不出现 EP / ORT / DirectML 等词）。
+_ACCEL_MODE_OPTIONS = "省电优先 / 性能优先"
+
+
+def _accel_mode_label(mode):
+    """把模式取值转成口语化标签（performance → 性能优先；eco → 省电优先）。"""
+    return "性能优先" if normalize_mode(mode) == "performance" else "省电优先"
+
+
+def _format_accel_summary(plan):
+    """把 ``accel_plan`` 落点转成口语化、零术语的一句加速结论。
+
+    禁止出现 EP / ORT / DirectML / CUDA / DML / ROCm / GPU / CPU 等术语。
+    """
+    tts_accel = plan.get("tts.accel")
+    device = plan.get("tts.accel_device")
+    if tts_accel == "cuda":
+        return "检测到 NVIDIA 独立显卡，已为语音合成开启显卡加速"
+    if tts_accel == "dml" and device == "dgpu":
+        return "检测到独立显卡，已为语音合成开启显卡加速"
+    if tts_accel == "dml" and device == "igpu":
+        return "检测到核显，已为语音合成开启省电加速"
+    if tts_accel == "dml":
+        return "检测到可用显卡，已为语音合成开启显卡加速"
+    return "没有可用的独立显卡，语音合成先用电脑本身运行（更稳更省电）"
 
 
 def _format_profile(profile):
@@ -88,6 +120,10 @@ class FirstRunDriver:
         self._downloader = downloader
         #: 硬件体检推荐结果（step_hardware_recommend 填充；探测降级时为 None）。
         self.recommendation = None
+        #: 硬件画像（step_hardware_recommend 填充；探测降级时为 None）——供模式询问复用。
+        self.profile = None
+        #: 加速方案落点（step_choose_accel_mode 填充；未询问时为 None）。
+        self.accel_plan_result = None
 
     # ------------------------------------------------------------------ #
     # 输入辅助                                                           #
@@ -182,6 +218,7 @@ class FirstRunDriver:
             return None
 
         self.recommendation = recommendation
+        self.profile = profile
         self._output(f"[引导] 硬件体检结果：{_format_profile(profile)}")
         if recommendation.get("use_local"):
             model = recommendation.get("model") or {}
@@ -195,7 +232,57 @@ class FirstRunDriver:
             self._output("[引导] 推荐档位与体积：暂不下载本地小 LLM，先走云端（可稍后自行下载）")
         for reason in recommendation.get("reasons") or []:
             self._output(f"[引导] 推荐理由：{reason}")
+        # 运行偏好询问（省电优先 / 性能优先，默认按画像推导）——本步骤内完成
+        try:
+            self.step_choose_accel_mode(profile)
+        except Exception as exc:  # noqa: BLE001 - 模式询问失败不阻断向导
+            self._output(
+                f"[引导] 运行偏好设置失败（{type(exc).__name__}: {exc}），"
+                "已跳过，不影响后续步骤"
+            )
         return recommendation
+
+    def step_choose_accel_mode(self, profile=None):
+        """询问运行偏好（省电优先 / 性能优先），默认按画像推导并落盘全部落点。
+
+        选择结果经唯一真相源 :func:`lite.runtime.hardware_profile.accel_plan`
+        展开为各组件落点（``accel.mode`` / ``tts.accel`` / ``tts.accel_device`` /
+        ``asr.device`` / ``local_llm.device`` / ``embedding.device``）并写入配置，
+        与前端 ``/api/settings`` 共用同一键（无第二套真相）。
+
+        :param profile: 硬件画像（缺省用 ``self.profile``）；缺失时保守按空画像推导。
+        :return: 归一后的模式字符串（``"performance"`` / ``"eco"``）。
+        """
+        hardware = profile if isinstance(profile, dict) else (self.profile or {})
+        default_mode = derive_default_mode(hardware)
+        default_label = _accel_mode_label(default_mode)
+        raw = self._ask(
+            f"[引导] 平时更看重哪一点？{_ACCEL_MODE_OPTIONS}（默认{default_label}）> ",
+            default_mode,
+        )
+        mode = self._parse_accel_mode(raw, default_mode)
+        plan = accel_plan(hardware, mode)
+        # 落盘：模式 + accel_plan 全部组件落点（单一真相源，禁止在本处另写判断）
+        self.cm.set("accel", "mode", plan["accel.mode"])
+        self.cm.set("tts", "accel", plan["tts.accel"])
+        self.cm.set("tts", "accel_device", plan["tts.accel_device"])
+        self.cm.set("asr", "device", plan["asr.device"])
+        self.cm.set("local_llm", "device", plan["local_llm.device"])
+        self.cm.set("embedding", "device", plan["embedding.device"])
+        self.accel_plan_result = plan
+        self._output(f"[引导] 已选择：{_accel_mode_label(plan['accel.mode'])}")
+        self._output(f"[引导] 加速方案：{_format_accel_summary(plan)}")
+        return plan["accel.mode"]
+
+    @staticmethod
+    def _parse_accel_mode(raw, default_mode):
+        """解析用户输入为模式取值；无法识别时回落默认（非法输入不报错）。"""
+        text = str(raw or "").strip().lower()
+        if text in ("performance", "性能", "性能优先", "2", "gpu", "独显"):
+            return "performance"
+        if text in ("eco", "省电", "省电优先", "节能", "1", "cpu", "核显"):
+            return "eco"
+        return normalize_mode(default_mode)
 
     # ------------------------------------------------------------------ #
     # 步骤5：下载线路选择（唯一用户选择，兼管模型来源）                  #
@@ -307,6 +394,7 @@ class FirstRunDriver:
             f"云端提供商: {self.cm.get('cloud', 'provider')}",
             f"API Key: {'已填写（加密存储）' if api_key else '未填写（可在设置页补填）'}",
             f"TTS 引擎/音色: {self.cm.get('tts', 'engine')} / {self.cm.get('tts', 'voice', 'cx-open')}",
+            f"运行偏好: {_accel_mode_label(self.cm.get('accel', 'mode', 'performance'))}",
             f"嵌入模型: {self.cm.get('embedding', 'model')}",
             f"向量库: {self.cm.get('vector', 'backend')}",
             f"下载线路: {route_label}（{channel}），模型来源: {self.cm.get('local_llm', 'source')}",
@@ -344,6 +432,7 @@ class FirstRunDriver:
             "download_channel": download_channel,
             "model_repo": self.cm.get("local_llm", "source"),
             "setup_completed": self.cm.get("setup", "completed"),
+            "accel_mode": self.cm.get("accel", "mode", "performance"),
         }
 
 

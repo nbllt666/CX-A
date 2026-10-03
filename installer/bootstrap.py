@@ -292,11 +292,108 @@ def init_workplace(root):
 # ------------------------------------------------------------------ #
 
 
-def build_gpu_dependency_commands(recommend, cuda_version=None, channel=None):
-    """按 GPU 检测结论装配加速依赖命令清单。
+#: ORT（onnxruntime）变体包名——四者同一 import 名 ``onnxruntime``，同一 Runtime
+#: 只能装一个变体（互斥）；分叉装配的唯一真相源见 :func:`resolve_ort_package`。
+ORT_PACKAGE_CPU = "onnxruntime"
+ORT_PACKAGE_GPU = "onnxruntime-gpu"
+ORT_PACKAGE_DIRECTML = "onnxruntime-directml"
+#: Linux ROCm 变体（20261002 批 A：``platform`` 为 Linux 且画像指向 AMD/ROCm
+#: 时产出；Windows 行为不受影响——ROCm EP 缺失时由 bridge 既有回退链兜底）。
+ORT_PACKAGE_ROCM = "onnxruntime-rocm"
+
+
+def resolve_ort_package(profile, platform=None):
+    """按加速画像决定 ORT 变体包名（唯一分叉口径）。
+
+    映射（spec「安装链」/ 裁决①，Windows 现实路径）：
+
+    - 有核显（任意独显组合）→ ``onnxruntime-directml``（双模式前提）；
+    - 无核显 NVIDIA（``recommend=cuda``）→ ``onnxruntime-gpu``；
+    - 无核显 AMD（Windows，``recommend=rocm``）→ ``onnxruntime-directml``；
+    - 无可用 GPU（``recommend=cpu``）→ ``onnxruntime``（CPU 兜底）。
+
+    **Linux 例外**（20261002 批 A）：``platform`` 以 ``"linux"`` 开头且画像指向
+    AMD / ROCm（``recommend=rocm`` 或 ``gpu_vendor`` / ``dgpu_vendor`` 为
+    ``amd``）→ ``onnxruntime-rocm``（DirectML 为 Windows 专有技术，Linux 无
+    DML 路径）。Linux 真机未验证，代码路径 + 单测覆盖口径。
+
+    :param profile: 画像 dict（``has_igpu`` / ``recommend`` / ``gpu_vendor`` /
+        ``dgpu_vendor``）；非法 / 缺失一律按无 GPU 保守回退 CPU 版。
+    :param platform: 平台标识（``sys.platform`` 同构串）；None 缺省取当前
+        ``sys.platform``（Windows 构建链不受影响，历史行为逐字不变）。
+    :return: 变体包名字符串。
+    """
+    profile = profile if isinstance(profile, dict) else {}
+    sys_platform = sys.platform if platform is None else str(platform)
+    is_linux = sys_platform.startswith("linux")
+    recommend = str(profile.get("recommend") or "")
+    vendor = str(profile.get("gpu_vendor") or "")
+    dgpu_vendor = profile.get("dgpu_vendor")
+    has_amd_igpu = any(
+        isinstance(g, dict)
+        and g.get("type") == "igpu"
+        and str(g.get("vendor") or "").strip().lower() == "amd"
+        for g in (profile.get("gpus") or [])
+    )
+    if is_linux and (
+        recommend == "rocm"
+        or dgpu_vendor == "amd"
+        or vendor == "amd"
+        or has_amd_igpu
+    ):
+        return ORT_PACKAGE_ROCM
+    if bool(profile.get("has_igpu")):
+        return ORT_PACKAGE_DIRECTML
+    if recommend == "cuda" or dgpu_vendor == "nvidia" or vendor == "nvidia":
+        return ORT_PACKAGE_GPU
+    if recommend == "rocm" or dgpu_vendor in ("amd", "intel") or vendor == "amd":
+        return ORT_PACKAGE_DIRECTML
+    return ORT_PACKAGE_CPU
+
+
+def build_ort_package_command(profile, channel=None, platform=None):
+    """按画像装配 ORT 变体安装命令（与 torch 链解耦的单一分叉入口）。
+
+    :param profile: 画像 dict（见 :func:`resolve_ort_package`）。
+    :param channel: 统一下载源通道；``"mirror"`` 时对普通 pip 包追加国内索引
+        （``None`` / ``"official"`` 与历史逐字相同，不追加）。
+    :param platform: 平台标识透传 :func:`resolve_ort_package`（None 缺省当前平台）。
+    :return: 形如 ``pip install onnxruntime-directml`` 的命令字符串。
+    """
+    command = f"pip install {resolve_ort_package(profile, platform=platform)}"
+    index_url = pip_index_url(channel) if channel is not None else None
+    if index_url:
+        command = _append_pip_index(command, index_url)
+    return command
+
+
+def _ort_profile_for(recommend, has_igpu=None, profile=None):
+    """组装 ORT 分叉所需的最小画像；未提供画像信息时返回 None（不装配 ORT）。
+
+    未传 ``profile`` / ``has_igpu`` 时保持最简旧语义（仅 torch 链，不捆绑 ORT），
+    保证既有调用方（``channel=None`` 逐字不变）与下游装配不被破坏。
+    """
+    if isinstance(profile, dict):
+        merged = dict(profile)
+        merged.setdefault("recommend", recommend)
+        return merged
+    if has_igpu is not None:
+        return {"recommend": recommend, "has_igpu": bool(has_igpu)}
+    return None
+
+
+def build_gpu_dependency_commands(recommend, cuda_version=None, channel=None,
+                                  has_igpu=None, profile=None, platform=None):
+    """按 GPU 检测结论装配加速依赖命令清单（torch 链 + ORT 分叉）。
 
     清单条目均为可直接执行的命令字符串；以 ``# `` 开头的条目为说明性注释
     （引导用户手动完成 llama.cpp 特殊构建等步骤），自动安装时会被跳过。
+
+    **解耦（防分叉失效）**：ORT 包（``onnxruntime*``）不再随 cuda / rocm / cpu
+    分支捆绑——三分支只保留 torch / torchaudio / llama-cpp 链；ORT 变体改由画像经
+    :func:`resolve_ort_package` 统一装配（同一 import 名互斥，避免 DML / CPU 机器被
+    同 import 名的 ``onnxruntime-gpu`` 覆盖）。未提供 ``profile`` / ``has_igpu`` 时
+    只输出 torch 链（保持最简旧语义）。
 
     Task 9（统一下载源）：``channel`` 为 ``"mirror"`` 时，仅对**普通 pip 包**
     （``onnxruntime`` / ``onnxruntime-gpu`` / ``onnxruntime-directml``）在命令末尾
@@ -304,12 +401,14 @@ def build_gpu_dependency_commands(recommend, cuda_version=None, channel=None):
     ``lite.config.download_sources.pip_index_url`` 派生，禁止硬编码）；
     ``torch``（pytorch 官方轮子源）与 ``llama-cpp-python``（abetlen 专用源）
     命令一字不改——镜像站不代理这两类 whl。``channel=None``（未指定）与
-    ``"official"`` 输出与历史版本逐字相同（不追加任何镜像参数）。
+    ``"official"`` 输出不含任何镜像参数。
 
     :param recommend: 检测结论 ``"cuda" | "rocm" | "cpu"``。
     :param cuda_version: 驱动报告的 CUDA 版本（如 "12.4"），仅用于注释说明。
     :param channel: 统一下载源通道（``"mirror"`` / ``"official"``）；
         ``None`` 表示未指定，保持既有输出不变。
+    :param has_igpu: 是否含核显（``None`` 表示未提供画像，不装配 ORT）。
+    :param profile: 硬件画像 dict（优先于 ``has_igpu``）。
     :return: list[str] 命令清单。
     """
     if recommend == "cuda":
@@ -322,24 +421,45 @@ def build_gpu_dependency_commands(recommend, cuda_version=None, channel=None):
             # torchaudio 与 torch 同版本族、同源（MeloTTS / funasr 的硬依赖；
             # 2026-09-25 实装发现：缺它则 sidecar 内 melo.api 导入即失败）
             "pip install torchaudio --index-url https://download.pytorch.org/whl/cu128",
-            "pip install onnxruntime-gpu",
             "pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu128 --force-reinstall --no-cache-dir",
         ]
     elif recommend == "rocm":
-        commands = [
-            "# PyTorch ROCm 官方轮子（Linux）；Windows 平台 AMD 建议改用 DirectML 后端",
-            "pip install torch --index-url https://download.pytorch.org/whl/rocm6.0",
-            "pip install torchaudio --index-url https://download.pytorch.org/whl/rocm6.0",
-            "# Windows + AMD：onnxruntime 采用 DirectML 版本（替代 onnxruntime-gpu）",
-            "pip install onnxruntime-directml",
-            "# llama.cpp 建议使用 Vulkan 预编译构建（llama-*-bin-win-vulkan-x64.zip），解压至 data/local_llm/ 供本地推理调用",
-        ]
+        sys_platform = sys.platform if platform is None else str(platform)
+        if sys_platform.startswith("linux"):
+            commands = [
+                "# PyTorch ROCm 官方轮子（仅 Linux 有 ROCm 轮子）",
+                "pip install torch --index-url https://download.pytorch.org/whl/rocm6.0",
+                "pip install torchaudio --index-url https://download.pytorch.org/whl/rocm6.0",
+            ]
+        else:
+            # Windows 无 PyTorch ROCm 轮子（ROCm 构建仅面向 Linux）：AMD 机器
+            # torch 侧回退 CPU 轮子（语音识别 CPU；TTS 加速走 DirectML，由
+            # ORT 画像分叉装配；llama.cpp 走 Vulkan 构建），避免必失败的
+            # rocm6.0 安装命令阻断安装链（20261002 用户问询发现）
+            commands = [
+                "# Windows 平台无 PyTorch ROCm 轮子：torch 侧回退 CPU"
+                "（TTS 加速走 DirectML / llama.cpp 走 Vulkan，见 ORT 分叉与注释）",
+                "pip install torch --index-url https://download.pytorch.org/whl/cpu",
+                "pip install torchaudio --index-url https://download.pytorch.org/whl/cpu",
+            ]
     else:
         commands = [
             "pip install torch --index-url https://download.pytorch.org/whl/cpu",
             "pip install torchaudio --index-url https://download.pytorch.org/whl/cpu",
-            "pip install onnxruntime",
         ]
+
+    # ORT 分叉（与 torch 链解耦）：画像齐备时统一装配唯一变体（互斥）
+    ort_profile = _ort_profile_for(recommend, has_igpu=has_igpu, profile=profile)
+    if ort_profile is not None:
+        commands.append(build_ort_package_command(ort_profile))
+
+    # 说明性注释（llama.cpp 特殊构建等；自动安装跳过）
+    if recommend == "rocm":
+        commands.append(
+            "# llama.cpp 建议使用 Vulkan 预编译构建（llama-*-bin-win-vulkan-x64.zip），"
+            "解压至 data/local_llm/ 供本地推理调用"
+        )
+
     # channel 未指定（None）时不做任何改写；official 经 pip_index_url 派生为 None，
     # 同样不追加——两种情形输出与历史版本逐字相同。
     index_url = pip_index_url(channel) if channel is not None else None
@@ -350,7 +470,10 @@ def build_gpu_dependency_commands(recommend, cuda_version=None, channel=None):
 
 #: 镜像通道下追加 ``-i <国内索引>`` 的目标包（普通 pip 包）。torch 走 pytorch 官方
 #: 轮子源、llama-cpp-python 走 abetlen 专用源，镜像站不代理其 whl，故不在此列。
-_MIRROR_ELIGIBLE_PACKAGES = ("onnxruntime", "onnxruntime-gpu", "onnxruntime-directml")
+#: （20261002 批 A：追加 ``onnxruntime-rocm``——Linux ROCm 变体同为普通 pip 包。）
+_MIRROR_ELIGIBLE_PACKAGES = (
+    "onnxruntime", "onnxruntime-gpu", "onnxruntime-directml", "onnxruntime-rocm",
+)
 
 
 def _append_pip_index(command, index_url):
@@ -393,11 +516,36 @@ def _default_install_runner(cmd):
         return -1, f"{type(exc).__name__}: {exc}"
 
 
-def install_gpu_dependencies(report_path=None, auto_install=False, runner=None, channel=None):
+def _build_accel_profile(report, detector, runner=None):
+    """组装用于 ORT 分叉的最小画像 dict。
+
+    核显枚举仅在 ``runner is None``（生产默认链）时执行——注入 runner（测试替身 /
+    自定义执行器）时不做真实硬件探测，避免污染注入通道；枚举失败降级「无核显」。
+    """
+    has_igpu, dgpu_vendor = False, None
+    if runner is None:
+        try:
+            summary = detector.detect_inventory(runner=runner)
+            has_igpu = bool(summary.get("has_igpu"))
+            dgpu_vendor = summary.get("dgpu_vendor")
+        except Exception as exc:  # noqa: BLE001 - 枚举失败按无核显保守继续
+            _log_warn(f"GPU 清单枚举失败（按无核显继续 ORT 分叉）：{type(exc).__name__}: {exc}")
+    return {
+        "recommend": report.get("recommend"),
+        "gpu_vendor": report.get("gpu_vendor"),
+        "cuda_version": report.get("cuda_version"),
+        "has_igpu": has_igpu,
+        "dgpu_vendor": dgpu_vendor,
+    }
+
+
+def install_gpu_dependencies(report_path=None, auto_install=False, runner=None,
+                            channel=None, profile=None):
     """GPU 加速依赖检测与引导式安装（失败不阻断主安装）。
 
-    流程：GpuDetector 检测 → :func:`build_gpu_dependency_commands` 装配清单 →
-    写报告 → 依 ``auto_install`` 决定仅打印引导命令或逐条真实执行。
+    流程：GpuDetector 检测 →（核显枚举）→ :func:`build_gpu_dependency_commands`
+    装配「torch 链 + ORT 分叉」清单 → 写报告 → 依 ``auto_install`` 决定仅打印
+    引导命令或逐条真实执行。
 
     :param report_path: 检测报告落盘绝对路径；缺省 ``<项目根>/data/install_report.json``。
     :param auto_install: False（默认）仅报告 + 打印待执行命令（引导式）；
@@ -405,22 +553,30 @@ def install_gpu_dependencies(report_path=None, auto_install=False, runner=None, 
     :param runner: 命令执行器注入（检测与自动安装共用；测试 mock 入口）。
     :param channel: 统一下载源通道（Task 9）；透传给命令装配。``None``（默认）
         保持既有行为——不读配置、不追加镜像索引，输出与历史版本逐字相同。
-    :return: 报告 dict，字段：gpu_vendor / cuda_version / recommend /
-        pending_commands / installed / timestamp（自动安装时附 errors 列表）。
+    :param profile: 显式画像 dict（覆盖内核显枚举结果）；``None`` 时由检测报告与
+        核显枚举组装。
+    :return: 报告 dict，字段：gpu_vendor / cuda_version / recommend / has_igpu /
+        ort_package / pending_commands / installed / timestamp（自动安装时附 errors）。
     """
     # 1. 检测（runner 注入点贯穿检测与安装）
     detector = GpuDetector(runner=runner)
     report = detector.detect()
     _log_info(f"GPU 检测完成：{report['gpu_vendor']} → 推荐 {report['recommend']}（{report['details']}）")
 
-    # 2. 依检测结论装配依赖清单（channel=None 时输出与既有版本逐字相同）
+    # 1b. 画像增量（核显识别）：供 ORT 包分叉
+    if not isinstance(profile, dict):
+        profile = _build_accel_profile(report, detector, runner=runner)
+
+    # 2. 依检测结论 + 画像装配依赖清单（torch 链 + ORT 分叉）
     commands = build_gpu_dependency_commands(
-        report["recommend"], report.get("cuda_version"), channel=channel
+        report["recommend"], report.get("cuda_version"), channel=channel, profile=profile
     )
     result = {
         "gpu_vendor": report["gpu_vendor"],
         "cuda_version": report.get("cuda_version"),
         "recommend": report["recommend"],
+        "has_igpu": bool(profile.get("has_igpu")),
+        "ort_package": resolve_ort_package(profile),
         "pending_commands": list(commands),
         "installed": False,
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
