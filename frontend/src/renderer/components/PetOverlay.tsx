@@ -584,13 +584,16 @@ export default function PetOverlay() {
             const angle = -Math.PI + progress * Math.PI; // 上半弧：左 → 上 → 右
             const vw = window.innerWidth;
             const vh = window.innerHeight;
-            const scale = Math.max(Math.min(vw / 314, vh / 366), 0.6, Math.min(vw / 314, vh / 366, 1.6));
-            const btn = Math.round(44 * scale);
+            // 控件固定尺寸（20261006 用户反馈）：按钮/字号/滑块胶囊不随窗口缩放——
+            // 缩放只作用于角色画布；弧形半径按窗口等比缩放（环绕距离随画布同步）。
+            const btn = 44;
             const half = btn / 2;
             const cx = vw / 2;
             const cy = vh * 0.44; // 弧心锚定桌宠上半身
-            const rx = Math.max((cx - half - 8) * 0.92, 40);
-            const ry = Math.max(cy - half - 8, 40);
+            // 弧半径按窗口（画布）等比缩放（系数由 314×366 基准窗反推：rx≈0.37vw、ry≈0.30vh），
+            // 与画布同步放大缩小；下限 40 只兜底极小窗口防裁切。
+            const rx = Math.max(vw * 0.37, 40);
+            const ry = Math.max(vh * 0.3, 40);
             const x = cx + Math.cos(angle) * rx;
             const y = cy + Math.sin(angle) * ry;
             return (
@@ -611,7 +614,7 @@ export default function PetOverlay() {
                 onClick={item.onSelect}
               >
                 {item.icon ?? (
-                  <span className="pet-overlay-menu-char" style={{ fontSize: Math.round(15 * scale) }}>
+                  <span className="pet-overlay-menu-char" style={{ fontSize: 15 }}>
                     {item.labelText}
                   </span>
                 )}
@@ -619,8 +622,8 @@ export default function PetOverlay() {
                   // 滑块胶囊挂在圆钮正下方。注意：按钮自身是 absolute 定位上下文，
                   // left/top 必须用**相对按钮**的坐标——水平约束先按窗口系 clamp
                   // （保证胶囊完整可见）再换算回按钮系；垂直固定挂按钮正下方 6px
-                  // （左挂会压住弧上相邻按钮）。
-                  const pillW = Math.round(176 * scale);
+                  // （左挂会压住弧上相邻按钮）。胶囊固定 176px（同按钮不缩放口径）。
+                  const pillW = 176;
                   const pillLeftWin = Math.max(6, Math.min(x - pillW / 2, vw - pillW - 6));
                   const pillLeft = pillLeftWin - (x - half);
                   const pillTop = btn + 6;

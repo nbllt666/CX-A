@@ -996,9 +996,9 @@ export interface AgentInfo {
   enabled: boolean;
 }
 
-/** 拉取角色（Agent）列表（GET /api/agents）。 */
+/** 拉取角色（Agent）列表（GET /api/agents）。API_BASE 已含 /api 前缀，勿重复拼接。 */
 export async function listAgents(): Promise<AgentInfo[]> {
-  return requestJson<AgentInfo[]>(`${API_BASE}/api/agents`);
+  return requestJson<AgentInfo[]>(`${API_BASE}/agents`);
 }
 
 /**
@@ -1009,7 +1009,7 @@ export async function updateAgent(
   id: string,
   patch: { persona?: string; name?: string; voice?: string | null; enabled?: boolean },
 ): Promise<AgentInfo> {
-  return requestJson<AgentInfo>(`${API_BASE}/api/agents/${encodeURIComponent(id)}`, {
+  return requestJson<AgentInfo>(`${API_BASE}/agents/${encodeURIComponent(id)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),

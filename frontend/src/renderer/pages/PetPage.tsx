@@ -19,9 +19,10 @@ import { usePetEnabled } from '../hooks/usePetEnabled';
  */
 export default function PetPage() {
   const { enabled, setEnabled } = usePetEnabled();
-  // 默认「平静」：与悬浮窗一致，睁眼常态作为首眼观感
-  const [mood, setMood] = useState<PetMood>('calm');
-  const [talking, setTalking] = useState(false);
+  // 心情/口型由 AI 对话的情绪标签驱动（petMood 总线），页面不提供手动演示按钮；
+  // 页内预览固定展示平静态常态。
+  const mood: PetMood = 'calm';
+  const talking = false;
   // 模型代际（petModelReload 总线）：挂载时对齐当前 tick（本窗口在设置页导入后
   // 首次进本页也能拿到新模型）；跨窗口导入经 storage 事件跟进。
   const [modelTick, setModelTick] = useState<number>(() => readPetModelReloadTick());
@@ -45,26 +46,6 @@ export default function PetPage() {
           /* ---------- 开启态：页内渲染 VRM 桌宠（失败给中文提示，不回落卡通） ---------- */
           <div className="animate-bubble-in flex w-full flex-col items-center gap-6">
             <VrmAvatar mood={mood} talking={talking} size={330} reloadKey={modelTick} />
-
-            {/* 口型 / 表情演示控制（占位交互） */}
-            <div className="flex flex-wrap items-center justify-center gap-3">
-              <div className="flex items-center gap-1.5">
-                <span className="mr-0.5 text-xs text-[var(--text-tertiary)]">表情</span>
-                <MoodButton active={mood === 'happy'} onClick={() => setMood('happy')}>
-                  开心
-                </MoodButton>
-                <MoodButton active={mood === 'calm'} onClick={() => setMood('calm')}>
-                  平静
-                </MoodButton>
-              </div>
-              <button
-                type="button"
-                onClick={() => setTalking((v) => !v)}
-                className="h-8 rounded-full border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-3 text-xs font-medium text-[var(--text-secondary)] shadow-sm transition hover:text-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-              >
-                {talking ? '安静一下' : '说句话试试'}
-              </button>
-            </div>
 
             {/* 桌宠说明（用户口径：不出现技术栈与实现细节） */}
             <GlassCard className="w-full max-w-md">
@@ -112,31 +93,5 @@ export default function PetPage() {
         </GlassCard>
       </div>
     </div>
-  );
-}
-
-/** 表情切换小按钮 */
-function MoodButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={[
-        'h-8 rounded-full px-3 text-xs font-medium transition focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]',
-        active
-          ? 'bg-gradient-to-r from-[var(--color-secondary)] to-[var(--color-primary)] text-white shadow-sm'
-          : 'border border-[var(--glass-border)] bg-[var(--bg-secondary)] text-[var(--text-secondary)] hover:text-[var(--color-primary)]',
-      ].join(' ')}
-    >
-      {children}
-    </button>
   );
 }
