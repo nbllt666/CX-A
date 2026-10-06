@@ -30,6 +30,10 @@ import type {
  *   ④ 可选下载（进度 / 取消 / 失败重试 / 以后再说）
  *   ⑤ 完成（提交选择；失败不把用户卡死，可先进去用）
  *
+ * 手动路径直达（Task 6）：「我自己挑」在第一步把本地开关 / 显卡 / 档位选完后，
+ * 提供「完成并保存」跳过②③④直达⑤确认页，未选项落既有默认值；
+ * 「就用推荐的」与「我想用云端大脑」路径不受影响。
+ *
  * 文案原则：口语化、不出现技术术语；视觉沿用既有玻璃质感（GlassCard / Toggle / tokens）。
  */
 
@@ -330,6 +334,17 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
     }
   };
 
+  /**
+   * 手动路径直达完成：本地配置（本地开关 / 显卡 / 档位）选完即可跳过云端 / 线路 /
+   * 下载三步，直达确认页一键提交。未选项按既有默认值补全（线路默认国内、
+   * 模型仓库由线路在服务端派生）；本次提交不含云端（钥匙可在设置里补），
+   * 与「跳过，先用本地」同口径。
+   */
+  const finishManual = () => {
+    setCloudSkipped(true);
+    setStep(4);
+  };
+
   const pct = progress ? progressPercent(progress) : 0;
 
   return (
@@ -338,7 +353,7 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
         <div className="mb-4 flex flex-col gap-2">
           <div className="flex items-center gap-2.5">
             <BrandMark size={34} />
-            <span className="text-sm font-medium text-[var(--text-secondary)]">CX-A 赛博伴侣</span>
+            <span className="text-sm font-medium text-[var(--text-secondary)]">CX-A</span>
           </div>
           <h1 className="text-xl font-bold text-gradient">欢迎来到 CX-A</h1>
           <p className="text-sm text-[var(--text-secondary)]">
@@ -525,10 +540,24 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
                           </div>
                         )}
 
-                        <div>
-                          <button type="button" className={PRIMARY_BTN} onClick={goNext}>
-                            下一步
-                          </button>
+                        <div className="flex flex-wrap gap-2">
+                          {tier !== '' ? (
+                            /* 手动配置三项（本地开关 / 显卡 / 档位）均有值 → 可直达完成；
+                               「下一步」保留给想配云端大脑的用户 */
+                            <>
+                              <button type="button" className={PRIMARY_BTN} onClick={finishManual}>
+                                完成并保存
+                              </button>
+                              <button type="button" className={GHOST_BTN} onClick={goNext}>
+                                下一步
+                              </button>
+                            </>
+                          ) : (
+                            /* 档位尚未就绪（体检未回 / 无候选）：维持原「下一步」主路径 */
+                            <button type="button" className={PRIMARY_BTN} onClick={goNext}>
+                              下一步
+                            </button>
+                          )}
                         </div>
                       </div>
                     )}
@@ -629,7 +658,14 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
                   desc="不下载也能用，只是聊的时候都得连云端"
                 />
 
-                {tiers.length > 0 ? (
+                {applyRecommended ? (
+                  // 已采纳推荐：档位已按推荐预设，不再让用户重复挑
+                  <p className="text-sm text-[var(--text-secondary)]">
+                    就用推荐的那款
+                    {recommendedSize != null ? ` · 约 ${formatTierGb(recommendedSize)}GB` : ''}
+                    ，不用再挑啦
+                  </p>
+                ) : tiers.length > 0 ? (
                   <div className="flex flex-col gap-2">
                     {tiers.map((t) => (
                       <button

@@ -556,6 +556,7 @@ def test_inprocess_prompts_carry_no_think_suffix(llm_model, fake_llama_cpp):
 # ------------------------------------------------------------------ #
 
 from lite.runtime.llama_runtime import CHAT_DEFAULT_SEED  # noqa: E402
+from lite.runtime.llama_server import CHAT_SERVER_N_CTX  # noqa: E402
 
 
 class _StubChatServer:
@@ -611,7 +612,7 @@ def chat_server_env(external_env, monkeypatch):
 
 
 def test_external_prefers_chat_server_over_bridge(chat_server_env, llm_model):
-    """llama-server 就位时优先选常驻 chat 服务（而非桥）；构造参数按配置透传。"""
+    """llama-server 就位时优先选常驻 chat 服务（而非桥）；n_ctx 固定 8192（Gemma 4 KV 封顶）。"""
     rt = LlamaRuntime(
         config={"local_llm": {"device": "gpu", "n_ctx": 512}}, root=str(chat_server_env)
     )
@@ -622,7 +623,8 @@ def test_external_prefers_chat_server_over_bridge(chat_server_env, llm_model):
 
     stub = rt._external_chat
     assert stub.n_gpu_layers == GPU_LAYERS_ALL  # device=gpu 推导 -1
-    assert stub.n_ctx == 512
+    # 20261004 Gemma 4：chat 服务上下文不再沿用配置 n_ctx，固定 CHAT_SERVER_N_CTX
+    assert stub.n_ctx == CHAT_SERVER_N_CTX == 8192
 
     out = rt.offline_chat(
         [{"role": "system", "content": "人设"}, {"role": "user", "content": "你好"}]
@@ -723,6 +725,32 @@ def test_fit_messages_trims_history_and_clips(llm_model, fake_llama_cpp):
     assert _estimate_prompt_tokens(
         "\n".join(str(m["content"]) for m in two)
     ) <= budget
+
+
+def test_fit_messages_passes_multimodal_arrays_untouched(llm_model, fake_llama_cpp):
+    """content 为数组（text + image_url，Gemma 4 多模态）→ 整体跳过裁剪原样透传。
+
+    base64 数据 URL 不参与 token 估算，任何截断都会损坏数据 URL（服务端 400）；
+    上下文预算由常驻服务 -c（CHAT_SERVER_N_CTX=8192）兜底。
+    """
+    rt = LlamaRuntime(config={"local_llm": {"n_ctx": 512}})
+    assert rt.load_local_llm(llm_model) is True
+
+    huge_b64 = "A" * 100000  # 远超 n_ctx=512 预算的 base64 图片
+    multimodal = [
+        {"role": "system", "content": "人设"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "我屏幕上是什么？"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + huge_b64}},
+            ],
+        },
+    ]
+    fitted = rt._fit_messages(multimodal, OFFLINE_CHAT_MAX_TOKENS)
+
+    assert fitted == multimodal  # 原样透传：无删减、无截断
+    assert fitted[-1]["content"][1]["image_url"]["url"].endswith(huge_b64)
 
 
 def test_external_not_ready_raises_llama_not_ready(external_env, llm_model):

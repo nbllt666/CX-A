@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { GlassCard } from '../components/GlassCard';
 import Toggle from '../components/Toggle';
+import ModelTierCard from '../components/settings/ModelTierCard';
+import PetModelControls from '../components/PetModelControls';
 import { useRouterOptional } from '../App';
 import {
   IS_BACKEND_READY,
@@ -13,17 +15,19 @@ import {
   setComputerAuthorized,
   updateSettings,
 } from '../api';
-import type { AccelMode, VoiceInfo } from '../api';
+import type { AccelMode, DownloadChannel, TtsAccel, TtsAccelDevice, VoiceInfo } from '../api';
 
 /**
  * 设置页（/settings）：
- * 云端提供商选择 / 运行偏好 / 本地模式（含就绪徽标）/ 主动视觉 / 电脑控制授权 /
- * 音色选择（选项来自后端音色包列表，支持导入自定义音色包）。
+ * 云端提供商与 API Key / 运行偏好 / 本地模式（含就绪徽标）/ 本地模型档位管理 /
+ * 下载线路 / 主动视觉 / 电脑控制授权 / 音色选择（含导入自定义音色包）/
+ * 桌宠模型更换 / 语音加速。
  *
- * - 云端提供商 / 本地模式 / 音色 / 主动视觉：首帧从后端 GET /api/settings 读取，切换走
- *   PUT /api/settings 热更新（失败不阻断界面，待后端上线后自动同步）。
+ * - 云端提供商 / API Key / 下载线路 / 本地模式 / 音色 / 语音加速 / 主动视觉：
+ *   首帧从后端 GET /api/settings 读取，切换走 PUT /api/settings 热更新
+ *   （失败不阻断界面，待后端上线后自动同步）。
  * - 电脑控制授权：已接入真实后端（GET /api/computer/status + POST /api/computer/authorize）。
- * - 本页默认值与后端 config 默认值一致：deepseek / 本地模式关 / cx-open。
+ * - 本页默认值与后端 config 默认值一致：deepseek / 本地模式关 / cx-open / 国内线路。
  */
 
 /** localStorage 键（cx-a.* 家族）：电脑控制授权开关 */
@@ -57,6 +61,37 @@ const ACCEL_MODE_OPTIONS: Array<{ value: AccelMode; label: string; desc: string 
   { value: 'eco', label: '省电优先', desc: '日常更省电更安静，够用就好' },
   { value: 'performance', label: '性能优先', desc: '需要时火力全开，反应更快' },
 ];
+
+/**
+ * 下载线路选项（与向导 CHANNEL_OPTIONS 同口径：一个问题定全部，
+ * 模型仓库由线路在服务端派生，前端不单独持有 source）。
+ */
+const CHANNEL_OPTIONS: Array<{ value: DownloadChannel; label: string; desc: string }> = [
+  { value: 'mirror', label: '国内线路（魔塔，推荐）', desc: '下载更快更稳，模型从国内的魔塔拿' },
+  { value: 'official', label: '海外线路（HuggingFace）', desc: '直连海外站点，模型从 HuggingFace 拿' },
+];
+
+/** 语音加速方式选项（tts.accel，值域与后端白名单一致；展示中文化） */
+const TTS_ACCEL_OPTIONS: Array<{ value: TtsAccel; label: string }> = [
+  { value: 'auto', label: '自动（推荐）' },
+  { value: 'cpu', label: '处理器（稳定省电）' },
+  { value: 'cuda', label: 'NVIDIA 显卡加速' },
+  { value: 'dml', label: '显卡加速（通用）' },
+  { value: 'rocm', label: 'AMD 显卡加速' },
+  { value: 'off', label: '关闭加速' },
+];
+
+/** 语音加速设备选项（tts.accel_device；'' = 自动选设备） */
+const TTS_ACCEL_DEVICE_OPTIONS: Array<{ value: TtsAccelDevice; label: string }> = [
+  { value: '', label: '自动选设备' },
+  { value: 'igpu', label: '核显（更省电）' },
+  { value: 'dgpu', label: '独立显卡（更快）' },
+];
+
+/** tts.accel 合法值域（后端白名单外的值回落 auto） */
+const TTS_ACCEL_VALUES: readonly string[] = TTS_ACCEL_OPTIONS.map((o) => o.value);
+/** tts.accel_device 合法值域（白名单外的值回落 ''） */
+const TTS_ACCEL_DEVICE_VALUES: readonly string[] = TTS_ACCEL_DEVICE_OPTIONS.map((o) => o.value);
 
 /**
  * 读取 localStorage 布尔值；新键缺失时回落旧版键并顺手写入新键（静默迁移，
@@ -127,8 +162,27 @@ export default function SettingsPage() {
   const [localReady, setLocalReady] = useState(false);
   // 主动视觉开关（GET settings vision.enabled）
   const [visionEnabled, setVisionEnabled] = useState(false);
+  // 聊天时自动回忆开关（GET settings memory.context_inject，RAG 记忆注入）
+  const [contextInject, setContextInject] = useState(true);
   // 音色导入成功的轻量提示（样式与运行偏好提示 accelHint 同款）
   const [importHint, setImportHint] = useState<string | null>(null);
+
+  // ---- 向导选项入设置（Task 9）：API Key / 下载线路 / 本地模型档位 / 语音加速 ----
+  // API Key：输入框留空（新值才输入）；apiKeyMasked 为后端脱敏回显（sk-****尾4位），
+  // 以占位符展示——已有钥匙不回填明文，输入新值保存即覆盖
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [apiKeyMasked, setApiKeyMasked] = useState('');
+  const [apiKeyHint, setApiKeyHint] = useState<string | null>(null);
+  const [apiKeySaving, setApiKeySaving] = useState(false);
+  // 下载线路（mirror=国内魔塔 / official=海外 HuggingFace；缺省回落 mirror）
+  const [channel, setChannel] = useState<DownloadChannel>('mirror');
+  const [channelHint, setChannelHint] = useState<string | null>(null);
+  // 语音加速（tts.accel / tts.accel_device）
+  const [ttsAccel, setTtsAccel] = useState<TtsAccel>('auto');
+  const [ttsAccelDevice, setTtsAccelDevice] = useState<TtsAccelDevice>('');
+  const [ttsHint, setTtsHint] = useState<string | null>(null);
+  // 当前本地模型路径（后端视图可得才传给档位卡展示）
+  const [modelPath, setModelPath] = useState('');
 
   // 电脑控制授权状态
   const [controlAuth, setControlAuth] = useState(false);
@@ -161,12 +215,30 @@ export default function SettingsPage() {
           setLocalMode(Boolean(st?.local_llm?.enabled ?? FALLBACK_LOCAL_MODE));
           setLocalReady(Boolean(st?.local_llm?.ready ?? false));
           setVisionEnabled(Boolean(st?.vision?.enabled ?? false));
+          setContextInject(Boolean(st?.memory?.context_inject ?? true));
           const v = st?.tts?.voice || FALLBACK_VOICE;
           setVoice(v);
           currentVoice = v;
           // 运行偏好：以后端值为准，非法/缺失回落默认
           const m = st?.accel?.mode;
           setAccelMode(m === 'eco' || m === 'performance' ? m : FALLBACK_ACCEL_MODE);
+          // API Key 脱敏回显（后端已脱敏，形如 sk-****尾4位；未配置为空）
+          setApiKeyMasked(typeof st?.cloud?.api_key === 'string' ? st.cloud.api_key : '');
+          // 下载线路：非法/缺失回落 mirror（与向导默认一致）
+          setChannel(st?.download?.channel === 'official' ? 'official' : 'mirror');
+          // 语音加速：白名单外 / 缺失回落 auto 与 ''（自动）
+          const acc = st?.tts?.accel;
+          setTtsAccel(
+            typeof acc === 'string' && TTS_ACCEL_VALUES.includes(acc) ? (acc as TtsAccel) : 'auto',
+          );
+          const accDev = st?.tts?.accel_device;
+          setTtsAccelDevice(
+            typeof accDev === 'string' && TTS_ACCEL_DEVICE_VALUES.includes(accDev)
+              ? (accDev as TtsAccelDevice)
+              : '',
+          );
+          // 当前本地模型路径：可得才展示（档位卡据此显示/隐藏该行）
+          setModelPath(typeof st?.local_llm?.model_path === 'string' ? st.local_llm.model_path : '');
         } catch {
           if (!alive) return;
           setProvider(FALLBACK_PROVIDER);
@@ -256,6 +328,17 @@ export default function SettingsPage() {
     void updateSettings({ vision: { enabled: next } }).catch(() => {
       if (seq !== settingsSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
       setSaveError('主动视觉开关没保存上…待会儿再拨一次就好啦');
+    });
+  };
+  // 聊天时自动回忆开关：PUT /api/settings {memory:{context_inject}}（热更段即时生效）
+  const handleContextInjectChange = (next: boolean) => {
+    setContextInject(next);
+    const seq = ++settingsSeqRef.current;
+    setSaveError(null);
+    setCustomHint(null);
+    void updateSettings({ memory: { context_inject: next } }).catch(() => {
+      if (seq !== settingsSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
+      setSaveError('自动回忆开关没保存上…待会儿再拨一次就好啦');
     });
   };
   const handleVoiceChange = (next: string) => {
@@ -353,6 +436,88 @@ export default function SettingsPage() {
       });
   };
 
+  // ---- 向导选项入设置（Task 9）：保存链路均走 PUT /api/settings，失败内联显错不静默 ----
+
+  /** 保存 API Key：输入新值覆盖（输入框平时留空）；成功后清空输入、占位符换新脱敏值 */
+  const handleSaveApiKey = async () => {
+    const key = apiKeyInput.trim();
+    if (!key || apiKeySaving) return;
+    const seq = ++settingsSeqRef.current;
+    setSaveError(null);
+    setApiKeyHint(null);
+    setApiKeySaving(true);
+    try {
+      const res = await updateSettings({ cloud: { api_key: key } });
+      if (seq !== settingsSeqRef.current) return; // 已有更新的操作接管，丢弃迟到响应
+      const masked = res.config?.cloud?.api_key;
+      if (typeof masked === 'string' && masked) setApiKeyMasked(masked);
+      setApiKeyInput('');
+      setApiKeyHint('API Key 已保存');
+    } catch {
+      if (seq !== settingsSeqRef.current) return;
+      setSaveError('API Key 没保存上…待会儿再试一次就好啦');
+    } finally {
+      if (seq === settingsSeqRef.current) setApiKeySaving(false);
+    }
+  };
+
+  /** 切换下载线路：PUT {download:{channel}}；模型仓库由线路在服务端派生（前端不传 source） */
+  const handleChannelChange = (next: DownloadChannel) => {
+    setChannel(next);
+    const seq = ++settingsSeqRef.current;
+    setSaveError(null);
+    setChannelHint(null);
+    void updateSettings({ download: { channel: next } })
+      .then(() => {
+        if (seq !== settingsSeqRef.current) return;
+        setChannelHint('下载线路已保存，之后的模型下载会走新线路');
+      })
+      .catch(() => {
+        if (seq !== settingsSeqRef.current) return;
+        setSaveError('下载线路没保存上…待会儿再选一次就好啦');
+      });
+  };
+
+  /** 切换语音加速方式：PUT {tts:{accel}}；后端重建语音桥后按需提示重启（不静默） */
+  const handleTtsAccelChange = (next: TtsAccel) => {
+    setTtsAccel(next);
+    const seq = ++settingsSeqRef.current;
+    setSaveError(null);
+    setTtsHint(null);
+    void updateSettings({ tts: { accel: next } })
+      .then((res) => {
+        if (seq !== settingsSeqRef.current) return;
+        const wb = res.voice_backend;
+        setTtsHint(
+          wb?.needs_restart ? wb.message || '已保存，重启应用后完全生效' : '语音加速已保存',
+        );
+      })
+      .catch(() => {
+        if (seq !== settingsSeqRef.current) return;
+        setSaveError('语音加速没保存上…待会儿再选一次就好啦');
+      });
+  };
+
+  /** 切换语音加速设备：PUT {tts:{accel_device}}（'' = 自动选设备） */
+  const handleTtsAccelDeviceChange = (next: TtsAccelDevice) => {
+    setTtsAccelDevice(next);
+    const seq = ++settingsSeqRef.current;
+    setSaveError(null);
+    setTtsHint(null);
+    void updateSettings({ tts: { accel_device: next } })
+      .then((res) => {
+        if (seq !== settingsSeqRef.current) return;
+        const wb = res.voice_backend;
+        setTtsHint(
+          wb?.needs_restart ? wb.message || '已保存，重启应用后完全生效' : '语音加速已保存',
+        );
+      })
+      .catch(() => {
+        if (seq !== settingsSeqRef.current) return;
+        setSaveError('语音加速设备没保存上…待会儿再选一次就好啦');
+      });
+  };
+
   // 切换授权：在线走 POST authorize；离线/失败则本地记忆。
   // F-8（第三轮体检批次6）：补序号守卫（F3 修复未覆盖此处）——快速连点时
   // 并发 POST 响应可乱序，迟到的旧响应不得把 UI 拉回与后端真相背离的状态。
@@ -413,6 +578,15 @@ export default function SettingsPage() {
         <p className="-mt-1 mb-2 text-xs text-[var(--text-secondary)]">{importHint}</p>
       )}
 
+      {/* 向导选项入设置（Task 9）：API Key / 下载线路 / 语音加速的保存成功提示 */}
+      {apiKeyHint && (
+        <p className="-mt-1 mb-2 text-xs text-[var(--text-secondary)]">{apiKeyHint}</p>
+      )}
+      {channelHint && (
+        <p className="-mt-1 mb-2 text-xs text-[var(--text-secondary)]">{channelHint}</p>
+      )}
+      {ttsHint && <p className="-mt-1 mb-2 text-xs text-[var(--text-secondary)]">{ttsHint}</p>}
+
       <div className="flex max-w-2xl flex-col gap-4">
         {/* 云端提供商 */}
         <GlassCard>
@@ -430,6 +604,39 @@ export default function SettingsPage() {
               <option value="moonshot">Moonshot（月之暗面）</option>
               {extraProvider && <option value={extraProvider}>{extraProvider}（当前值）</option>}
             </select>
+            {/* API Key：脱敏回显占位（sk-****尾4位），输入新值保存即覆盖 */}
+            <div className="mt-1 flex flex-col gap-1.5">
+              <label className="text-sm font-medium" htmlFor="settings-api-key">
+                云端钥匙（API Key）
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  id="settings-api-key"
+                  type="password"
+                  value={apiKeyInput}
+                  onChange={(e) => {
+                    setApiKeyInput(e.target.value);
+                    setApiKeyHint(null);
+                  }}
+                  placeholder={apiKeyMasked ? `已配置（${apiKeyMasked}），输入新值可覆盖` : '还没有配置，粘贴你的钥匙'}
+                  autoComplete="off"
+                  className="h-9 flex-1 rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-2 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)]"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleSaveApiKey();
+                  }}
+                  disabled={apiKeyInput.trim() === '' || apiKeySaving}
+                  className="shrink-0 rounded-full border border-[var(--glass-border)] px-4 py-1.5 text-sm text-[var(--text-secondary)] transition hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {apiKeySaving ? '保存中…' : '保存钥匙'}
+                </button>
+              </div>
+              <p className="text-xs text-[var(--text-tertiary)]">
+                钥匙只存在这台电脑上；已配置的只显示结尾几位，不会泄露完整内容
+              </p>
+            </div>
           </div>
         </GlassCard>
 
@@ -493,12 +700,60 @@ export default function SettingsPage() {
           )}
         </GlassCard>
 
+        {/* 本地模型档位管理（Task 9.3）：当前模型 + 四档下载 + 进度 + 取消；
+            「设为本地默认大脑」沿用既有 local_llm.enabled 保存链路 */}
+        <ModelTierCard
+          modelPath={modelPath || undefined}
+          localEnabled={localMode}
+          onLocalEnabledChange={handleLocalModeChange}
+        />
+
+        {/* 下载线路（Task 9.2）：一个问题定全部，模型仓库由线路在服务端派生 */}
+        <GlassCard>
+          <div className="flex flex-col gap-2 p-4">
+            <p className="font-medium">下载线路</p>
+            <p className="text-xs text-[var(--text-tertiary)]">
+              模型下载走哪条路；国内更快更稳，随时能换
+            </p>
+            <div className="mt-1 flex flex-col gap-2">
+              {CHANNEL_OPTIONS.map((opt) => {
+                const active = channel === opt.value;
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => handleChannelChange(opt.value)}
+                    className={[
+                      'flex flex-col gap-0.5 rounded-xl border px-3 py-2 text-left text-sm transition',
+                      active
+                        ? 'border-[var(--color-primary)] bg-[rgba(255,183,225,0.12)]'
+                        : 'border-[var(--glass-border)] hover:border-[var(--color-accent)]',
+                    ].join(' ')}
+                  >
+                    <span>{opt.label}</span>
+                    <span className="text-xs text-[var(--text-tertiary)]">{opt.desc}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </GlassCard>
+
         {/* 主动视觉 */}
         <SettingRow
           title="主动视觉"
           desc="开启后它会看看屏幕、记住你正在忙什么，越陪你越懂你；画面不会离开这台电脑，理解画面时需要联网"
         >
           <Toggle checked={visionEnabled} onChange={handleVisionChange} label="主动视觉" />
+        </SettingRow>
+
+        {/* 聊天时自动回忆（RAG 记忆注入，20261005） */}
+        <SettingRow
+          title="聊天时自动回忆"
+          desc="聊天时自动想起相关的记忆，聊过的事它自然记得；关闭后只有到记忆页主动查才会用"
+        >
+          <Toggle checked={contextInject} onChange={handleContextInjectChange} label="聊天时自动回忆" />
         </SettingRow>
 
         {/* 电脑控制授权 */}
@@ -574,6 +829,63 @@ export default function SettingsPage() {
               >
                 {importing ? '导入中…' : '导入音色包'}
               </button>
+            </div>
+          </div>
+        </GlassCard>
+
+        {/* 桌宠模型（Task 8）：更换自定义 VRM / 恢复默认；导入成功后悬浮窗经总线立即重载 */}
+        <GlassCard>
+          <div className="flex flex-col gap-2 p-4">
+            <p className="font-medium">桌宠模型</p>
+            <p className="text-xs text-[var(--text-tertiary)]">
+              挑一个你喜欢的 VRM 模型换上；不满意随时一键恢复默认（原模型会自动备份）
+            </p>
+            <PetModelControls />
+          </div>
+        </GlassCard>
+
+        {/* 语音加速（Task 9.4）：tts.accel / tts.accel_device 两键热更；需重启时明确提示 */}
+        <GlassCard>
+          <div className="flex flex-col gap-2 p-4">
+            <p className="font-medium">语音加速</p>
+            <p className="text-xs text-[var(--text-tertiary)]">
+              让说话的声音合成得更快更顺；不确定就选「自动」
+            </p>
+            <div className="mt-1 flex flex-col gap-2 sm:flex-row sm:gap-3">
+              <div className="flex flex-1 flex-col gap-1">
+                <label className="text-sm font-medium" htmlFor="settings-tts-accel">
+                  加速方式
+                </label>
+                <select
+                  id="settings-tts-accel"
+                  value={ttsAccel}
+                  onChange={(e) => handleTtsAccelChange(e.target.value as TtsAccel)}
+                  className="h-9 rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-2 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)]"
+                >
+                  {TTS_ACCEL_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex flex-1 flex-col gap-1">
+                <label className="text-sm font-medium" htmlFor="settings-tts-accel-device">
+                  加速设备
+                </label>
+                <select
+                  id="settings-tts-accel-device"
+                  value={ttsAccelDevice}
+                  onChange={(e) => handleTtsAccelDeviceChange(e.target.value as TtsAccelDevice)}
+                  className="h-9 rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-2 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)]"
+                >
+                  {TTS_ACCEL_DEVICE_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
           </div>
         </GlassCard>

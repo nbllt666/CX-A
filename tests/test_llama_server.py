@@ -16,7 +16,12 @@ import json
 
 import pytest
 
-from lite.runtime.llama_server import LlamaServerChat, LlamaServerEmbedder
+from lite.runtime.llama_server import (
+    CHAT_SERVER_N_CTX,
+    LlamaServerChat,
+    LlamaServerEmbedder,
+    find_mmproj_path,
+)
 
 
 # ------------------------------------------------------------------ #
@@ -661,6 +666,55 @@ def test_chat_cold_start_argv_exact(files):
     client.ensure_started()
     assert len(popen.calls) == 1
     assert client.running is True
+
+
+def test_find_mmproj_path_picks_first_sorted_gguf(tmp_path):
+    """find_mmproj_path：同目录多个 mmproj 取字典序第一个（BF16 < F16）。"""
+    (tmp_path / "mmproj-F16.gguf").write_bytes(b"x")
+    (tmp_path / "mmproj-BF16.gguf").write_bytes(b"x")
+    assert find_mmproj_path(str(tmp_path / "model.gguf")) == str(tmp_path / "mmproj-BF16.gguf")
+
+
+def test_find_mmproj_path_returns_none_without_mmproj(tmp_path):
+    """find_mmproj_path：无 mmproj 文件 / 目录不可读 → None（纯文本模型不挂载）。"""
+    (tmp_path / "model.gguf").write_bytes(b"x")
+    assert find_mmproj_path(str(tmp_path / "model.gguf")) is None
+    assert find_mmproj_path(str(tmp_path / "missing-dir" / "model.gguf")) is None
+
+
+def test_chat_argv_appends_mmproj_when_model_dir_has_mmproj(tmp_path):
+    """模型同目录存在 mmproj*.gguf → argv 追加 --mmproj（Gemma 4 多模态挂载）。"""
+    exe = tmp_path / "llama-server.exe"
+    exe.write_bytes(b"fake")
+    model = tmp_path / "gemma-4-E2B-it-Q4_K_M.gguf"
+    model.write_bytes(b"fake-gguf")
+    mmproj = tmp_path / "mmproj-BF16.gguf"
+    mmproj.write_bytes(b"fake-mmproj")
+
+    popen = _PopenRecorder()
+    client = LlamaServerChat(
+        str(exe), str(model), popen_factory=popen, http_factory=_FakeHttp()
+    )
+    client.ensure_started()
+
+    argv = popen.calls[0]
+    assert argv[-2:] == ["--mmproj", str(mmproj)]
+
+
+def test_chat_server_context_capped_at_8192(tmp_path):
+    """LlamaRuntime chat 服务上下文固定 8192（Gemma 4 KV 封顶），不随 self._n_ctx 走。"""
+    from lite.runtime.llama_runtime import LlamaRuntime
+
+    base_dir = tmp_path / "runtime" / "llama"
+    base_dir.mkdir(parents=True)
+    (base_dir / "llama-server.exe").write_bytes(b"fake")
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"fake-gguf")
+
+    runtime = LlamaRuntime(config={"local_llm": {"n_ctx": 2048}}, root=str(tmp_path))
+    assert runtime._try_load_chat_server(str(gguf)) is True
+    assert runtime._external_chat is not None
+    assert runtime._external_chat._n_ctx == CHAT_SERVER_N_CTX == 8192
 
 
 def test_chat_request_shape_and_parse(files):

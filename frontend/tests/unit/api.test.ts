@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { requestJson, synthesizeSpeech, transcribeAudio } from '../../src/renderer/api';
+import { requestJson, synthesizeSpeech, synthesizeSpeechStream, transcribeAudio } from '../../src/renderer/api';
 
 /**
  * Test1 · requestJson 非 2xx 错误体透出（D5 修复回归）。
@@ -266,5 +266,101 @@ describe('语音接口：合成与识别请求（voice）', () => {
     expect(init.method).toBe('POST');
     expect(JSON.parse(String(init.body))).toEqual({ audio_base64: 'AAA=', sample_rate: 16000 });
     expect(result.text).toBe('你好呀');
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 追加（20261003_模块0_流式合成中断异常处理）：synthesizeSpeechStream 的
+ * AbortError 消化语义——中断是预期控制流，本层静默结束；其余错误照常上抛。
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+describe('synthesizeSpeechStream：AbortError 消化（20261003）', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** NDJSON 流式 200 响应：start 中 enqueue 首帧后挂起，controller 暴露给测试用例按需 error/close */
+  function stubStreamFetch(): ReadableStreamDefaultController<Uint8Array> {
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        streamController = c;
+        c.enqueue(new TextEncoder().encode('{"seq":1,"text":"你"}\n'));
+        // 不 close：第二个 read() 挂起，等待测试用例 error/close 驱动
+      },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(stream, { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } }),
+      ),
+    );
+    return streamController;
+  }
+
+  it('正常流：逐帧回调 onChunk、done 帧回调 onDone（回归防线）', async () => {
+    const controller = stubStreamFetch();
+    const onChunk = vi.fn();
+    const onDone = vi.fn<(total: number) => void>();
+    const pending = synthesizeSpeechStream('你好', onChunk, onDone);
+
+    await vi.waitFor(() => expect(onChunk).toHaveBeenCalledTimes(1));
+    controller.enqueue(new TextEncoder().encode('{"done":true,"total":3}\n'));
+    await expect(pending).resolves.toBeUndefined();
+    expect(onDone).toHaveBeenCalledWith(3);
+  });
+
+  it('fetch 阶段中断：静默返回，不抛错、不回调 onDone', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        (_input: RequestInfo | URL, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              reject(new DOMException('The operation was aborted.', 'AbortError'));
+            });
+          }),
+      ),
+    );
+    const controller = new AbortController();
+    const onChunk = vi.fn();
+    const onDone = vi.fn<(total: number) => void>();
+
+    const pending = synthesizeSpeechStream('你好', onChunk, onDone, controller.signal);
+    // fetch 已被调用（监听器就位）后触发中断：fetch 以 AbortError 拒绝
+    await vi.waitFor(() => expect(onChunk).not.toHaveBeenCalled());
+    controller.abort();
+
+    await expect(pending).resolves.toBeUndefined();
+    expect(onChunk).not.toHaveBeenCalled();
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it('流式读取阶段 read() 抛 AbortError：静默返回，不抛错、不回调 onDone', async () => {
+    const streamController = stubStreamFetch();
+    const controller = new AbortController();
+    const onChunk = vi.fn();
+    const onDone = vi.fn<(total: number) => void>();
+
+    const pending = synthesizeSpeechStream('你好', onChunk, onDone, controller.signal);
+    await vi.waitFor(() => expect(onChunk).toHaveBeenCalledTimes(1));
+
+    // 模拟 signal 中断后 read() 以 AbortError 拒绝（浏览器真实行为）
+    controller.abort();
+    streamController.error(new DOMException('The operation was aborted.', 'AbortError'));
+
+    await expect(pending).resolves.toBeUndefined();
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it('流式读取阶段非中断错误：照常上抛（不被静默吞掉）', async () => {
+    const streamController = stubStreamFetch();
+    const onChunk = vi.fn();
+
+    const pending = synthesizeSpeechStream('你好', onChunk);
+    await vi.waitFor(() => expect(onChunk).toHaveBeenCalledTimes(1));
+
+    streamController.error(new Error('boom'));
+    await expect(pending).rejects.toThrow('boom');
   });
 });

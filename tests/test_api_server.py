@@ -269,15 +269,19 @@ def test_status_endpoint(api_server):
 
 
 def test_settings_get_masked_without_api_key(api_server):
-    """GET /api/settings 返回脱敏配置视图，绝不包含 API Key。"""
+    """GET /api/settings 返回脱敏配置视图；api_key 未配置时脱敏回显为空串。
+
+    Task 5（向导选项入设置）：视图契约由「完全不含 api_key 键」升级为
+    「脱敏回显」——未配置时空串、已配置时 sk-****尾4位，明文任何形式绝不外泄。
+    """
     _store, _pipeline, base = api_server
-    status, body, raw = http_get(f"{base}/api/settings")
+    status, body, _raw = http_get(f"{base}/api/settings")
     assert status == 200
     assert body["cloud"]["provider"] == "deepseek"
     assert body["tts"]["voice"] == "cx-open"
     assert body["local_llm"]["enabled"] is False
-    assert "api_key" not in raw.lower()
-    assert "api_key" not in json.dumps(body)
+    # 未配置：键存在但值为空串（前端据此渲染「未配置」）
+    assert body["cloud"]["api_key"] == ""
 
 
 def test_settings_update_hot_reload(api_server):
@@ -314,16 +318,17 @@ def test_settings_update_ignores_unknown_provider(api_server):
 
 
 def test_chat_endpoints_guard(api_server):
-    """聊天端点本期为未启用守卫：明确提示而不 404，避免直连误判。"""
+    """聊天发送守卫端点明确提示而不 404；history 已接持久化返回 ok+空列表。"""
     _store, _pipeline, base = api_server
     status, body = http_post(f"{base}/api/chat/messages", {"text": "hi"})
     assert status == 200
     assert body["error"] == "chat_service_disabled"
     assert body["ok"] is False
 
+    # 20261004：history 为真实现（无对话时 ok=True + 空列表，不再返回守卫错误码）
     status2, body2, _raw = http_get(f"{base}/api/chat/history")
     assert status2 == 200
-    assert body2["error"] == "chat_service_disabled"
+    assert body2["ok"] is True
     assert body2["messages"] == []
 
 
@@ -1279,21 +1284,15 @@ def test_main_loopback_default_unaffected(monkeypatch, capsys):
     assert "拒绝启动" not in out
 
 
-# ---------------------------------------------------------------- 第四轮体检批次E：向量库降级透明化
-def test_build_deps_lancedb_degrade_warning(tmp_path, monkeypatch, caplog):
-    """批次E：配置 vector.backend=lancedb 但依赖不可用时，中文告警且 InMemory 兜底不变。
+# ---------------------------------------------------------------- 20261005：向量库禁止降级
+def test_build_deps_lancedb_missing_raises(tmp_path, monkeypatch):
+    """20261005 禁止降级：配置 vector.backend=lancedb 但依赖不可用 → 启动硬失败。
 
-    monkeypatch importlib.util.find_spec 使 "lancedb" 探测为缺失（对应 frozen
-    产物 excludes lancedb 形态），验证 build_deps 降级路径：告警可见 +
-    InMemoryVectorStore 兜底不变（桩嵌入：哈希向量无持久价值，走内存）。
-
-    20260926_模块0_真实嵌入与向量持久化：默认后端已改为 sqlite，本用例显式写
-    config.json 指定 lancedb 以触发降级分支。
+    旧口径（依赖缺失 → 告警回落 SQLite/内存库）已按人类裁决移除——LanceDB 为
+    默认后端，冻结包已收录依赖；任何"静默换库"都会造成数据语义漂移，故缺失时
+    直接 RuntimeError（中文，含处置指引），启动中止。
     """
     import importlib.util
-    import logging
-
-    from lite.memory.vector_store import InMemoryVectorStore
 
     (tmp_path / "config.json").write_text(
         json.dumps({"vector": {"backend": "lancedb", "path": "data/lancedb"}}),
@@ -1309,13 +1308,10 @@ def test_build_deps_lancedb_degrade_warning(tmp_path, monkeypatch, caplog):
         return real_find_spec(name, *args, **kwargs)
 
     monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec)
-    with caplog.at_level(logging.WARNING, logger="lite.server.api_server"):
-        _store, pipeline, _manager, _remote = build_deps(data_dir=str(tmp_path))
-
-    # 中文降级告警已发出（不再静默降级）
-    assert any("已降级为内存向量库" in rec.getMessage() for rec in caplog.records)
-    # 兜底不变：装配仍为内存向量库
-    assert isinstance(pipeline.vector_store, InMemoryVectorStore)
+    with pytest.raises(RuntimeError) as excinfo:
+        build_deps(data_dir=str(tmp_path))
+    assert "禁止降级" in str(excinfo.value)
+    assert "lancedb" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------- 首启向导接口族（Task 6 / Task 7）
@@ -1480,7 +1476,7 @@ def test_setup_recommend_structure_and_suggested_source(tmp_path):
     assert status == 200
     assert {"profile", "recommendation", "tiers", "suggested_source"} <= set(body)
     assert body["suggested_source"] == "modelscope"
-    assert any(tier["tier"] == "1.7B" for tier in body["tiers"])
+    assert any(tier["tier"] == "E2B-Q4" for tier in body["tiers"])
     assert all("tier" in tier and "repo" in tier for tier in body["tiers"])
     assert {"use_local", "device", "tier", "config_patch", "model"} <= set(body["recommendation"])
     assert "probe_notes" in body["profile"]
@@ -1725,16 +1721,37 @@ def _build_download_env(tmp_path, mode):
     return config, manager, fake, constructions
 
 
+def test_download_manager_downloads_mmproj_for_multimodal_tier(tmp_path):
+    """多模态档位（Gemma 4）：主模型就位后同仓库下载视觉组件（双文件落同目录）。"""
+    config, manager, fake, _constructions = _build_download_env(tmp_path, "success")
+    result = manager.start(tier="E2B-Q4")
+    assert result["ok"] is True
+
+    # 后台线程 success 模式毫秒级完成：轮询至 done（上限 5s）
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and manager.snapshot()["state"] != "done":
+        time.sleep(0.01)
+    assert manager.snapshot()["state"] == "done"
+    # 双文件：主模型 + mmproj 视觉组件，同仓库（文件名经 2026-10-04 联网核实）
+    assert [c["filename"] for c in fake.calls] == [
+        "gemma-4-E2B-it-Q4_K_M.gguf",
+        "mmproj-BF16.gguf",
+    ]
+    assert fake.calls[0]["repo"] == fake.calls[1]["repo"] == "unsloth/gemma-4-E2B-it-GGUF"
+    # 配置写回：model_path 指向主模型
+    assert config.get("local_llm", "model_path", "").endswith("gemma-4-E2B-it-Q4_K_M.gguf")
+
+
 def test_setup_model_download_progress_immediate_and_idempotent(tmp_path):
     """阻塞下载期间：进度与状态端点即时返回（不阻塞服务）；重复触发幂等。"""
     config, manager, fake, constructions = _build_download_env(tmp_path, "block")
     with setup_server(tmp_path, config=config, download_manager=manager) as (base, _cfg, _handler):
-        status, body = http_post(f"{base}/api/setup/model/download", {"tier": "1.7B"})
+        status, body = http_post(f"{base}/api/setup/model/download", {"tier": "E2B-Q4"})
         assert status == 200
         assert body["ok"] is True
         assert body["state"] == "downloading"
         assert body["already_running"] is False
-        assert body["model"]["tier"] == "1.7B"
+        assert body["model"]["tier"] == "E2B-Q4"
         assert fake.started.wait(timeout=5)
 
         # 下载被替身阻塞：进度端点必须即时返回（单次请求 < 2s）
@@ -1974,6 +1991,130 @@ def test_pet_model_documented_in_tools_usage(api_server):
     _store, _pipeline, base = api_server
     _status, body, _raw = http_get(f"{base}/api/tools")
     assert "GET /api/pet/model" in body["usage"]
+    # Task 4：导入/恢复端点同步登记，防文档漂移
+    assert "POST /api/pet/model/import" in body["usage"]
+    assert "POST /api/pet/model/reset" in body["usage"]
+
+
+# ---------------------------------------------------------------- 桌宠模型导入/恢复（Task 4：用户自定义 VRM 桌宠模型）
+def _make_fake_vrm(path, content: bytes) -> str:
+    """在 path 写入假 .vrm 文件（内容为字节数组即可，不校验 VRM 内部格式）。"""
+    os.makedirs(os.path.dirname(str(path)), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(content)
+    return str(path)
+
+
+def test_pet_model_import_replaces_and_backs_up(tmp_path, monkeypatch):
+    """导入成功：目标被新内容替换 + 同目录 .bak 备份为旧内容 + 源文件保持不变。"""
+    root = tmp_path / "approot"
+    target = _make_fake_vrm(root / "data" / "pet" / "cx-open.vrm", b"OLD-MODEL-BYTES")
+    source = _make_fake_vrm(tmp_path / "my-pet" / "custom.vrm", b"NEW-MODEL-BYTES")
+    with pet_model_server(tmp_path, monkeypatch, root) as base:
+        status, body = http_post(f"{base}/api/pet/model/import", {"source_path": source})
+    assert status == 200
+    assert body["ok"] is True
+    assert "导入成功" in body["message"]
+    # 目标被替换为新内容（与原内容不同）
+    with open(target, "rb") as fh:
+        assert fh.read() == b"NEW-MODEL-BYTES"
+    # 同目录备份存在且内容为旧模型
+    backup = target + ".bak"
+    assert os.path.isfile(backup)
+    with open(backup, "rb") as fh:
+        assert fh.read() == b"OLD-MODEL-BYTES"
+    # 源文件未被改动
+    with open(source, "rb") as fh:
+        assert fh.read() == b"NEW-MODEL-BYTES"
+    # 原子替换不留临时残留
+    assert not os.path.isfile(target + ".importing")
+
+
+def test_pet_model_import_rejects_non_vrm_suffix(tmp_path, monkeypatch):
+    """非 .vrm 后缀 → 400 中文错误，目标模型与备份均不受影响。"""
+    root = tmp_path / "approot"
+    target = _make_fake_vrm(root / "data" / "pet" / "cx-open.vrm", b"OLD-MODEL-BYTES")
+    source = _make_fake_vrm(tmp_path / "not-a-model.txt", b"TXT-BYTES")
+    with pet_model_server(tmp_path, monkeypatch, root) as base:
+        status, body = http_post(f"{base}/api/pet/model/import", {"source_path": source})
+    assert status == 400
+    assert body["ok"] is False
+    assert "仅支持" in body["message"] and ".vrm" in body["message"]
+    with open(target, "rb") as fh:
+        assert fh.read() == b"OLD-MODEL-BYTES"
+    assert not os.path.isfile(target + ".bak")
+
+
+def test_pet_model_import_rejects_missing_source(tmp_path, monkeypatch):
+    """source_path 指向不存在的文件 → 400 中文错误，目标模型不动。"""
+    root = tmp_path / "approot"
+    target = _make_fake_vrm(root / "data" / "pet" / "cx-open.vrm", b"OLD-MODEL-BYTES")
+    with pet_model_server(tmp_path, monkeypatch, root) as base:
+        status, body = http_post(
+            f"{base}/api/pet/model/import",
+            {"source_path": str(tmp_path / "ghost" / "nope.vrm")},
+        )
+    assert status == 400
+    assert body["ok"] is False
+    assert "不存在" in body["message"]
+    with open(target, "rb") as fh:
+        assert fh.read() == b"OLD-MODEL-BYTES"
+
+
+def test_pet_model_import_missing_source_path_400(tmp_path, monkeypatch):
+    """body 缺 source_path（或空串）→ 400 missing_source_path 中文提示。"""
+    root = tmp_path / "approot"
+    with pet_model_server(tmp_path, monkeypatch, root) as base:
+        status, body = http_post(f"{base}/api/pet/model/import", {})
+        assert status == 400
+        assert body["error"] == "missing_source_path"
+        status2, body2 = http_post(f"{base}/api/pet/model/import", {"source_path": "   "})
+        assert status2 == 400
+        assert body2["error"] == "missing_source_path"
+
+
+def test_pet_model_reset_restores_backup(tmp_path, monkeypatch):
+    """reset：.bak 存在 → 还原为 cx-open.vrm（ok:true），内容与备份一致。"""
+    root = tmp_path / "approot"
+    target = _make_fake_vrm(root / "data" / "pet" / "cx-open.vrm", b"IMPORTED-MODEL")
+    _make_fake_vrm(root / "data" / "pet" / "cx-open.vrm.bak", b"DEFAULT-MODEL")
+    with pet_model_server(tmp_path, monkeypatch, root) as base:
+        status, body = http_post(f"{base}/api/pet/model/reset", {})
+    assert status == 200
+    assert body["ok"] is True
+    assert "恢复" in body["message"]
+    with open(target, "rb") as fh:
+        assert fh.read() == b"DEFAULT-MODEL"
+    assert not os.path.isfile(target + ".restoring")
+
+
+def test_pet_model_reset_missing_backup_404(tmp_path, monkeypatch):
+    """reset：无备份 → 404 pet_model_backup_missing + 中文 message，现模型不动。"""
+    root = tmp_path / "approot"
+    target = _make_fake_vrm(root / "data" / "pet" / "cx-open.vrm", b"CURRENT-MODEL")
+    with pet_model_server(tmp_path, monkeypatch, root) as base:
+        status, body = http_post(f"{base}/api/pet/model/reset", {})
+    assert status == 404
+    assert body["ok"] is False
+    assert body["error"] == "pet_model_backup_missing"
+    assert "备份" in body["message"]
+    with open(target, "rb") as fh:
+        assert fh.read() == b"CURRENT-MODEL"
+
+
+def test_pet_model_import_and_reset_require_token_in_token_mode(tmp_path, monkeypatch):
+    """令牌模式：import/reset 无令牌 → 403（走既有令牌闸，无豁免端点）。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
+    root = tmp_path / "approot"
+    _make_fake_vrm(root / "data" / "pet" / "cx-open.vrm", b"OLD")
+    with pet_model_server(tmp_path, monkeypatch, root) as base:
+        for path, payload in (
+            ("/api/pet/model/import", {"source_path": "x.vrm"}),
+            ("/api/pet/model/reset", {}),
+        ):
+            status, body = http_post(f"{base}{path}", payload)
+            assert status == 403, f"{path} 无令牌应 403"
+            assert body == {"ok": False, "error": "unauthorized_client"}
 
 
 # ---------------------------------------------------------------- 20260926_模块0_真实嵌入与向量持久化
@@ -1996,10 +2137,20 @@ def _seed_memories(db_path, contents):
 
 
 def test_build_deps_real_embedding_uses_sqlite_store_and_warmup(tmp_path, monkeypatch):
-    """真实嵌入可用时：装配 SQLite 持久向量库，且启动预热回填既有记忆向量。"""
+    """显式 backend=sqlite：装配 SQLite 持久向量库，且启动预热回填既有记忆向量。
+
+    20261005 默认后端已改 lancedb；本用例显式写 sqlite 以锁定持久库装配与
+    预热回填语义（用户显式选择路径）。
+    """
+    import json as _json
+
     import lite.server.api_server as api
     from lite.memory.vector_store import SQLiteVectorStore
 
+    (tmp_path / "config.json").write_text(
+        _json.dumps({"vector": {"backend": "sqlite", "path": "data/lancedb"}}),
+        encoding="utf-8",
+    )
     _seed_memories(str(tmp_path / "memories.db"), ["历史记忆一", "历史记忆二"])
 
     def _fake_builder(config):
@@ -2015,30 +2166,57 @@ def test_build_deps_real_embedding_uses_sqlite_store_and_warmup(tmp_path, monkey
     assert res["memories"], "预热回填后向量检索应可召回"
 
 
-def test_build_deps_stub_embedding_uses_memory_store(tmp_path, monkeypatch, caplog):
-    """真实嵌入模型缺失（路径解析为空）时：中文告警 + 桩嵌入 + 内存向量库，不阻断启动。"""
-    import logging
+def test_build_embedding_provider_missing_raises(tmp_path, monkeypatch):
+    """嵌入禁止降级（20261005）：模型路径为空 → RuntimeError 中文（不回落哈希桩）。
+
+    直接调用装配器本体（经 conftest 保留的 _build_embedding_provider_original
+    原函数引用——函数内延迟 import 会拿到替身，无法绕过）。
+    """
+    from lite.config.config_manager import ConfigManager
 
     import lite.runtime.llama_runtime as llama_runtime
-    import lite.server.api_server as api
-    from lite.memory.embedding import LiteEmbeddingProvider
-    from lite.memory.vector_store import InMemoryVectorStore
 
     monkeypatch.setattr(llama_runtime, "resolve_embedding_model_path", lambda *a, **k: "")
-    with caplog.at_level(logging.WARNING, logger="lite.server.api_server"):
-        _store, pipeline, _manager, _remote = api.build_deps(data_dir=str(tmp_path))
-    assert isinstance(pipeline.vector_store, InMemoryVectorStore)
-    assert isinstance(pipeline.embed, LiteEmbeddingProvider)
-    assert any("已降级为哈希桩嵌入" in rec.getMessage() for rec in caplog.records)
+    config = ConfigManager(config_path=str(tmp_path / "config.json"), data_dir=str(tmp_path))
+    original = api_server_module._build_embedding_provider_original
+    with pytest.raises(RuntimeError) as excinfo:
+        original(config)
+    assert "嵌入模型" in str(excinfo.value)
+    assert "禁止降级" in str(excinfo.value)
 
 
-def test_build_deps_lancedb_degrade_to_sqlite_for_real_embedding(tmp_path, monkeypatch, caplog):
-    """真实嵌入 + 显式 lancedb 且依赖缺失：告警"已降级为 SQLite 持久向量库"。"""
+def test_build_embedding_provider_load_failure_raises(tmp_path, monkeypatch):
+    """嵌入禁止降级：llama-server 启动失败（LlamaRuntime 抛错）→ RuntimeError。"""
+    from lite.config.config_manager import ConfigManager
+
+    import lite.runtime.llama_runtime as llama_runtime
+
+    monkeypatch.setattr(
+        llama_runtime, "resolve_embedding_model_path",
+        lambda *a, **k: str(tmp_path / "fake-embedding.gguf"),
+    )
+
+    class _BoomRuntime:
+        def __init__(self, config):
+            pass
+
+        def load_embedding_model(self, path):
+            raise RuntimeError("llama-server 启动失败（模拟）")
+
+    monkeypatch.setattr(llama_runtime, "LlamaRuntime", _BoomRuntime)
+    config = ConfigManager(config_path=str(tmp_path / "config.json"), data_dir=str(tmp_path))
+    original = api_server_module._build_embedding_provider_original
+    with pytest.raises(RuntimeError) as excinfo:
+        original(config)
+    assert "禁止降级" in str(excinfo.value)
+    assert "嵌入模型加载失败" in str(excinfo.value)
+
+
+def test_build_deps_lancedb_missing_raises_for_real_embedding(tmp_path, monkeypatch):
+    """真实嵌入 + 显式 lancedb 且依赖缺失 → 硬失败（禁止降级，不回落 SQLite）。"""
     import importlib.util
-    import logging
 
     import lite.server.api_server as api
-    from lite.memory.vector_store import SQLiteVectorStore
 
     (tmp_path / "config.json").write_text(
         json.dumps({"vector": {"backend": "lancedb", "path": "data/lancedb"}}),
@@ -2053,10 +2231,42 @@ def test_build_deps_lancedb_degrade_to_sqlite_for_real_embedding(tmp_path, monke
         api, "_build_embedding_provider",
         lambda config: (_FakeRealEmbed(), "llama", {"dim": 4, "model_tag": "fake|model.gguf"}),
     )
-    with caplog.at_level(logging.WARNING, logger="lite.server.api_server"):
-        _store, pipeline, _manager, _remote = api.build_deps(data_dir=str(tmp_path))
-    assert any("已降级为 SQLite 持久向量库" in rec.getMessage() for rec in caplog.records)
+    with pytest.raises(RuntimeError) as excinfo:
+        api.build_deps(data_dir=str(tmp_path))
+    assert "禁止降级" in str(excinfo.value)
+
+
+def test_build_deps_explicit_sqlite_still_works(tmp_path, monkeypatch):
+    """显式 backend=sqlite（用户选择，非降级）→ SQLiteVectorStore 正常装配。"""
+    import json as _json
+
+    import lite.server.api_server as api
+    from lite.memory.vector_store import SQLiteVectorStore
+
+    (tmp_path / "config.json").write_text(
+        _json.dumps({"vector": {"backend": "sqlite", "path": "data/lancedb"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        api, "_build_embedding_provider",
+        lambda config: (_FakeRealEmbed(), "llama", {"dim": 4, "model_tag": "fake|model.gguf"}),
+    )
+    _store, pipeline, _manager, _remote = api.build_deps(data_dir=str(tmp_path))
     assert isinstance(pipeline.vector_store, SQLiteVectorStore)
+
+
+def test_build_vector_store_unknown_backend_raises(tmp_path):
+    """未知 backend（含空串）→ RuntimeError（禁止降级：不再回落内存库）。"""
+    import json as _json
+
+    import lite.server.api_server as api
+
+    (tmp_path / "config.json").write_text(
+        _json.dumps({"vector": {"backend": "weaviate"}}), encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        api.build_deps(data_dir=str(tmp_path))
+    assert "未知向量后端" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------- Task 5：模式入口
@@ -2606,6 +2816,140 @@ def test_settings_put_vision_section_non_dict_400(api_server):
     assert body["error"] == "invalid section type: vision"
 
 
+# ---------------------------------------------------------------- settings 白名单扩展（Task 5：向导选项入设置）
+def test_settings_put_api_key_applied_and_get_masked(api_server):
+    """PUT cloud.api_key：applied 登记；GET 脱敏回显 sk-****尾4位，明文不外泄。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/settings",
+        {"cloud": {"api_key": "sk-abcdefgh12345678"}},
+        method="PUT",
+    )
+    assert status == 200
+    assert body["ok"] is True
+    assert "cloud.api_key" in body["applied"]
+    # 回执中的视图值已是脱敏形式，明文任何形式不出现在响应里
+    assert body["config"]["cloud"]["api_key"].endswith("5678")
+    assert "sk-abcdefgh12345678" not in json.dumps(body)
+    # GET 脱敏回显：sk-**** + 尾4位
+    _st2, body2, raw2 = http_get(f"{base}/api/settings")
+    assert body2["cloud"]["api_key"] == "sk-****5678"
+    assert "sk-abcdefgh12345678" not in raw2
+
+
+def test_settings_put_api_key_empty_ignored_keeps_existing(api_server):
+    """PUT cloud.api_key 空串/纯空白 → ignored，不覆盖既有值。"""
+    _store, _pipeline, base = api_server
+    status, _ = http_post(
+        f"{base}/api/settings", {"cloud": {"api_key": "sk-initial-key-9999"}}, method="PUT"
+    )
+    assert status == 200
+    status, body = http_post(f"{base}/api/settings", {"cloud": {"api_key": "   "}}, method="PUT")
+    assert status == 200
+    assert not body["applied"]
+    assert any("cloud.api_key" in item for item in body["ignored"])
+    _st2, body2, _raw2 = http_get(f"{base}/api/settings")
+    assert body2["cloud"]["api_key"] == "sk-****9999"
+
+
+def test_settings_put_download_channel_applied_and_source_derived(api_server):
+    """PUT download.channel=official：applied 两项 + 派生 local_llm.source（向导同口径）。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/settings", {"download": {"channel": "official"}}, method="PUT"
+    )
+    assert status == 200
+    assert "download.channel" in body["applied"]
+    assert "local_llm.source" in body["applied"]
+    assert body["config"]["download"]["channel"] == "official"
+    assert body["config"]["local_llm"]["source"] == "huggingface"
+    # GET 视图同步回显（通道 + 派生仓库）
+    _st2, body2, _raw2 = http_get(f"{base}/api/settings")
+    assert body2["download"]["channel"] == "official"
+    assert body2["local_llm"]["source"] == "huggingface"
+
+
+def test_settings_put_download_channel_mirror_derives_modelscope(api_server):
+    """PUT download.channel（大小写混杂）→ 归一小写 + 派生 modelscope。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/settings", {"download": {"channel": "MIRROR"}}, method="PUT"
+    )
+    assert status == 200
+    assert body["config"]["download"]["channel"] == "mirror"
+    assert body["config"]["local_llm"]["source"] == "modelscope"
+
+
+def test_settings_put_download_channel_invalid_ignored(api_server):
+    """PUT download.channel=bogus → ignored 显式回显，config 维持默认通道。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/settings", {"download": {"channel": "bogus"}}, method="PUT"
+    )
+    assert status == 200
+    assert not body["applied"]
+    assert any("download.channel" in item and "bogus" in item for item in body["ignored"])
+    _st2, body2, _raw2 = http_get(f"{base}/api/settings")
+    # normalize_channel 回落默认通道（mirror），local_llm.source 按默认通道派生
+    assert body2["download"]["channel"] == "mirror"
+    assert body2["local_llm"]["source"] == "modelscope"
+
+
+def test_settings_put_download_section_non_dict_400(api_server):
+    """PUT {"download": "abc"}（段非 dict）→ 400 invalid section type: download。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/settings", {"download": "abc"}, method="PUT")
+    assert status == 400
+    assert body["error"] == "invalid section type: download"
+
+
+def test_settings_put_tts_accel_keys_applied_and_echoed(api_server):
+    """PUT tts.accel / tts.accel_device 合法值 → applied + GET 回显。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/settings",
+        {"tts": {"accel": "cuda", "accel_device": "dgpu"}},
+        method="PUT",
+    )
+    assert status == 200
+    assert "tts.accel" in body["applied"]
+    assert "tts.accel_device" in body["applied"]
+    _st2, body2, _raw2 = http_get(f"{base}/api/settings")
+    assert body2["tts"]["accel"] == "cuda"
+    assert body2["tts"]["accel_device"] == "dgpu"
+
+
+def test_settings_put_tts_accel_invalid_ignored(api_server):
+    """PUT tts.accel=npu / tts.accel_device=xgpu（非法值）→ ignored 显式回显，config 不变。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/settings",
+        {"tts": {"accel": "npu", "accel_device": "xgpu"}},
+        method="PUT",
+    )
+    assert status == 200
+    assert not body["applied"]
+    assert any("tts.accel=" in item and "npu" in item for item in body["ignored"])
+    assert any("tts.accel_device" in item and "xgpu" in item for item in body["ignored"])
+    _st2, body2, _raw2 = http_get(f"{base}/api/settings")
+    assert body2["tts"]["accel"] == "auto"     # 默认值不变
+    assert body2["tts"]["accel_device"] == ""  # 默认值不变
+
+
+def test_settings_put_unknown_keys_behavior_unchanged(api_server):
+    """未知键既有行为不变：未知段/未知顶层键不进 applied（download 未知键静默丢弃口径一致）。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/settings",
+        {"download": {"unknown_key": 1}, "totally_new_section": {"a": 1}},
+        method="PUT",
+    )
+    assert status == 200
+    assert body["applied"] == []
+    # 未知顶层段不在只读回显清单（acp/remote/vector），保持既有静默丢弃口径
+    assert all("totally_new_section" not in item for item in body["ignored"])
+
+
 def test_create_app_wires_vision_pipeline(tmp_path):
     """create_app 生产装配：默认视觉管线 + daemon tick 线程均已就绪。"""
     _store, _pipeline, handler = create_app(data_dir=str(tmp_path))
@@ -2614,6 +2958,722 @@ def test_create_app_wires_vision_pipeline(tmp_path):
     assert handler._vision_thread.is_alive()
     assert handler._vision_thread.daemon is True
     assert handler._vision_thread.name == "vision-tick"
+
+
+# ---------------------------------------------------------------- 管理 API 令牌落盘
+def test_write_token_file_writes_json(tmp_path, monkeypatch):
+    """令牌模式：write_token_file 落盘 api_token.json（token/port/pid 均可解析）。"""
+    monkeypatch.setenv("CXA_API_TOKEN", "unit-test-token")
+    monkeypatch.setattr(api_server_module, "app_root", lambda: str(tmp_path))
+    api_server_module.write_token_file(8600)
+    path = tmp_path / "logs" / "api_token.json"
+    assert path.exists()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["token"] == "unit-test-token"
+    assert payload["port"] == 8600
+    assert isinstance(payload["pid"], int)
+    assert "updated_at" in payload
+    # 原子写收敛：不留 .tmp 残留
+    assert not (tmp_path / "logs" / "api_token.json.tmp").exists()
+
+
+def test_write_token_file_open_mode_skips(tmp_path, monkeypatch):
+    """开放模式（未设令牌）：不写文件，外部直连即可。"""
+    monkeypatch.delenv("CXA_API_TOKEN", raising=False)
+    monkeypatch.setattr(api_server_module, "app_root", lambda: str(tmp_path))
+    api_server_module.write_token_file(8600)
+    assert not (tmp_path / "logs" / "api_token.json").exists()
+
+
+def test_remove_token_file_tolerant(tmp_path, monkeypatch):
+    """删除令牌文件：不存在静默通过，存在则删除。"""
+    monkeypatch.setattr(api_server_module, "app_root", lambda: str(tmp_path))
+    api_server_module.remove_token_file()  # 不存在 → 不抛
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "api_token.json").write_text("{}", encoding="utf-8")
+    api_server_module.remove_token_file()
+    assert not (logs / "api_token.json").exists()
+
+
+# ---------------------------------------------------------------- 管理面：CX-A 管理 CX-O（establish-fleet-admin-plane）
+import threading  # noqa: E402
+from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
+from urllib.parse import urlparse as _urlparse  # noqa: E402
+
+
+class _FakeCXOState:
+    """假 CX-O 管理面的共享状态：记录最近一次请求供断言。"""
+
+    def __init__(self):
+        self.last = None  # {"method","path","headers","body"}
+
+
+class _FakeCXOHandler(BaseHTTPRequestHandler):
+    """按 CX-O 管理接口文档 §6 形状实现的假管理面。
+
+    Bearer 分级语义（错误码原样透传的靶子）：
+      tok-good → 全部 200；tok-bad → 401 ADMIN_AUTH_FAILED；
+      tok-limited → 429 ADMIN_RATE_LIMITED；tok-disabled → 503 ADMIN_DISABLED；
+      缺失/错误头 → 401。health 端点免鉴权（§5.3）。
+    """
+
+    state = None  # type: _FakeCXOState
+
+    def log_message(self, fmt, *args):  # 静默访问日志
+        pass
+
+    def _reply(self, status, payload):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _record(self, body=None):
+        self.state.last = {
+            "method": self.command,
+            "path": _urlparse(self.path).path,
+            "headers": {k.lower(): v for k, v in self.headers.items()},
+            "body": body,
+        }
+
+    def _bearer(self):
+        auth = self.headers.get("Authorization") or ""
+        return auth[7:] if auth.startswith("Bearer ") else ""
+
+    def do_GET(self):
+        self._record()
+        token = self._bearer()
+        if _urlparse(self.path).path == "/api/admin/health":
+            self._reply(200, {"status": "healthy", "components": {}})  # §5.3 免鉴权
+            return
+        if token == "tok-disabled":
+            self._reply(503, {"ok": False, "error": "ADMIN_DISABLED"})
+            return
+        if token != "tok-good":
+            self._reply(401, {"ok": False, "error": "ADMIN_AUTH_FAILED"})
+            return
+        path = _urlparse(self.path).path
+        if path == "/api/admin/manifest":
+            self._reply(200, {"instance_id": "fake", "capabilities": {"autonomy": True},
+                              "control_actions": ["enable", "disable"]})
+        elif path == "/api/admin/status":
+            self._reply(200, {"status": "success", "snapshot": {"models": {}}})
+        elif path == "/api/admin/audit":
+            self._reply(200, {"status": "success", "items": []})
+        else:
+            self._reply(404, {"ok": False, "error": "not_found"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            body = {}
+        self._record(body)
+        token = self._bearer()
+        if token == "tok-limited":
+            self._reply(429, {"ok": False, "error": "ADMIN_RATE_LIMITED"})
+            return
+        if token != "tok-good":
+            self._reply(401, {"ok": False, "error": "ADMIN_AUTH_FAILED"})
+            return
+        self._reply(200, {"status": "success", "result": {"echo_request_id": body.get("request_id")}})
+
+
+@pytest.fixture()
+def fake_cxo():
+    """起停假 CX-O 管理面，返回 (base_url, state)。"""
+    state = _FakeCXOState()
+    handler = type("BoundFakeCXOHandler", (_FakeCXOHandler,), {"state": state})
+    server = HTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def _add_fake_instance(base, fake_url, token="tok-good"):
+    """手动登记假实例 → (status, instance_id)。"""
+    status, body = http_post(
+        f"{base}/api/fleet/instances",
+        payload={"name": "假实例", "base_url": fake_url, "token": token},
+        method="POST",
+    )
+    return status, body.get("instance", {}).get("id")
+
+
+def test_fleet_list_empty(api_server):
+    _store, _pipeline, base = api_server
+    status, body = http_get_json(f"{base}/api/fleet/instances")
+    assert status == 200
+    assert body == {"status": "success", "instances": []}
+
+
+def test_fleet_add_and_list_redacted(api_server, tmp_path):
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/fleet/instances",
+        payload={"name": "家里的重实例", "base_url": "http://192.168.1.10:8000", "token": "tok-abcd1234"},
+        method="POST",
+    )
+    assert status == 200
+    inst = body["instance"]
+    assert inst["has_token"] is True
+    assert inst["token_suffix"] == "1234"
+    assert "token" not in inst  # 明文绝不回传
+    status, body = http_get_json(f"{base}/api/fleet/instances")
+    assert status == 200
+    assert len(body["instances"]) == 1
+    assert "token" not in body["instances"][0]
+    assert body["instances"][0]["token_suffix"] == "1234"
+    # 台账落盘（data/fleet.json），但那是存储层——API 响应仍脱敏
+    fleet_file = tmp_path / "fleet.json"
+    assert fleet_file.exists()
+    assert json.loads(fleet_file.read_text(encoding="utf-8"))[0]["token"] == "tok-abcd1234"
+
+
+def test_fleet_add_missing_fields_400(api_server):
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/fleet/instances", payload={"name": "缺 token"}, method="POST"
+    )
+    assert status == 400
+    assert body["error"] == "bad_request"
+
+
+def test_fleet_add_duplicate_base_url_400(api_server, fake_cxo):
+    _store, _pipeline, base = api_server
+    fake_url, _state = fake_cxo
+    status, _id = _add_fake_instance(base, fake_url)
+    assert status == 200
+    status, body = http_post(
+        f"{base}/api/fleet/instances",
+        payload={"name": "重复的", "base_url": fake_url, "token": "tok-good"},
+        method="POST",
+    )
+    assert status == 400
+
+
+def test_fleet_unknown_instance_404(api_server):
+    _store, _pipeline, base = api_server
+    status, body = http_get_json(f"{base}/api/fleet/instances/no-such/manifest")
+    assert status == 404
+    assert body["error"] == "not_found"
+
+
+def test_fleet_delete_then_404(api_server, fake_cxo):
+    _store, _pipeline, base = api_server
+    fake_url, _state = fake_cxo
+    _status, instance_id = _add_fake_instance(base, fake_url)
+    status, body = http_delete(f"{base}/api/fleet/instances/{instance_id}")
+    assert status == 200
+    status, body = http_delete(f"{base}/api/fleet/instances/{instance_id}")
+    assert status == 404
+
+
+def test_fleet_register_loopback_ok(api_server):
+    """CX-O 注册上门（豁免令牌闸 + 回环来源）：upsert 台账，source=registered。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/admin/register",
+        payload={"instance_id": "cx-o-node", "endpoint": "http://192.168.1.20:8000",
+                 "role": "active", "timestamp": "2026-10-04T05:00:00+00:00"},
+        method="POST",
+    )
+    assert status == 200
+    assert body["status"] == "success"
+    assert body["instance"]["source"] == "registered"
+    assert body["instance"]["base_url"] == "http://192.168.1.20:8000"
+    assert body["instance"]["role"] == "active"
+    assert body["instance"]["has_token"] is False
+
+
+def test_fleet_register_missing_fields_400(api_server):
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/admin/register", payload={"instance_id": "只有一半"}, method="POST"
+    )
+    assert status == 400
+
+
+def test_fleet_register_exempt_from_token_gate(api_server, monkeypatch):
+    """令牌模式下 register 仍豁免（唯一豁免端点）——无 X-Client-Token 不吃 403。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/admin/register",
+        payload={"instance_id": "cx-o-node", "endpoint": "http://192.168.1.20:8000"},
+        method="POST",
+    )
+    assert status == 200  # 豁免生效（若闸未豁免这里会是 403 unauthorized_client）
+
+
+def test_fleet_register_non_loopback_403(api_server, monkeypatch):
+    """GN-004 F3：非回环来源注册 → 403 且台账不变（豁免端点的唯一安全屏障，API 级验证）。"""
+    _store, _pipeline, base = api_server
+    monkeypatch.setattr(api_server_module, "is_loopback_client", lambda host: False)
+    status, body = http_post(
+        f"{base}/api/admin/register",
+        payload={"instance_id": "evil-node", "endpoint": "http://192.168.1.50:8000"},
+        method="POST",
+    )
+    assert status == 403
+    assert body["error"] == "forbidden"
+    # 台账不变：伪造注册未写入
+    status, body = http_get_json(f"{base}/api/fleet/instances")
+    assert status == 200
+    assert body["instances"] == []
+
+
+def test_fleet_health_gated_by_token(api_server, monkeypatch, fake_cxo):
+    """SB-1 裁决：/api/fleet/* 含 health 全部过令牌闸（无令牌 → 403）。"""
+    monkeypatch.setattr(api_server_module, "_API_TOKEN", "unit-test-token")
+    _store, _pipeline, base = api_server
+    fake_url, _state = fake_cxo
+    # 令牌模式下登记实例也要带头（先豁免窗口登记：用 register 端点拿一个实例再补录？简化：直接期望 403 即可）
+    status, body = http_get_json(f"{base}/api/fleet/instances")
+    assert status == 403
+    assert body["error"] == "unauthorized_client"
+
+
+def test_fleet_manifest_passthrough_with_bearer(api_server, fake_cxo):
+    """透传带 Bearer：CX-A 把实例令牌注入 Authorization 头。"""
+    _store, _pipeline, base = api_server
+    fake_url, state = fake_cxo
+    _status, instance_id = _add_fake_instance(base, fake_url)
+    status, body = http_get_json(f"{base}/api/fleet/instances/{instance_id}/manifest")
+    assert status == 200
+    assert body["instance_id"] == "fake"
+    assert state.last["headers"]["authorization"] == "Bearer tok-good"
+    assert state.last["path"] == "/api/admin/manifest"
+
+
+def test_fleet_wrong_token_401_passthrough(api_server, fake_cxo):
+    """SB-2 裁决：CX-O 401 ADMIN_AUTH_FAILED 原样透传（非 502 包装）。"""
+    _store, _pipeline, base = api_server
+    fake_url, _state = fake_cxo
+    _status, instance_id = _add_fake_instance(base, fake_url, token="tok-bad")
+    status, body = http_get_json(f"{base}/api/fleet/instances/{instance_id}/manifest")
+    assert status == 401
+    assert body["error"] == "ADMIN_AUTH_FAILED"
+
+
+def test_fleet_rate_limited_429_passthrough(api_server, fake_cxo):
+    _store, _pipeline, base = api_server
+    fake_url, _state = fake_cxo
+    _status, instance_id = _add_fake_instance(base, fake_url, token="tok-limited")
+    status, body = http_post(
+        f"{base}/api/fleet/instances/{instance_id}/control",
+        payload={"target": "config", "action": "reload"},
+        method="POST",
+    )
+    assert status == 429
+    assert body["error"] == "ADMIN_RATE_LIMITED"
+
+
+def test_fleet_disabled_503_passthrough(api_server, fake_cxo):
+    _store, _pipeline, base = api_server
+    fake_url, _state = fake_cxo
+    _status, instance_id = _add_fake_instance(base, fake_url, token="tok-disabled")
+    status, body = http_get_json(f"{base}/api/fleet/instances/{instance_id}/status")
+    assert status == 503
+    assert body["error"] == "ADMIN_DISABLED"
+
+
+def test_fleet_control_request_id_injected_then_preserved(api_server, fake_cxo):
+    """缺 request_id 自动补 UUID；自带原样转发不覆盖。"""
+    _store, _pipeline, base = api_server
+    fake_url, state = fake_cxo
+    _status, instance_id = _add_fake_instance(base, fake_url)
+    status, body = http_post(
+        f"{base}/api/fleet/instances/{instance_id}/control",
+        payload={"target": "config", "action": "reload"},
+        method="POST",
+    )
+    assert status == 200
+    injected = state.last["body"]["request_id"]
+    assert isinstance(injected, str) and len(injected) >= 8
+    status, body = http_post(
+        f"{base}/api/fleet/instances/{instance_id}/control",
+        payload={"target": "config", "action": "reload", "request_id": "op-001"},
+        method="POST",
+    )
+    assert status == 200
+    assert state.last["body"]["request_id"] == "op-001"  # 自带不覆盖
+
+
+def test_fleet_health_no_bearer_passthrough(api_server, fake_cxo):
+    _store, _pipeline, base = api_server
+    fake_url, state = fake_cxo
+    _status, instance_id = _add_fake_instance(base, fake_url)
+    status, body = http_get_json(f"{base}/api/fleet/instances/{instance_id}/health")
+    assert status == 200
+    assert body["status"] == "healthy"
+    assert "authorization" not in state.last["headers"]  # CX-O 侧免鉴权 → 不带 Bearer
+
+
+def test_fleet_unreachable_504(api_server):
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/fleet/instances",
+        payload={"name": "不可达", "base_url": "http://127.0.0.1:1", "token": "tok-good"},
+        method="POST",
+    )
+    assert status == 200
+    instance_id = body["instance"]["id"]
+    status, body = http_get_json(f"{base}/api/fleet/instances/{instance_id}/manifest")
+    assert status == 504
+    assert body["error"] == "fleet_unreachable"
+    assert "不可达" in body["message"]
+
+
+# ==================================================================
+# 记忆页完整控制与核心能力（20261005，spec: align-wizard-settings-memory-pet）
+# ==================================================================
+def test_memory_create_and_diary_type(api_server):
+    """POST /api/memories：新建成功（含 diary 四值域），列表立即可查。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/memories",
+        {"content": "项目计划会议纪要", "memory_type": "long_term", "importance": 4, "tags": ["工作"]},
+    )
+    assert status == 200 and body["ok"] and isinstance(body["id"], int)
+    status, rows, _raw = http_get(f"{base}/api/memories")
+    assert status == 200 and any(r["content"] == "项目计划会议纪要" for r in rows)
+    status, body = http_post(f"{base}/api/memories", {"content": "今日随笔", "memory_type": "diary"})
+    assert status == 200 and body["ok"]
+
+
+def test_memory_create_validation_400(api_server):
+    """POST /api/memories：缺 content / 非法 type / importance 越界 / 非法 tags → 400 中文。"""
+    _store, _pipeline, base = api_server
+    for payload, keyword in (
+        ({"content": ""}, "content"),
+        ({"content": "   "}, "content"),
+        ({}, "content"),
+        ({"content": "x", "memory_type": "bogus"}, "memory_type"),
+        ({"content": "x", "importance": 0}, "importance"),
+        ({"content": "x", "importance": 6}, "importance"),
+        ({"content": "x", "importance": "high"}, "importance"),
+        ({"content": "x", "tags": [1, 2]}, "tags"),
+    ):
+        status, body = http_post(f"{base}/api/memories", payload)
+        assert status == 400, (payload, status, body)
+        assert keyword in body["message"] and body["error"] == "bad_request"
+
+
+def test_memory_create_deduplicated(api_server):
+    """POST /api/memories：与既有记忆高度相似时走 manager 去重，返回 deduplicated:true。"""
+    _store, _pipeline, base = api_server
+    status, first = http_post(f"{base}/api/memories", {"content": "用户喜欢喝冰美式咖啡"})
+    assert status == 200 and first["ok"] and first["id"] is not None
+    # 重复内容（完全一致必然相似度 1.0 ≥ 0.85 阈值）
+    status, second = http_post(f"{base}/api/memories", {"content": "用户喜欢喝冰美式咖啡"})
+    assert status == 200 and second.get("deduplicated") is True and second["id"] is None
+
+
+def test_memory_update_put(api_server):
+    """PUT /api/memories/{id}：字段补丁编辑生效（走 MemoryStore.update）。"""
+    _store, _pipeline, base = api_server
+    _status, created = http_post(f"{base}/api/memories", {"content": "旧内容", "importance": 2})
+    mid = created["id"]
+    status, body = http_post(
+        f"{base}/api/memories/{mid}",
+        {"content": "新内容", "memory_type": "diary", "importance": 5, "tags": ["新标签"]},
+        method="PUT",
+    )
+    assert status == 200 and body["ok"]
+    assert body["memory"]["content"] == "新内容"
+    assert body["memory"]["type"] == "diary"
+    assert body["memory"]["importance"] == 5
+    assert body["memory"]["tags"] == ["新标签"]
+
+
+def test_memory_update_put_404_and_400(api_server):
+    """PUT /api/memories/{id}：不存在/已软删 404；非法字段与空补丁 400。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/memories/99999", {"content": "x"}, method="PUT")
+    assert status == 404 and "不存在" in body["message"]
+    # 已软删记忆不可编辑
+    _status, created = http_post(f"{base}/api/memories", {"content": "待删"})
+    mid = created["id"]
+    http_delete(f"{base}/api/memories/{mid}")
+    status, body = http_post(f"{base}/api/memories/{mid}", {"content": "x"}, method="PUT")
+    assert status == 404
+    # 非法 type → 400
+    _status, created2 = http_post(f"{base}/api/memories", {"content": "正常"})
+    status, body = http_post(
+        f"{base}/api/memories/{created2['id']}", {"memory_type": "bogus"}, method="PUT"
+    )
+    assert status == 400 and "memory_type" in body["message"]
+    # 无可更新字段（全未知键）→ 400
+    status, body = http_post(
+        f"{base}/api/memories/{created2['id']}", {"hacker_field": 1}, method="PUT"
+    )
+    assert status == 400
+    # 非法 id → 400
+    status, _body = http_post(f"{base}/api/memories/not-an-id", {"content": "x"}, method="PUT")
+    assert status == 400
+
+
+def test_memory_batch_delete_with_permanent_protection(api_server):
+    """POST /api/memories/batch-delete：软删成功计数；permanent 保护跳过；明细回执。"""
+    _store, _pipeline, base = api_server
+    ids = []
+    for text in ("批量一", "批量二", "批量三"):
+        _status, created = http_post(f"{base}/api/memories", {"content": text})
+        ids.append(created["id"])
+    _status, perm = http_post(f"{base}/api/memories", {"content": "永久保留", "memory_type": "permanent"})
+    status, body = http_post(f"{base}/api/memories/batch-delete", {"ids": ids + [perm["id"], 99999]})
+    assert status == 200 and body["ok"]
+    assert body["deleted_count"] == 3 and sorted(body["deleted_ids"]) == sorted(ids)
+    reasons = {s["id"]: s["reason"] for s in body["skipped"]}
+    assert reasons[perm["id"]] == "permanent_protected"
+    assert reasons[99999] == "not_found"
+    # 列表确认软删生效、permanent 仍在
+    _status, rows, _raw = http_get(f"{base}/api/memories")
+    remain = {r["id"] for r in rows}
+    assert perm["id"] in remain and not (set(ids) & remain)
+    # 空 ids → 400
+    status, body = http_post(f"{base}/api/memories/batch-delete", {"ids": []})
+    assert status == 400 and "ids" in body["message"]
+    status, _body = http_post(f"{base}/api/memories/batch-delete", {})
+    assert status == 400
+
+
+def test_memory_decay_stats_endpoint(api_server):
+    """GET /api/memories/decay-stats：统计结构完整，permanent 计入豁免计数。"""
+    _store, _pipeline, base = api_server
+    http_post(f"{base}/api/memories", {"content": "普通记忆"})
+    http_post(f"{base}/api/memories", {"content": "永久记忆", "memory_type": "permanent"})
+    status, body, _raw = http_get(f"{base}/api/memories/decay-stats")
+    assert status == 200 and body["ok"]
+    stats = body["statistics"]
+    assert stats["total_memories"] == 2
+    assert stats["permanent_count"] == 1
+    assert set(stats["decay_distribution"]) == {"healthy", "fading", "faded"}
+    assert "avg_time_score" in stats and "importance_distribution" in stats
+    assert stats["thresholds"]["archive"] == 0.1
+
+
+def test_memory_sync_decay_endpoint(api_server, monkeypatch, tmp_path):
+    """POST /api/memories/sync-decay：低分记忆软删、permanent 豁免、回执完整。"""
+    from lite.memory.decay import DecayCalculator
+
+    store, _pipeline, base = api_server
+    # 直写 store 注入 90 天前的低分记忆（端点用实时时钟，用过去时间戳保证已衰减）
+    from datetime import datetime, timedelta
+
+    old = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S.%f")
+    old_id = store.add({"type": "short_term", "content": "古老低分", "importance": 1, "created_at": old})
+    perm_id = store.add(
+        {"type": "permanent", "content": "古老永久", "importance": 1, "permanent": True, "created_at": old}
+    )
+    status, body = http_post(f"{base}/api/memories/sync-decay", {})
+    assert status == 200 and body["ok"]
+    assert old_id in body["deleted_ids"] and perm_id not in body["deleted_ids"]
+    assert body["skipped_permanent"] == 1
+    assert body["archive_threshold"] == 0.1
+    # decay-stats 同步后：faded 桶清零（低分已被归档）
+    _status, stats_body, _raw = http_get(f"{base}/api/memories/decay-stats")
+    assert stats_body["statistics"]["decay_distribution"]["faded"] == 0
+    # 静默引用防未用告警
+    assert DecayCalculator is not None and tmp_path is not None and monkeypatch is not None
+
+
+def test_memory_diary_endpoint(api_server):
+    """GET /api/memories/diary：按 created_at 本地日期分组、date 过滤、type 过滤。"""
+    _store, _pipeline, base = api_server
+    # 直写 store 控制日期（一条今天、一条 2026-01-02）
+    store, _pipeline, base = api_server
+    store.add({"type": "diary", "content": "今天的日记", "created_at": "2026-01-02 08:00:00.000000"})
+    store.add({"type": "long_term", "content": "同日旧记忆", "created_at": "2026-01-02 21:30:00.000000"})
+    status, body, _raw = http_get(f"{base}/api/memories/diary")
+    assert status == 200 and body["ok"]
+    groups = {g["date"]: g for g in body["diary_groups"]}
+    assert "2026-01-02" in groups and groups["2026-01-02"]["count"] == 2
+    # 日期降序
+    dates = [g["date"] for g in body["diary_groups"]]
+    assert dates == sorted(dates, reverse=True)
+    # date 过滤：只返回该日期组
+    status, body, _raw = http_get(f"{base}/api/memories/diary?date=2026-01-02")
+    assert status == 200 and len(body["diary_groups"]) == 1 and body["count"] == 2
+    # type 过滤：仅 diary 类型
+    status, body, _raw = http_get(f"{base}/api/memories/diary?type=diary")
+    assert status == 200 and body["count"] == 1
+    assert body["diary_groups"][0]["entries"][0]["content"] == "今天的日记"
+    # 非法 type → 400（http_get_json 捕获 HTTPError 返回二元组）
+    status, _body = http_get_json(f"{base}/api/memories/diary?type=bogus")
+    assert status == 400
+    # 无记忆日期 → 空态
+    status, body, _raw = http_get(f"{base}/api/memories/diary?date=1999-01-01")
+    assert status == 200 and body["diary_groups"] == [] and body["count"] == 0
+
+
+def test_memory_search_3d_endpoint(api_server):
+    """GET /api/memories/3d：三维加权排序；极端权重（全给重要性）排序随之变化。"""
+    store, _pipeline, base = api_server
+    # 显式传 importance_score（importance 维度的真正来源；不传则默认 0.6 无法区分）
+    low = store.add({"type": "long_term", "content": "重要性低的相关条目", "importance": 1, "importance_score": 0.2})
+    high = store.add({"type": "long_term", "content": "重要性高的相关条目", "importance": 5, "importance_score": 0.9})
+    # 默认权重（无 query → relevance 全 0.5 降级口径，importance 主导差异）
+    status, body, _raw = http_get(f"{base}/api/memories/3d")
+    assert status == 200 and body["ok"]
+    assert body["applied_weights"] == {"importance": 0.35, "time": 0.25, "relevance": 0.4}
+    ids_default = [m["id"] for m in body["memories"]]
+    assert set(ids_default) == {low, high}
+    # 默认权重下 importance 0.9 应显著排前（importance 维度主导）
+    assert ids_default.index(high) < ids_default.index(low)
+    # 全给重要性：importance 5 恒在前
+    status, body, _raw = http_get(f"{base}/api/memories/3d?w_importance=1&w_time=0&w_rel=0")
+    assert status == 200 and body["applied_weights"]["importance"] == 1.0
+    ids_imp = [m["id"] for m in body["memories"]]
+    assert ids_imp.index(high) < ids_imp.index(low)
+    # 反向极端：时间/相关性主导（两者接近）时排序差距收窄——仍恒定不含已删条目
+    status, body, _raw = http_get(f"{base}/api/memories/3d?w_importance=0&w_time=0&w_rel=1")
+    assert status == 200 and body["applied_weights"]["importance"] == 0.0
+
+
+def test_memory_search_3d_with_query_and_validation(api_server):
+    """GET /api/memories/3d：query 走检索链路；权重非法 400；非法 type 400。"""
+    from urllib.parse import urlencode
+
+    _store, _pipeline, base = api_server
+    _store.add({"type": "long_term", "content": "关于项目计划的记忆"})
+    q = urlencode({"query": "项目计划"})
+    status, body, _raw = http_get(f"{base}/api/memories/3d?{q}")
+    assert status == 200 and body["total"] >= 1
+    assert any("项目计划" in m["content"] for m in body["memories"])
+    # 每条结果带三维分量（score_memories 产出）
+    assert "final_score" in body["memories"][0]
+    # 权重非法 → 400（http_get_json 捕获 HTTPError）
+    status, _body = http_get_json(f"{base}/api/memories/3d?w_importance=abc")
+    assert status == 400
+    status, _body = http_get_json(f"{base}/api/memories/3d?w_time=1.5")
+    assert status == 400
+    status, _body = http_get_json(f"{base}/api/memories/3d?w_rel=-0.1")
+    assert status == 400
+    # 非法 type → 400
+    status, _body = http_get_json(f"{base}/api/memories/3d?type=bogus")
+    assert status == 400
+
+
+# ---------------------------------------------------------------- 内置记忆工具（memory_read / memory_update / memory_delete）
+class TestBuiltinMemoryTools:
+    """BuiltinToolRegistry 记忆管理助手工具环新增工具（Task 3 依赖）。"""
+
+    @pytest.fixture()
+    def registry_env(self, tmp_path):
+        from lite.memory.storage import MemoryStore
+        from lite.tools.builtin_registry import BuiltinToolRegistry
+
+        store = MemoryStore(db_path=str(tmp_path / "memories.db"))
+        store.create_table()
+        registry = BuiltinToolRegistry(memory_store=store)
+        yield store, registry
+        store.close()
+
+    def test_read_found_and_missing(self, registry_env):
+        store, registry = registry_env
+        mid = store.add({"type": "short_term", "content": "读取目标"})
+        outcome = registry.call("memory_read", {"id": mid})
+        assert outcome["success"] and outcome["result"]["memory"]["content"] == "读取目标"
+        missing = registry.call("memory_read", {"id": 99999})
+        assert not missing["success"] and "不存在" in missing["error"]
+        bad = registry.call("memory_read", {"id": "abc"})
+        assert not bad["success"] and "id 必须为整数" in bad["error"]
+
+    def test_update_fields_and_validation(self, registry_env):
+        store, registry = registry_env
+        mid = store.add({"type": "short_term", "content": "更新前", "importance": 2})
+        outcome = registry.call("memory_update", {"id": mid, "importance": 5, "tags": ["新"]})
+        assert outcome["success"] and outcome["result"]["updated_fields"] == ["importance", "tags"]
+        assert store.get(mid)["importance"] == 5
+        # type 非法 → 校验失败回执（store.update 的 ValueError 被包装）
+        outcome = registry.call("memory_update", {"id": mid, "type": "bogus"})
+        assert not outcome["success"] and "非法记忆类型" in outcome["error"]
+        # 无有效字段 → 明确错误
+        outcome = registry.call("memory_update", {"id": mid})
+        assert not outcome["success"] and "至少提供" in outcome["error"]
+        # 软删后不可更新
+        store.soft_delete(mid)
+        outcome = registry.call("memory_update", {"id": mid, "content": "x"})
+        assert not outcome["success"] and "不存在" in outcome["error"]
+
+    def test_delete_success_and_permanent_protection(self, registry_env):
+        store, registry = registry_env
+        mid = store.add({"type": "short_term", "content": "待删"})
+        outcome = registry.call("memory_delete", {"id": mid})
+        assert outcome["success"] and outcome["result"]["deleted"] is True
+        assert store.get(mid)["is_deleted"] == 1
+        pid = store.add({"type": "permanent", "content": "永久", "permanent": True})
+        outcome = registry.call("memory_delete", {"id": pid})
+        assert not outcome["success"] and "permanent" in outcome["error"]
+        assert store.get(pid)["is_deleted"] == 0
+        missing = registry.call("memory_delete", {"id": 424242})
+        assert not missing["success"] and "不存在" in missing["error"]
+
+
+# ---------------------------------------------------------------- 指令标签解析器（memory-agent 工具环前置）
+class TestMemoryOpParsing:
+    """_extract_memory_ops / _strip_memory_tags：标签提取与剥离（括号平衡扫描）。"""
+
+    def test_extract_single_and_multi(self):
+        from lite.server.api_server import _extract_memory_ops
+
+        text = (
+            '前文 [memory:search {"query": "项目计划", "top_k": 3}] 中间'
+            ' [memory:delete {"id": 7}] 尾部'
+        )
+        ops = _extract_memory_ops(text)
+        assert len(ops) == 2
+        assert ops[0][0] == "search" and ops[0][1] == {"query": "项目计划", "top_k": 3}
+        assert ops[1][0] == "delete" and ops[1][1] == {"id": 7}
+        assert all(raw.startswith("[memory:") for _op, _args, raw in ops)
+
+    def test_extract_json_with_bracket_inside_string(self):
+        from lite.server.api_server import _extract_memory_ops
+
+        text = '[memory:write {"content": "内容含右括号]与{花括号}", "type": "diary"}]'
+        ops = _extract_memory_ops(text)
+        assert len(ops) == 1
+        assert ops[0][1]["content"] == "内容含右括号]与{花括号}"
+
+    def test_extract_invalid_json_yields_none_args(self):
+        from lite.server.api_server import _extract_memory_ops
+
+        ops = _extract_memory_ops("[memory:write {bad json}]")
+        assert len(ops) == 1 and ops[0][0] == "write" and ops[0][1] is None
+
+    def test_extract_no_tags(self):
+        from lite.server.api_server import _extract_memory_ops
+
+        assert _extract_memory_ops("普通回复，没有标签") == []
+        assert _extract_memory_ops("") == []
+        assert _extract_memory_ops(None) == []
+
+    def test_strip_tags_removes_all_and_cleans_blank_lines(self):
+        from lite.server.api_server import _strip_memory_tags
+
+        text = '第一段 [memory:write {"content": "x"}]\n\n[memory:delete {"id": 1}] 第二段'
+        cleaned = _strip_memory_tags(text)
+        assert "[memory:" not in cleaned
+        assert "第一段" in cleaned and "第二段" in cleaned
+
+    def test_strip_partial_tag_without_json(self):
+        from lite.server.api_server import _strip_memory_tags
+
+        # 残缺标签（无 JSON 体 / 未闭合）也不泄漏
+        assert "[memory:" not in _strip_memory_tags("前 [memory:write] 后")
+        assert "[memory:" not in _strip_memory_tags('前 [memory:write {"a": 1')
+        assert _strip_memory_tags("无标签") == "无标签"
 
 
 

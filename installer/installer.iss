@@ -22,7 +22,7 @@
   #define AppVersion "0.1.0"
 #endif
 
-#define MyAppName "CX-A 赛博伴侣"
+#define MyAppName "CX-A"
 #define MyAppPublisher "CX-A"
 #define MyAppExeName "CX-A.exe"
 

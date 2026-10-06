@@ -95,6 +95,10 @@ CHAT_READY_TIMEOUT_S = 300
 #: chat 单次请求超时（秒）——常驻服务已加载模型，仅需覆盖生成本身（慢机留足余量）
 CHAT_REQUEST_TIMEOUT_S = 120
 
+#: 常驻 chat 服务上下文窗口（20261004 Gemma 4）：Gemma 4 KV cache 偏重，显式
+#: 封顶 8192——既覆盖多模态图片 token（单图约数百至上千 token），又防内存爆。
+CHAT_SERVER_N_CTX = 8192
+
 # ------------------------------------------------------------------ #
 # 后端目录解析（20261002 批 A：Vulkan 构建路径选择）                    #
 # ------------------------------------------------------------------ #
@@ -157,6 +161,24 @@ def resolve_llama_dir(root, backend="") -> str:
         LLAMA_SERVER_EXE_NAME, vulkan_dir, base_dir,
     )
     return base_dir
+
+
+def find_mmproj_path(model_path):
+    """探测本地小 LLM 同目录的视觉投影文件（mmproj*.gguf，20261004 Gemma 4 多模态）。
+
+    :param model_path: 主模型 GGUF 绝对路径。
+    :return: str 视觉投影文件绝对路径（字典序第一个命中）；同目录无 mmproj
+        文件或目录不可读时返回 None（纯文本模型，无需挂载）。
+    """
+    try:
+        directory = os.path.dirname(os.path.abspath(str(model_path or "")))
+        for name in sorted(os.listdir(directory)):
+            lowered = name.lower()
+            if lowered.startswith("mmproj") and lowered.endswith(".gguf"):
+                return os.path.join(directory, name)
+    except OSError:
+        return None
+    return None
 
 
 def _char_cost(ch):
@@ -793,12 +815,21 @@ class LlamaServerChat(_LlamaServerProcess):
         )
 
     def _build_argv(self, port):
-        """chat 服务启动 argv（无嵌入专用开关；其余同嵌入服务口径）。"""
-        return [
+        """chat 服务启动 argv（无嵌入专用开关；其余同嵌入服务口径）。
+
+        20261004 Gemma 4 多模态：模型同目录存在 mmproj*.gguf 时自动追加
+        ``--mmproj``——挂载视觉投影后 /v1/chat/completions 可直接接收
+        image_url（base64 data URL）多模态消息；纯文本模型无该文件则不挂载。
+        """
+        argv = [
             self._exe_path, "-m", self._model_path,
             "--host", self._host, "--port", str(port),
             "-c", str(self._n_ctx), "-ngl", str(self._n_gpu_layers), "--no-webui",
         ]
+        mmproj = find_mmproj_path(self._model_path)
+        if mmproj:
+            argv += ["--mmproj", mmproj]
+        return argv
 
     # ------------------------------------------------------------------ #
     # chat 补全                                                            #

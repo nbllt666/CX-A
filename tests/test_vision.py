@@ -273,6 +273,55 @@ class TestAdaptiveSampler:
         with pytest.raises(ValueError):
             AdaptiveSampler(None, high_threshold=0.3, low_threshold=0.5)
 
+    def test_event_carries_image_b64_when_backend_supports(self):
+        """20261004 本地视觉：backend 具备 capture_image_b64 → 事件附带 PNG base64。"""
+        backend = ScriptedBackend([solid_frame(0), solid_frame(255)])
+        backend.capture_image_b64 = lambda max_width=896: "QUJD"
+
+        sampler = AdaptiveSampler(
+            backend, detector=ChangeDetector(width=10, height=10)
+        )
+        sampler.tick(now=0.0)
+        event = sampler.tick(now=2.0)
+        assert event is not None
+        assert event["image_b64"] == "QUJD"
+
+    def test_event_omits_image_b64_when_backend_lacks_capability(self):
+        """backend 无 capture_image_b64（脚本化替身默认）→ 事件不含 image_b64 键。"""
+        backend = ScriptedBackend([solid_frame(0), solid_frame(255)])
+        sampler = AdaptiveSampler(
+            backend, detector=ChangeDetector(width=10, height=10)
+        )
+        sampler.tick(now=0.0)
+        event = sampler.tick(now=2.0)
+        assert event is not None
+        assert "image_b64" not in event
+
+
+class TestPngEncoder:
+    """截图链路 PNG 编码器（纯标准库，20261004 Gemma 4 本地视觉）。"""
+
+    def test_encode_png_base64_produces_valid_png(self):
+        """_encode_png_base64：输出为合法 PNG 结构（magic + IHDR + IEND 终块）。"""
+        import base64
+
+        from lite.vision.screen_backend import _encode_png_base64
+
+        row = bytes([255, 0, 0] * 4)  # 4 像素红色行（RGB 3 字节/像素）
+        b64 = _encode_png_base64([row, row], 4, 2)
+        raw = base64.b64decode(b64)
+        assert raw[:8] == b"\x89PNG\r\n\x1a\n"
+        assert raw.endswith(b"IEND\xaeB`\x82")  # IEND 块（含固定 CRC）
+
+    def test_screen_backend_capture_image_b64_non_windows_returns_none(self):
+        """非 Windows 平台 / GDI 失败 → capture_image_b64 返回 None（不阻断视觉链路）。"""
+        from lite.vision.screen_backend import WindowsGrayscaleScreenBackend
+
+        backend = WindowsGrayscaleScreenBackend()
+        result = backend.capture_image_b64()
+        # CI / 非 Windows 环境必然失败回落 None；Windows 真机返回 base64 字符串
+        assert result is None or isinstance(result, str)
+
 
 # ------------------------------------------------------------------ #
 # 3. VisionClipQueue 有界队列                                          #
@@ -361,7 +410,8 @@ class TestVisionPipeline:
     """采样 → 队列 → 理解 → 沉淀管线。"""
 
     def _make_pipeline(self, tmp_path, frames, *, enabled=True, cloud=None,
-                       understanding=None, sampler_kwargs=None):
+                       understanding=None, sampler_kwargs=None,
+                       local_understanding=None):
         """构造被测管线（脚本化后端 + 临时库 + dict 配置）。"""
         backend = ScriptedBackend(frames)
         sampler = AdaptiveSampler(backend, **(sampler_kwargs or {}))
@@ -370,6 +420,7 @@ class TestVisionPipeline:
         pipeline = VisionPipeline(
             sampler=sampler, cloud=cloud, memory_store=store,
             config=config, understanding=understanding,
+            local_understanding=local_understanding,
         )
         return pipeline, backend, store
 
@@ -500,6 +551,101 @@ class TestVisionPipeline:
         payload = json.dumps(cloud.chat_calls[0], ensure_ascii=False)
         assert VISION_PROMPT in payload
         assert "画面亮度拓扑" in payload
+
+    # -------------------------------------------------------------- 20261004 本地视觉
+    def test_local_understanding_consumes_image_and_skips_cloud(self, tmp_path):
+        """本地视觉优先：事件带截图 → 本地回调收到 image_url 数据 URL，云端零调用。"""
+        captured = {}
+
+        def local_understanding(messages):
+            captured["messages"] = messages
+            return "本地看到的画面"
+
+        backend = ScriptedBackend([solid_frame(0), solid_frame(255)])
+        backend.capture_image_b64 = lambda max_width=896: "QUJD"  # 假 PNG base64
+        sampler = AdaptiveSampler(backend)
+        store = make_memory_store(tmp_path)
+        cloud = MockCloud(online=True)
+        pipeline = VisionPipeline(
+            sampler=sampler, cloud=cloud, memory_store=store,
+            config={"vision": {"enabled": True}},
+            local_understanding=local_understanding,
+        )
+        pipeline.run_once(now=0.0)
+        pipeline.run_once(now=2.0)
+        pipeline.stop()
+
+        memories = store.list(type="short_term")
+        assert len(memories) == 1
+        assert memories[0]["content"] == "本地看到的画面"
+        assert memories[0]["source"] == "vision"
+        # 本地消息为多模态数组：text 提示词 + image_url 数据 URL（截图不上云）
+        content = captured["messages"][0]["content"]
+        assert content[0] == {"type": "text", "text": VISION_PROMPT}
+        assert content[1]["type"] == "image_url"
+        assert content[1]["image_url"]["url"] == "data:image/png;base64,QUJD"
+        assert cloud.chat_calls == []  # 云端零调用（数据不出本机）
+
+    def test_local_unready_falls_back_to_cloud_topology_only(self, tmp_path):
+        """本地未就绪（回调返回 None）→ 回落云端，且云端仅收灰度拓扑、不收截图。"""
+        def local_understanding(messages):
+            return None  # 本地模型未就绪
+
+        backend = ScriptedBackend([solid_frame(0), solid_frame(255)])
+        backend.capture_image_b64 = lambda max_width=896: "QUJD"
+        sampler = AdaptiveSampler(backend)
+        store = make_memory_store(tmp_path)
+        cloud = MockCloud(online=True, chunks=["云端", "描述"])
+        pipeline = VisionPipeline(
+            sampler=sampler, cloud=cloud, memory_store=store,
+            config={"vision": {"enabled": True}},
+            local_understanding=local_understanding,
+        )
+        pipeline.run_once(now=0.0)
+        pipeline.run_once(now=2.0)
+        pipeline.stop()
+
+        memories = store.list(type="short_term")
+        assert len(memories) == 1
+        assert memories[0]["content"] == "云端描述"
+        # 隐私红线：云端消息不含截图 base64（仅灰度拓扑文本）
+        payload = json.dumps(cloud.chat_calls[0], ensure_ascii=False)
+        assert "QUJD" not in payload
+        assert "画面亮度拓扑" in payload
+
+    def test_local_error_falls_back_to_cloud(self, tmp_path, caplog):
+        """本地回调抛异常 → 告警并回落云端（视觉链路不中断）。"""
+        def local_understanding(messages):
+            raise RuntimeError("本地推理服务未启动")
+
+        pipeline, backend, store = self._make_pipeline(
+            tmp_path, [solid_frame(0), solid_frame(255)],
+            cloud=MockCloud(online=True, chunks=["回落", "成功"]),
+            local_understanding=local_understanding,
+        )
+        pipeline.run_once(now=0.0)
+        pipeline.run_once(now=2.0)
+        pipeline.stop()
+
+        memories = store.list(type="short_term")
+        assert len(memories) == 1
+        assert memories[0]["content"] == "回落成功"
+        assert "[VisionPipeline][WARN]" in caplog.text
+
+    def test_local_only_without_cloud_still_settles(self, tmp_path):
+        """仅本地（无 cloud）+ 本地就绪 → 正常沉淀，不触发 CloudUnavailableError。"""
+        pipeline, backend, store = self._make_pipeline(
+            tmp_path, [solid_frame(0), solid_frame(255)],
+            cloud=None,
+            local_understanding=lambda messages: "纯本地描述",
+        )
+        pipeline.run_once(now=0.0)
+        pipeline.run_once(now=2.0)
+        pipeline.stop()
+
+        memories = store.list(type="short_term")
+        assert len(memories) == 1
+        assert memories[0]["content"] == "纯本地描述"
 
     def test_pipeline_reads_config_manager(self, tmp_path):
         """配置载体为 ConfigManager：enabled 判定走 vision 段（热更新段逐次读取）。"""

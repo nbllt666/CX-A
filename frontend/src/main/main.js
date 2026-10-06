@@ -1,9 +1,9 @@
 /**
- * CX-A 赛博伴侣 — Electron 主进程
+ * CX-A — Electron 主进程
  *
  * 职责：
  *  - 拉起 Python 后端服务（127.0.0.1:8600）并等待 /api/health 就绪（打包链路）
- *  - 创建主窗口（伴侣面 / 管理面主视图）
+ *  - 创建主窗口（主视图）
  *  - 创建「桌宠透明悬浮窗」的独立窗口（createPetOverlayWindow / pet-overlay:open IPC）
  *  - 注册 renderer 所需的最小 IPC（app:get-info、pet-overlay:open/close、backend:token）
  *
@@ -18,7 +18,7 @@
  * will-navigate 按 URL 解析精确放行（自身 dist 产物 / dev server origin，D2），
  * setWindowOpenHandler 一律拒绝 window.open。
  */
-const { app, BrowserWindow, ipcMain, dialog, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen, Tray, Menu } = require('electron');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const http = require('http');
@@ -46,6 +46,11 @@ let mainWindow = null;
 let petWindow = null;
 /** 后端子进程引用（仅主进程持有，退出时回收） */
 let backendProcess = null;
+
+/** 系统托盘引用（20261004_模块0_托盘常驻：关窗不退出，常驻后台） */
+let tray = null;
+/** 是否处于退出流程：true 时主窗口 close 不再拦截（托盘「退出」/ app.quit 路径） */
+let appIsQuitting = false;
 
 /**
  * 应用图标路径（build/icon.ico，与前端 BrandMark 同一视觉）。
@@ -279,6 +284,15 @@ function createWindow(options = {}) {
   loadRenderer(win, 'index.html');
   attachNavigationGuards(win);
 
+  // 托盘常驻（20261004_模块0_托盘常驻）：主窗口点 X = 藏入托盘而非退出；
+  // 真退出走托盘「退出」或 app.quit（before-quit 先置 appIsQuitting 放行 close）。
+  win.on('close', (event) => {
+    if (!appIsQuitting) {
+      event.preventDefault();
+      win.hide();
+    }
+  });
+
   win.on('closed', () => {
     if (mainWindow === win) mainWindow = null;
   });
@@ -287,21 +301,22 @@ function createWindow(options = {}) {
 }
 
 /**
- * 桌宠悬浮窗尺寸档位（画面宽 px → 窗口宽高映射，与 PetOverlay 的档位键一一对应）。
- *
- * 推导（与 PetOverlay CSS 对应，写死为查表而非现算）：
- *  - 画面（VRM 容器）宽 = 档位值，高 = round(档位 × 1.05)（VrmAvatar 的取景比例）；
- *  - 窗口宽 = 画面宽 + 根容器左右 padding 14×2 = 档位 + 28；
- *  - 窗口高 = 画面高 + 上下 padding 28 + 底部菜单浮层呼吸余量（约 27~38px），
- *    三档分别取整定值 286 / 366 / 440（余量随档位微调，保证模型不贴边、菜单不溢出）。
+ * 桌宠悬浮窗窗口尺寸（20261003_模块0_桌宠大小滑块化公式化）：
+ * 与 renderer PetOverlay CSS 对应（滑块连续值，非查表）：
+ *  - 画面（VRM 容器）宽 = 传入画布值，高 = round(画布值 × 1.05)（VrmAvatar 的取景比例）；
+ *  - 窗口宽 = 画面宽 + 根容器左右 padding 14×2 = 画布宽 + 28；
+ *  - 窗口高 = 画面高 + 上下 padding 28 + 底部菜单浮层呼吸余量。
+ * @param {number} canvas 画布宽（px）
+ * @returns {{width: number, height: number}}
  */
-const PET_OVERLAY_SIZE_PRESETS = {
-  220: { width: 248, height: 286 },
-  286: { width: 314, height: 366 },
-  360: { width: 388, height: 440 },
-};
+function petWindowSizeFor(canvas) {
+  return {
+    width: canvas + 28,
+    height: Math.round(canvas * 1.05) + 28,
+  };
+}
 
-/** 中档（默认档位）——建窗初始尺寸与 renderer 缺省 size 保持一致 */
+/** 默认画布宽（建窗初始尺寸与 renderer 缺省 size 保持一致） */
 const PET_OVERLAY_DEFAULT_SIZE = 286;
 
 /**
@@ -341,11 +356,11 @@ function createPetOverlayWindow() {
     return petWindow;
   }
 
-  const preset = PET_OVERLAY_SIZE_PRESETS[PET_OVERLAY_DEFAULT_SIZE];
+  const preset = petWindowSizeFor(PET_OVERLAY_DEFAULT_SIZE);
 
   petWindow = new BrowserWindow({
-    width: 320,
-    height: 360,
+    width: preset.width,
+    height: preset.height,
     show: false,
     transparent: true,
     frame: false,
@@ -388,10 +403,75 @@ function closePetOverlayWindow() {
   return true;
 }
 
+// ---------- 托盘常驻（20261004_模块0_托盘常驻与悬浮窗按钮对齐CXO） ----------
+
+/** 显示并聚焦主窗口（托盘菜单 / 悬浮窗「打开主窗口」共用）；主窗口已销毁时重建。 */
+function showMainWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+    return;
+  }
+  mainWindow = createWindow();
+}
+
+/** 按桌宠悬浮窗当前存在性重建托盘菜单（菜单项「桌宠：显示/隐藏」动态标注）。 */
+function updateTrayMenu() {
+  if (!tray) return;
+  const petOpen = Boolean(petWindow && !petWindow.isDestroyed());
+  const menu = Menu.buildFromTemplate([
+    { label: '显示主窗口', click: () => showMainWindow() },
+    {
+      label: petOpen ? '隐藏桌宠' : '显示桌宠',
+      click: () => {
+        togglePetFromTray();
+      },
+    },
+    { type: 'separator' },
+    {
+      label: '退出',
+      click: () => {
+        appIsQuitting = true;
+        app.quit();
+      },
+    },
+  ]);
+  tray.setContextMenu(menu);
+}
+
+/** 托盘桌宠开关：主进程直控窗口显隐，同时通知渲染层同步 localStorage（单一真相源不变）。 */
+function togglePetFromTray() {
+  const open = !(petWindow && !petWindow.isDestroyed());
+  if (open) {
+    createPetOverlayWindow();
+  } else {
+    closePetOverlayWindow();
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('pet:set-enabled', open);
+  }
+  updateTrayMenu();
+}
+
+/** 创建系统托盘（图标缺失时跳过并告警，不影响应用主流程）。 */
+function createTray() {
+  const iconPath = appIconPath();
+  if (!iconPath) {
+    console.warn('[tray] 未找到应用图标（build/icon.ico），托盘不创建');
+    return;
+  }
+  tray = new Tray(iconPath);
+  tray.setToolTip('CX-A');
+  updateTrayMenu();
+  // Windows 惯例：左键单击 = 呼出主窗口
+  tray.on('click', () => showMainWindow());
+}
+
 // ---------- IPC：renderer 最小桥接 ----------
 
 ipcMain.handle('app:get-info', () => ({
-  name: 'CX-A 赛博伴侣',
+  name: 'CX-A',
   version: app.getVersion(),
   platform: process.platform,
 }));
@@ -399,38 +479,107 @@ ipcMain.handle('app:get-info', () => ({
 // 桌宠悬浮窗开关（对应 preload 的 openPetOverlay / closePetOverlay 白名单方法）
 ipcMain.handle('pet-overlay:open', () => {
   createPetOverlayWindow();
+  updateTrayMenu(); // 托盘「桌宠：显示/隐藏」标注跟随
   return true;
 });
-ipcMain.handle('pet-overlay:close', () => closePetOverlayWindow());
-
-// 平移悬浮窗（增量式拖拽）：renderer 在 pointermove 中节流回传像素增量，
-// 主进程取当前坐标直接叠加。非法参数（非有限数字）静默忽略；窗口不存在静默返回。
-ipcMain.handle('pet-overlay:move', (_event, dx, dy) => {
-  if (!petWindow || petWindow.isDestroyed()) return true;
-  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return true;
-  const [x, y] = petWindow.getPosition();
-  petWindow.setPosition(Math.round(x + dx), Math.round(y + dy));
+ipcMain.handle('pet-overlay:close', () => {
+  closePetOverlayWindow();
+  updateTrayMenu();
   return true;
 });
 
-// 换档悬浮窗尺寸：查白名单档位映射（非白名单值一律忽略）；保持窗口中心不变，
-// 并 clamp 到虚拟屏范围内防止窗口被移出屏幕过远。
+// 显示主窗口（悬浮窗菜单「打开主窗口」通道；托盘左键走主进程内 showMainWindow）
+ipcMain.handle('app:show-main', () => {
+  showMainWindow();
+  return true;
+});
+
+// 拖拽主进程化（20261003_模块0_桌宠拖拽主进程化与六档尺寸）：
+// 渲染层只在 pointerdown/up 发 start/end，移动循环全在主进程——
+// 16ms 轮询光标 → setPosition(光标 - 抓取偏移)，消除渲染层→IPC 往返延迟（拖拽跟手关键）。
+// 窗口销毁循环自灭；drag-end 显式停表；循环内 clamp 虚拟屏防拖丢。
+let petDragLoopTimer = null;
+
+function stopPetDragLoop() {
+  if (petDragLoopTimer !== null) {
+    clearInterval(petDragLoopTimer);
+    petDragLoopTimer = null;
+  }
+}
+
+ipcMain.handle('pet-overlay:drag-start', () => {
+  stopPetDragLoop();
+  if (!petWindow || petWindow.isDestroyed()) return false;
+  const cursor = screen.getCursorScreenPoint();
+  const [winX, winY] = petWindow.getPosition();
+  const offsetX = cursor.x - winX;
+  const offsetY = cursor.y - winY;
+  const step = () => {
+    if (!petWindow || petWindow.isDestroyed()) {
+      stopPetDragLoop();
+      return;
+    }
+    const c = screen.getCursorScreenPoint();
+    const [nx, ny] = clampPointToVirtualScreen(
+      Math.round(c.x - offsetX),
+      Math.round(c.y - offsetY),
+      petWindow.getBounds().width,
+      petWindow.getBounds().height,
+    );
+    petWindow.setPosition(nx, ny);
+  };
+  step();
+  petDragLoopTimer = setInterval(step, 16);
+  return true;
+});
+
+ipcMain.handle('pet-overlay:drag-end', () => {
+  stopPetDragLoop();
+  return true;
+});
+
+// 换档悬浮窗尺寸（20261003_模块0_桌宠大小滑块化）：滑块连续可调，
+// 窗口尺寸按公式同步（画布宽 clamp [160,640]；宽=+28、高=round(×1.05)+28，
+// 与 renderer VrmAvatar 取景比例和根容器 padding 对应）。
+// 保持窗口中心不变，并 clamp 到虚拟屏范围内防止窗口被移出屏幕过远。
+/**
+ * 桌宠尺寸上下限按主屏分辨率推导（20261003_模块0_桌宠大小滑块与重出安装程序 追加回合）：
+ *  - 上限：窗口高（画布×1.05 + 28）不超过主屏工作区高的 62%，再钳制 [320, 1440]；
+ *  - 下限：随工作区高缩放（12%），钳制 [120, 280]（太小没法点、太大失去"宠物"感）。
+ * renderer 滑块与窗口 resize 都以此为准（单一真相在主进程）。
+ * @param {number} workAreaHeight 主屏工作区高（px）
+ * @returns {{min: number, max: number}}
+ */
+function petSizeBoundsFor(workAreaHeight) {
+  const max = Math.max(320, Math.min(1440, Math.round((workAreaHeight * 0.62) / 1.05) - 28));
+  const min = Math.max(120, Math.min(280, Math.round(workAreaHeight * 0.12)));
+  return { min, max };
+}
+
+// 注意：Electron Display 对象没有 workAreaHeight 快捷属性，必须取 workArea.height
+// （写成 display.workAreaHeight 会得到 undefined → 全链 NaN → 画布归零）。
+ipcMain.handle('pet-overlay:size-bounds', () =>
+  petSizeBoundsFor(screen.getPrimaryDisplay().workArea.height),
+);
+
 ipcMain.handle('pet-overlay:resize', (_event, size) => {
   if (!petWindow || petWindow.isDestroyed()) return true;
-  // typeof gate 之后按数字查表：数字键不可能命中 __proto__ 等原型链成员
+  // typeof gate 之后按数字校验：非有限值直接忽略，防止 setPosition 写入 NaN
   if (typeof size !== 'number' || !Number.isFinite(size)) return false;
-  const preset = PET_OVERLAY_SIZE_PRESETS[size];
-  if (!preset) return false;
+  const { min, max } = petSizeBoundsFor(screen.getPrimaryDisplay().workArea.height);
+  const canvas = Math.max(min, Math.min(max, Math.round(size)));
+  const width = canvas + 28;
+  const height = Math.round(canvas * 1.05) + 28;
   const oldBounds = petWindow.getBounds();
   const centerX = oldBounds.x + oldBounds.width / 2;
   const centerY = oldBounds.y + oldBounds.height / 2;
   const [nx, ny] = clampPointToVirtualScreen(
-    Math.round(centerX - preset.width / 2),
-    Math.round(centerY - preset.height / 2),
-    preset.width,
-    preset.height,
+    Math.round(centerX - width / 2),
+    Math.round(centerY - height / 2),
+    width,
+    height,
   );
-  petWindow.setBounds({ x: nx, y: ny, width: preset.width, height: preset.height });
+  petWindow.setBounds({ x: nx, y: ny, width, height });
   return true;
 });
 
@@ -439,6 +588,17 @@ ipcMain.handle('voice:pick-folder', async () => {
   const result = await dialog.showOpenDialog({
     title: '选择音色文件夹',
     properties: ['openDirectory'],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return result.filePaths[0];
+});
+
+// 系统文件选择器（桌宠 VRM 模型更换通道）：仅放行 .vrm 后缀；取消或未选返回 null
+ipcMain.handle('pick-vrm-file', async () => {
+  const result = await dialog.showOpenDialog({
+    title: '选择 VRM 模型文件',
+    properties: ['openFile'],
+    filters: [{ name: 'VRM 模型', extensions: ['vrm'] }],
   });
   if (result.canceled || result.filePaths.length === 0) return null;
   return result.filePaths[0];
@@ -476,6 +636,7 @@ app.whenReady().then(() => {
   });
 
   mainWindow = createWindow();
+  createTray();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -492,6 +653,7 @@ app.on('window-all-closed', () => {
 
 // 应用退出前销毁桌宠悬浮窗并回收后端子进程，防止残留孤儿窗口/进程
 app.on('before-quit', () => {
+  appIsQuitting = true; // 放行主窗口 close（藏托盘拦截只在非退出流程生效）
   closePetOverlayWindow();
   stopBackend();
 });

@@ -4,7 +4,9 @@ import {
   getAppInfo,
   openPetOverlay,
   closePetOverlay,
-  movePetOverlay,
+  dragPetOverlayStart,
+  dragPetOverlayEnd,
+  getPetOverlaySizeBounds,
   resizePetOverlay,
   pickVoiceFolder,
 } from '../../src/renderer/bridge';
@@ -24,7 +26,7 @@ describe('bridge.ts 非 Electron 环境（window.cxaAPI 缺失）', () => {
 
   it('getAppInfo() 降级返回 mock AppInfo，不抛异常', async () => {
     await expect(getAppInfo()).resolves.toEqual({
-      name: 'CX-A 赛博伴侣',
+      name: 'CX-A',
       version: '0.1.0',
       platform: 'mock-dev',
     });
@@ -52,13 +54,18 @@ describe('bridge.ts Electron 环境（window.cxaAPI 已 mock）', () => {
     delete (window as { cxaAPI?: unknown }).cxaAPI;
   });
 
-  it('movePetOverlay(dx, dy) 透传像素增量给 cxaAPI 并返回其结果', async () => {
-    const movePetOverlayMock = vi.fn().mockResolvedValue(true);
-    (window as { cxaAPI?: unknown }).cxaAPI = { movePetOverlay: movePetOverlayMock };
+  it('dragPetOverlayStart / dragPetOverlayEnd 透传给 cxaAPI 并返回其结果', async () => {
+    const startMock = vi.fn().mockResolvedValue(true);
+    const endMock = vi.fn().mockResolvedValue(true);
+    (window as { cxaAPI?: unknown }).cxaAPI = {
+      dragPetOverlayStart: startMock,
+      dragPetOverlayEnd: endMock,
+    };
 
-    await expect(movePetOverlay(12, -7)).resolves.toBe(true);
-    expect(movePetOverlayMock).toHaveBeenCalledTimes(1);
-    expect(movePetOverlayMock).toHaveBeenCalledWith(12, -7);
+    await expect(dragPetOverlayStart()).resolves.toBe(true);
+    expect(startMock).toHaveBeenCalledTimes(1);
+    await expect(dragPetOverlayEnd()).resolves.toBe(true);
+    expect(endMock).toHaveBeenCalledTimes(1);
   });
 
   it('resizePetOverlay(size) 透传档位给 cxaAPI 并返回其结果', async () => {
@@ -83,11 +90,23 @@ describe('bridge.ts Electron 环境（window.cxaAPI 已 mock）', () => {
     await expect(pickVoiceFolder()).resolves.toBeNull();
   });
 
-  it('cxaAPI 存在但方法缺失时安全降级：move/resize 返回 false、pickVoiceFolder 返回 null', async () => {
+  it('getPetOverlaySizeBounds 透传 cxaAPI 结果；缺失时回退兜底量程', async () => {
+    const boundsMock = vi.fn().mockResolvedValue({ min: 120, max: 586 });
+    (window as { cxaAPI?: unknown }).cxaAPI = { getPetOverlaySizeBounds: boundsMock };
+    await expect(getPetOverlaySizeBounds()).resolves.toEqual({ min: 120, max: 586 });
+    expect(boundsMock).toHaveBeenCalledTimes(1);
+
+    // preload 旧版本（方法缺失）：回退保守默认量程
+    (window as { cxaAPI?: unknown }).cxaAPI = {};
+    await expect(getPetOverlaySizeBounds()).resolves.toEqual({ min: 160, max: 640 });
+  });
+
+  it('cxaAPI 存在但方法缺失时安全降级：drag/resize 返回 false、pickVoiceFolder 返回 null', async () => {
     // 模拟 preload 旧版本：桥存在但未暴露新方法
     (window as { cxaAPI?: unknown }).cxaAPI = {};
 
-    await expect(movePetOverlay(1, 2)).resolves.toBe(false);
+    await expect(dragPetOverlayStart()).resolves.toBe(false);
+    await expect(dragPetOverlayEnd()).resolves.toBe(false);
     await expect(resizePetOverlay(360)).resolves.toBe(false);
     await expect(pickVoiceFolder()).resolves.toBeNull();
   });

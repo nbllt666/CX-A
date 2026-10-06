@@ -12,8 +12,13 @@
     --onedir --name backend   -> EXE(exclude_binaries=True) + COLLECT(name='backend')
     --paths <项目根>          -> Analysis(pathex=[PROJECT_ROOT])
     --exclude-module X ...    -> Analysis(excludes=[...])
-可选重依赖（funasr/melo/llama_cpp/torch/lancedb/numpy）均为延迟导入、缺失自动
-降级，排除以减小产物体积。
+可选重依赖（funasr/melo/llama_cpp/torch）均为延迟导入、缺失自动降级，排除以减小
+产物体积。
+
+20261005 人类裁决「LanceDB 默认 + 禁止降级」：lancedb / numpy **解除排除**——
+冻结包必须真实可用 LanceVectorStore（lancedb 依赖链 pyarrow/numpy 一并自动跟进
+Analysis），否则启动硬失败（_build_vector_store 禁止降级语义）。体积 +150~250MB
+为既定代价。
 """
 
 import os
@@ -29,11 +34,11 @@ a = Analysis(
     pathex=[PROJECT_ROOT],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['lancedb', 'pyarrow', 'numpy'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['funasr', 'melo', 'llama_cpp', 'torch', 'lancedb', 'numpy'],
+    excludes=['funasr', 'melo', 'llama_cpp', 'torch'],
     noarchive=False,
     optimize=0,
 )

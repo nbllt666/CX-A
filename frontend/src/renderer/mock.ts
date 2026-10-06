@@ -7,7 +7,7 @@
 
 export interface ChatMessage {
   id: string;
-  /** companion = 伴侣回复，me = 用户自己 */
+  /** companion = AI回复，me = 用户自己 */
   role: 'companion' | 'me';
   content: string;
   time: string;

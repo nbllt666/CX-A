@@ -8,7 +8,7 @@
   步骤4 硬件体检与推荐（CPU / 内存 / GPU / 磁盘 → 推荐档位与体积；探测失败降级跳过）
   步骤5 下载线路选择（国内（魔塔，推荐）/ 海外（HuggingFace），默认国内；写
         download.channel，并由线路派生写入 local_llm.source——模型来源不再单独提问）
-  步骤6 本地小 LLM 可选下载引导（建议 1.7B，存 data/local_llm/；
+  步骤6 本地小 LLM 可选下载引导（默认档 Gemma 4 E2B（多模态），存 data/local_llm/；
         downloader 注入时可在向导内真实下载，异常只告警不中断）
   步骤7 完成汇总输出（配置段一览）
 
@@ -316,7 +316,7 @@ class FirstRunDriver:
     # ------------------------------------------------------------------ #
 
     def step_local_llm(self):
-        """本地小 LLM 可选下载引导（模型来源由线路派生、建议 1.7B、存 data/local_llm/）。
+        """本地小 LLM 可选下载引导（模型来源由线路派生、默认档 Gemma 4 E2B、存 data/local_llm/）。
 
         - ``downloader`` 未注入（缺省）：仅打印引导，不做任何网络请求（既有行为）；
         - ``downloader`` 已注入：询问是否现在下载（默认不下载），同意则调用
@@ -329,7 +329,7 @@ class FirstRunDriver:
         channel = normalize_channel(self.cm.get("download", "channel", "mirror"))
         self._output("[引导] 可选：本地小 LLM 下载引导")
         self._output("   - 模型来源：由下载线路派生（国内=魔塔 Modelscope / 海外=HuggingFace）")
-        self._output("   - 建议规格：约 1.7B 参数 GGUF 模型")
+        self._output("   - 默认规格：Gemma 4 E2B 多模态 GGUF 模型（约 2.9GB + 视觉组件）")
         self._output("   - 安装位置：data/local_llm/")
         self._output(f"   - 当前模型来源：{source}；当前下载线路：{channel}")
         if self._downloader is None:
@@ -359,6 +359,19 @@ class FirstRunDriver:
             )
             self.cm.set("local_llm", "model_path", str(path))
             self._output(f"[引导] 下载完成：{path}")
+            # 多模态档位（20261004 Gemma 4）：主模型就位后同仓库下载视觉组件
+            # （落同目录；llama-server --mmproj 挂载后具备看图能力），失败不阻断
+            mmproj_name = info.get("mmproj_filename")
+            if mmproj_name:
+                self._output(f"[引导] 开始下载视觉组件：{mmproj_name}")
+                mmproj_path = self._downloader.download(
+                    info["repo"],
+                    mmproj_name,
+                    source=source,
+                    progress_cb=self._make_progress_cb(),
+                    verify_size_gb=info.get("mmproj_size_gb"),
+                )
+                self._output(f"[引导] 视觉组件下载完成：{mmproj_path}")
         except Exception as exc:  # noqa: BLE001 - 下载失败不阻断引导完成
             self._output(
                 f"[引导] 下载失败（不影响引导完成，可稍后重试）：{type(exc).__name__}: {exc}"

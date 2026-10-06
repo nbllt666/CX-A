@@ -36,7 +36,7 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
     // 根元素可见（React 挂载成功）
     await expect(win.locator('#root')).toBeVisible();
     // title 匹配 index.html <title>
-    await expect(win).toHaveTitle('CX-A 赛博伴侣');
+    await expect(win).toHaveTitle('CX-A');
     // 标志性文案：ChatPage 首屏 heading「聊天」与空态引导
     await expect(win.getByRole('heading', { name: '聊天' })).toBeVisible({ timeout: 20_000 });
     await expect(win.getByText(/还没有聊天记录/)).toBeVisible();
@@ -47,12 +47,13 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
   test('场景2：发送消息后端不可达 → 未送达标记 + 提示条，无伪造回复气泡', async () => {
     const { app, win } = await launchApp();
 
-    const input = win.getByPlaceholder('跟你的伴侣说点什么吧…');
+    const input = win.getByPlaceholder('跟你的AI说点什么吧…');
     await input.waitFor({ state: 'visible', timeout: 20_000 });
     await input.fill('E2E 测试消息');
 
-    // 提示条在首帧即常显（channel 初始 unknown ≠ connected）
-    await expect(win.getByText(/消息暂时送不到/)).toBeVisible();
+    // 本地优先语义（20261002_模块0_聊天提示条）：未发过消息不显示"送不到"提示
+    // （没填云端也能本地聊，首帧常显会误导）；发送失败后才出现
+    await expect(win.getByText(/消息暂时送不到/)).toHaveCount(0);
 
     await win.getByRole('button', { name: '发送', exact: true }).click();
 
@@ -63,7 +64,7 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
     // 连接失败提示条仍在（文案不含技术栈字样）
     await expect(win.getByText(/消息暂时送不到/)).toBeVisible();
 
-    // 无伪造伴侣回复：不存在伴侣气泡头像（lucide Bot 图标）；用户内容气泡保持唯一
+    // 无伪造 AI 回复：不存在 AI 气泡头像（lucide Bot 图标）；用户内容气泡保持唯一
     await expect(win.locator('svg.lucide-bot')).toHaveCount(0);
     const userBubbles = win.getByText('E2E 测试消息');
     await expect(userBubbles).toHaveCount(1);
@@ -140,7 +141,7 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
   test('场景5：手输非法 hash → 地址栏归一回写 #/chat 且聊天页可见', async () => {
     const { app, win } = await launchApp();
 
-    // 模拟地址栏手输非法 hash（不在伴侣面路由表内）
+    // 模拟地址栏手输非法 hash（不在主界面路由表内）
     await win.evaluate(() => {
       window.location.hash = '#/bogus';
     });
@@ -180,7 +181,29 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
     // 输入区与聊天页保持可用（错误分支只写 console，不改 UI 结构）
     await mic.click();
     await expect(win.getByRole('heading', { name: '聊天' })).toBeVisible();
-    await expect(win.getByPlaceholder('跟你的伴侣说点什么吧…')).toBeVisible();
+    await expect(win.getByPlaceholder('跟你的AI说点什么吧…')).toBeVisible();
+
+    await app.close();
+  });
+
+  test('场景7：隐藏入口——连点侧栏 logo 5 次进入管理面（后端不可达降级卡）', async () => {
+    const { app, win } = await launchApp();
+
+    // 隐藏入口（spec add-fleet-frontend-hidden）：3 秒窗口内连点品牌区 5 次
+    const brand = win.getByTestId('sidebar-brand');
+    for (let i = 0; i < 5; i += 1) {
+      await brand.click();
+    }
+
+    // hash 切到 #/fleet 且管理面渲染
+    await expect
+      .poll(() => win.evaluate(() => window.location.hash), { timeout: 10_000 })
+      .toBe('#/fleet');
+
+    // 后端不可达 → 台账呈现中文降级卡（禁 Mock 假数据），页面结构完整
+    await expect(win.getByText(/实例台账暂时读不出来/)).toBeVisible({ timeout: 30_000 });
+    await expect(win.getByRole('button', { name: /刷新/ })).toBeVisible();
+    await expect(win.getByText(/登记实例/)).toBeVisible();
 
     await app.close();
   });

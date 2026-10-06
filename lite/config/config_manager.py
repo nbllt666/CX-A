@@ -77,10 +77,11 @@ DEFAULTS = {
         "model_path": "",
         "backend": "",
     },
-    #: 向量库后端（20260926 起默认 sqlite：<data>/memories.db 内持久向量表，
-    #: 检索口径与 InMemoryVectorStore 逐位一致（cosine））；path 仅在
-    #: backend=lancedb（保留旧口径，要求环境装有 lancedb）时作为 LanceDB 目录。
-    "vector": {"backend": "sqlite", "path": "data/lancedb"},
+    #: 向量库后端（20261005 人类裁决：默认 lancedb 且**禁止降级**——依赖缺失/
+    #: 初始化失败直接启动报错（中文），绝不静默回落 SQLite/内存库；显式配置
+    #: backend=sqlite 的场景走 SQLiteVectorStore 属选择而非降级）。冻结包已收录
+    #: lancedb 依赖（installer/backend.spec 解除排除）。path 为 LanceDB 目录。
+    "vector": {"backend": "lancedb", "path": "data/lancedb"},
     #: 全组件加速模式（性能/节能双模式 spec）：mode 为静态默认；
     #: 安装/首启期由画像经 accel_plan 推导落盘（有独显 → performance；仅核显/无 → eco）。
     #: 归为热更新段——模式切换保存后由应用层按新落点重建语音桥生效。
@@ -98,7 +99,14 @@ DEFAULTS = {
     },
     "asr": {"engine": "sensevoice", "device": "cpu"},
     "vad": {"mode": "webrtc"},
-    "memory": {"max_memories": 30, "dedup": 0.85, "permanent_threshold": 0.95},
+    "memory": {
+        "max_memories": 30,
+        "dedup": 0.85,
+        "permanent_threshold": 0.95,
+        # 聊天记忆注入开关（RAG 闭环，20261005）：开启时每次聊天自动检索
+        # top-8 记忆拼入 system【回忆】块；memory-agent 对话不受此开关影响
+        "context_inject": True,
+    },
     "computer_control": {"authorized": False, "confirm_dangerous": True},
     "sync": {"enabled": False},
     "remote": {"endpoint": "", "enabled": False},

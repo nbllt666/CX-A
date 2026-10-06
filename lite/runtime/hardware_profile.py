@@ -737,19 +737,19 @@ def _accel_profile(plan, device, use_local) -> dict:
 # ------------------------------------------------------------------ #
 
 #: 本地模型推荐档位排序（大 → 小），供磁盘不足逐级降档使用。
-_TIER_ORDER = ("8B", "4B", "1.7B", "0.5B")
+_TIER_ORDER = ("E4B-Q6", "E4B-Q4", "E2B-Q6", "E2B-Q4")
 
 
 def recommend_for(profile, disk_free_gb=None) -> dict:
     """按硬件画像产出推荐配置补丁与本地模型档位。
 
-    阈值口径（spec 冻结）：
+    阈值口径（spec 冻结；20261004 全换 Gemma 4 后档位名随之更新）：
     - ``ram_gb`` 不可得 → 按未知走云保守处理；
-    - ``ram_gb < 8`` → 走云，tier=0.5B，``local_llm.enabled=False``；
-    - ``8 <= ram_gb < 16`` → 本机 cpu + 1.7B；
-    - ``ram_gb >= 16`` → 本机 cpu + 1.7B（无 GPU 不上调档位）；
-    - ``nvidia && vram_gb`` 可得 → gpu 并按显存分档（8B/4B/1.7B），
-      若 ``ram_gb < 16`` 档位最高不超过 4B；
+    - ``ram_gb < 8`` → 走云，tier=E2B-Q4，``local_llm.enabled=False``；
+    - ``8 <= ram_gb < 16`` → 本机 cpu + E2B-Q4；
+    - ``ram_gb >= 16`` → 本机 cpu + E2B-Q4（无 GPU 不上调档位）；
+    - ``nvidia && vram_gb`` 可得 → gpu 并按显存分档（E4B-Q6/E4B-Q4/E2B-Q4），
+      若 ``ram_gb < 16`` 档位最高不超过 E4B-Q4；
     - 磁盘不足（参数优先，否则画像字段）< 档位体积×1.05 → 逐级降档，
       最小档也不足 → 走云并给所需/可用对比。
 
@@ -783,7 +783,7 @@ def recommend_for(profile, disk_free_gb=None) -> dict:
         notes.append(note)
         reasons.append(note)
         return _make_recommendation(
-            use_local=False, device="cpu", tier="0.5B",
+            use_local=False, device="cpu", tier="E2B-Q4",
             config_patch=_build_config_patch(
                 use_local=False, device="cpu", plan=plan, embedding_gpu=False,
             ),
@@ -796,7 +796,7 @@ def recommend_for(profile, disk_free_gb=None) -> dict:
         reason = f"内存仅 {ram_gb:.1f} GB（低于本地推理阈值 8 GB），建议走云端"
         reasons.append(reason)
         return _make_recommendation(
-            use_local=False, device="cpu", tier="0.5B",
+            use_local=False, device="cpu", tier="E2B-Q4",
             config_patch=_build_config_patch(
                 use_local=False, device="cpu", plan=plan, embedding_gpu=False,
             ),
@@ -804,28 +804,28 @@ def recommend_for(profile, disk_free_gb=None) -> dict:
             accel=_accel_profile(plan, device="cpu", use_local=False),
         )
 
-    # ---- 内存充足：默认本机 cpu + 1.7B ----
+    # ---- 内存充足：默认本机 cpu + E2B-Q4 ----
     use_local = True
     # device 委托 accel_plan（唯一真相源）：NVIDIA 显存 ≥4 GB → gpu，否则 cpu
     device = plan["local_llm.device"]
-    tier = "1.7B"
+    tier = "E2B-Q4"
     reasons.append("内存满足本地推理阈值（≥ 8 GB），推荐本机运行本地小 LLM")
 
     # ---- NVIDIA + 显存可得：按显存分档 ----
     if gpu_vendor == "nvidia" and vram_gb is not None:
         if vram_gb >= 10:
-            tier = "8B"
+            tier = "E4B-Q6"
         elif vram_gb >= 6:
-            tier = "4B"
+            tier = "E4B-Q4"
         elif vram_gb >= 4:
-            tier = "1.7B"
+            tier = "E2B-Q4"
         else:
-            tier = "1.7B"  # 显存 < 4：维持 cpu + 1.7B，不上 GPU
+            tier = "E2B-Q4"  # 显存 < 4：维持 cpu + E2B-Q4，不上 GPU
         if vram_gb >= 4:
-            # 内存上限约束：ram < 16 时档位最高不超过 4B
-            if ram_gb < 16 and tier == "8B":
-                tier = "4B"
-                reasons.append("内存低于 16 GB，8B 档受内存上限约束，回落到 4B 档")
+            # 内存上限约束：ram < 16 时档位最高不超过 E4B-Q4
+            if ram_gb < 16 and tier == "E4B-Q6":
+                tier = "E4B-Q4"
+                reasons.append("内存低于 16 GB，E4B-Q6 档受内存上限约束，回落到 E4B-Q4 档")
             reasons.append(
                 f"检测到 NVIDIA GPU（显存约 {vram_gb:.1f} GB），推荐按 {tier} 档显卡推理"
             )
@@ -839,7 +839,7 @@ def recommend_for(profile, disk_free_gb=None) -> dict:
     # ---- 磁盘约束：可用空间 < 档位体积×1.05 → 逐级降档 ----
     if free_gb is not None:
         sizes = {name: _tier_size_gb(name) for name in _TIER_ORDER}
-        if sizes.get("0.5B") is None:
+        if sizes.get("E2B-Q4") is None:
             # 档位表尚未就绪（并行开发）→ 无法评估体积，不做降档，仅记说明
             note = "模型档位表未就绪，无法校验磁盘空间约束"
             notes.append(note)
@@ -853,13 +853,13 @@ def recommend_for(profile, disk_free_gb=None) -> dict:
                     candidate = name
                     break
             if candidate is None:
-                # 连最小档（0.5B）都不足 → 走云，给出所需 / 可用对比
-                min_size = sizes["0.5B"]
+                # 连最小档（E2B-Q4）都不足 → 走云，给出所需 / 可用对比
+                min_size = sizes["E2B-Q4"]
                 use_local = False
-                tier = "0.5B"
+                tier = "E2B-Q4"
                 device = "cpu"
                 reasons.append(
-                    f"磁盘可用空间不足：所需至少 {min_size:.1f} GB（0.5B 档，含 5% 余量），"
+                    f"磁盘可用空间不足：所需至少 {min_size:.1f} GB（E2B-Q4 档，含 5% 余量），"
                     f"实际可用 {free_gb:.1f} GB，建议先走云端"
                 )
             elif _TIER_ORDER.index(candidate) > _TIER_ORDER.index(tier):
@@ -958,6 +958,8 @@ def _resolve_model(tier: str):
         "repo": entry.get("repo"),
         "filename": entry.get("filename"),
         "approximate_size_gb": entry.get("approximate_size_gb"),
+        "mmproj_filename": entry.get("mmproj_filename"),
+        "mmproj_size_gb": entry.get("mmproj_size_gb"),
         "family": entry.get("family"),
         "quant": entry.get("quant"),
     }

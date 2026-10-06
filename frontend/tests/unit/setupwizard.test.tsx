@@ -129,6 +129,17 @@ const DOWNLOADING_PROGRESS: api.ModelProgress = {
   model: null,
 };
 
+/** 下载完成态进度（done）：④步应显示「下一步」主按钮而非「以后再说」 */
+const DONE_PROGRESS: api.ModelProgress = {
+  state: 'done',
+  downloaded: 1000 * 1024 * 1024,
+  total: 1000 * 1024 * 1024,
+  percent: 100,
+  file: 'b.gguf',
+  error: null,
+  model: null,
+};
+
 /**
  * 快车道辅助（推荐 use_local=true）：「就用推荐的」跳过云端步骤，
  * 直达下载线路步骤（展示序号第 3 步，step=2）。
@@ -370,6 +381,33 @@ describe('首启向导（SetupWizard / App 门控）', () => {
     fireEvent.click(screen.getByRole('button', { name: '取消下载' }));
     await waitFor(() => expect(cancelModelDownloadMock).toHaveBeenCalledTimes(1));
     expect(await screen.findByText(/已经停下啦/)).toBeInTheDocument();
+  });
+
+  it('下载完成后显示「下一步」主按钮（不再显示「以后再说」），点击进确认页', async () => {
+    startModelDownloadMock.mockResolvedValue({
+      ok: true,
+      state: 'downloading',
+      already_running: false,
+      model: null,
+    });
+    fetchModelProgressMock.mockResolvedValue(DONE_PROGRESS);
+
+    render(<SetupWizard onDone={vi.fn()} initialStatus={STATUS_REQUIRED} />);
+    await screen.findByText(/跑得动本地小模型/);
+    advanceToDownloadStep();
+
+    fireEvent.click(screen.getByRole('button', { name: '现在下载' }));
+
+    // 完成提示出现；按钮排切换为「下一步」（「以后再说」/「现在下载」消失）
+    expect(await screen.findByText(/下载好啦/)).toBeInTheDocument();
+    const next = screen.getByRole('button', { name: '下一步' });
+    expect(next).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '以后再说' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '现在下载' })).not.toBeInTheDocument();
+
+    // 点击「下一步」进入确认页
+    fireEvent.click(next);
+    expect(screen.getByText(/快好了，确认一下/)).toBeInTheDocument();
   });
 
   it('卸载时清掉进度轮询定时器（不泄漏定时器 / 不再继续请求）', async () => {

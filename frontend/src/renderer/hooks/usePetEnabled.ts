@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { openPetOverlay, closePetOverlay } from '../bridge';
+import { onPetSetEnabled, openPetOverlay, closePetOverlay } from '../bridge';
 
 /**
  * 桌宠开关持久化 key：PetPage 与 SettingsPage 共享同一 local storage 键，
@@ -77,6 +77,20 @@ export function usePetEnabled() {
     };
     window.addEventListener('storage', onStorage);
     return () => window.removeEventListener('storage', onStorage);
+  }, []);
+
+  // 托盘桌宠开关同步（20261004_模块0_托盘常驻）：托盘直控窗口显隐后，主进程
+  // 通知本 hook 对齐 localStorage 与状态——单一真相源仍为渲染层既有链路，
+  // 这里只对齐状态与持久化，不重复发 open/close IPC（窗口已由主进程直控）。
+  useEffect(() => {
+    return onPetSetEnabled((next) => {
+      setEnabledState(next);
+      try {
+        window.localStorage.setItem(PET_ENABLED_KEY, next ? '1' : '0');
+      } catch {
+        /* 存储不可用（隐私模式等）时静默忽略 */
+      }
+    });
   }, []);
 
   return { enabled, setEnabled };

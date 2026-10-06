@@ -3,6 +3,7 @@ import { render, cleanup, waitFor } from '@testing-library/react';
 import VrmAvatar, {
   REASON_BY_STAGE,
   vrmExpressionForMood,
+  nextExposureStep,
 } from '../../src/renderer/components/VrmAvatar';
 import { fetchPetModelBuffer } from '../../src/renderer/api';
 
@@ -88,5 +89,34 @@ describe('REASON_BY_STAGE：三档失败原因文案（用户在失败态唯一�
     expect(REASON_BY_STAGE.parse).toContain('解析失败');
     // 三档文案互不相同（否则用户无法据此区分失败位置）
     expect(new Set(Object.values(REASON_BY_STAGE)).size).toBe(3);
+  });
+});
+
+describe('nextExposureStep：自动曝光单步判定（纯函数）', () => {
+  it('整体偏亮（mean > 190）→ 降曝光', () => {
+    const next = nextExposureStep(230, 0.0, 1.0);
+    expect(next).toBeCloseTo(0.85, 5);
+  });
+
+  it('死白占比 > 10% → 降曝光（即便平均亮度未超标：高光 clamp 是过曝的直接信号）', () => {
+    const next = nextExposureStep(150, 0.15, 1.0);
+    expect(next).toBeCloseTo(0.85, 5);
+  });
+
+  it('整体偏暗（mean < 70）→ 升曝光（旧模型偏暗方向）', () => {
+    const next = nextExposureStep(50, 0.0, 1.0);
+    expect(next).toBeCloseTo(1.15, 5);
+  });
+
+  it('正常区间（70 ≤ mean ≤ 190 且死白占比 ≤ 10%）→ null（收敛停止）', () => {
+    expect(nextExposureStep(128, 0.02, 1.0)).toBeNull();
+    // 边界值本身属于正常区间
+    expect(nextExposureStep(70, 0.1, 1.0)).toBeNull();
+    expect(nextExposureStep(190, 0.1, 1.0)).toBeNull();
+  });
+
+  it('曝光 clamp 到 [0.5, 2.0]：已到下限仍偏亮不再降、已到上限仍偏暗不再升', () => {
+    expect(nextExposureStep(240, 0.3, 0.4)).toBe(0.5); // 下限兜住
+    expect(nextExposureStep(30, 0.0, 1.9)).toBe(2.0); // 上限兜住
   });
 });

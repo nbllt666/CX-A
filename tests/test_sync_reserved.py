@@ -27,11 +27,14 @@ from lite.memory.storage import MemoryStore
 _LITE_DIR = Path(__file__).resolve().parents[1] / "lite"
 _MEMORY_DIR = _LITE_DIR / "memory"
 
-# 同步执行函数签名：实现同步逻辑才会出现的任务函数定义
+# 同步执行函数签名：实现**跨设备记忆同步**逻辑才会出现的任务函数定义。
+# 20261005 收窄：原通配 "def sync_" 误伤衰减同步 sync_decay（本地数据维护动作，
+# 与跨设备同步无关，见 .trae/specs/align-wizard-settings-memory-pet）；改为锚定
+# 记忆同步语义的具名模式（sync/pull/push_memories 等）。
 _SYNC_FN_PATTERNS = (
-    "def sync_",
-    "def pull(",
-    "def push(",
+    "def sync_memories",
+    "def pull_memories",
+    "def push_memories",
     "def merge_sync",
     "def import_sync",
     "def export_sync",
@@ -170,6 +173,7 @@ def test_sync_columns_only_definition_and_pass_through():
     for pat in _SYNC_FN_PATTERNS:
         assert pat not in schema_src
         assert pat not in storage_src
-    # MemoryStore 公开 API 面仅为 CRUD/软删/列表，不提供 pull/push/sync 动作
-    for forbid in ("def pull", "def push", "def sync"):
+    # MemoryStore 公开 API 面仅为 CRUD/软删/列表/衰减维护，不提供跨设备同步动作
+    # （20261005 收窄口径同上：sync_decay 为衰减同步，非跨设备同步）
+    for forbid in ("def pull_memories", "def push_memories", "def sync_memories"):
         assert forbid not in storage_src, f"storage.py 不应提供同步动作 API {forbid!r}"

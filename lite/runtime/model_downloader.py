@@ -6,7 +6,7 @@
   HuggingFace 恒用官方端点 ``https://huggingface.co``（国内路线下载魔塔，不经
   ``hf-mirror.com``，端点不再随配置派生）；
 - **格式**：GGUF（供 llama.cpp / LlamaRuntime 消费）；
-- **尺寸建议**：~1.7B（判定够快 + 断网兜底够用）；
+- **尺寸建议**：Gemma 4 E2B（原生多模态，判定够快 + 断网兜底够用）；
 - **存储**：``data/local_llm/``。
 
 设计要点（对齐 C2 必做清单）：
@@ -63,68 +63,80 @@ _SOURCE_ALIASES = {
     "HF": "huggingface",
 }
 
-#: 默认模型档位（缺省 tier=None 时的回落档，保持既有 1.7B 基线行为不变）
-DEFAULT_TIER = "1.7B"
+#: 默认模型档位（缺省 tier=None 时的回落档；20261004 全换 Gemma 4 后取最轻量档）
+DEFAULT_TIER = "E2B-Q4"
 
-#: 模型档位表（Task 5 冻结口径，Task 12 按联网实测校正）：档位标识 -> 仓库 / 文件名 / 体积 / 适用门槛。
+#: 模型档位表（20261004 全换 Gemma 4）：档位标识 -> 仓库 / 文件名 / 体积 / 适用门槛。
 #:
-#: ✅ 【已联网验证 2026-09-19】四个档位的 ``repo`` 与 ``filename`` 均经两侧站点逐档核实：
-#: HuggingFace ``/api/models/<repo>/tree/main`` 与魔塔 ``/repo/files`` 文件清单命中，
-#: 并以 ``Range: bytes=0-0`` 试探真实下载 URL 得到 206 与实际字节数；
-#: ``approximate_size_gb`` 为实测字节数折算（非参数量粗估——该值同时作为下载后
-#: 大小校验基准，粗估会导致校验失败）。
+#: ✅ 【已联网验证 2026-10-04】四个档位全部改用 Gemma 4（原生多模态）：
+#: ``repo`` 与 ``filename`` 均经两侧站点逐档核实——HuggingFace
+#: ``/api/models/<repo>/tree/main`` 与魔塔 ``/repo/files`` 文件清单命中，
+#: 字节数取自 HF tree API 实测 LFS size（该值同时作为下载后大小校验基准）。
+#: 视觉投影文件 ``mmproj-BF16.gguf``（视觉理解组件）与主模型同仓库同目录下载，
+#: 体积同样实测（E2B 仓 0.919 GB / E4B 仓 0.923 GB）。
 #:
 #: 核实要点（易错处，改动本表前请重新核实）：
-#: - 各系列命名并不统一：Qwen1.5 用下划线（``qwen1_5-1_8b``）、Qwen3 用大写连字符
-#:   （``Qwen3-4B-Q4_K_M``）、Qwen2.5 小尺寸用全小写点号（``qwen2.5-0.5b``）；
-#: - 必须避开**分片文件**（如 Qwen2.5-7B 的 q4_k_m 为 ``-00001-of-00002`` 两片），
-#:   本下载器按单文件下载，无法拼装分片；顶层档因此选用官方 8B 单文件仓库。
+#: - Gemma 4 Q6 档文件名为 ``Q6_K``（无 ``_M`` 后缀），与 Qwen 系 ``Q4_K_M`` 命名不同；
+#: - mmproj-BF16 两档通用（与主模型量化无关），但**各仓只配自己仓库的 mmproj**；
+#: - 必须避开分片文件：本下载器按单文件下载，无法拼装分片（四个档位均为单文件）。
 #:
 #: 字段说明：
 #: - ``repo``：``org/name`` 双段 GGUF 仓库（须通过 ``_validate_repo``）；
-#: - ``filename``：强制 ``.gguf`` 后缀（须通过 ``_validate_filename``）；
-#: - ``approximate_size_gb``：Q4_K_M 量化下的**实测**体积（供磁盘预检 / 下载后校验 / 展示）；
+#: - ``filename``：主模型文件名（强制 ``.gguf`` 后缀，须通过 ``_validate_filename``）；
+#: - ``mmproj_filename``：视觉投影文件名（多模态必备；llama-server 经
+#:   ``--mmproj`` 挂载后具备看图能力）；
+#: - ``mmproj_size_gb``：视觉投影文件实测体积（下载校验基准）；
+#: - ``approximate_size_gb``：主模型实测体积（供磁盘预检 / 下载后校验 / 展示，
+#:   不含视觉组件体积）；
 #: - ``ram_requirement_gb``：建议系统内存门槛（GB），供推荐逻辑读取；
 #: - ``vram_requirement_gb``：建议显存门槛（GB），0 表示纯 CPU 也可跑；
 #: - ``description``：面向用户的口语化「适用机器」中文说明。
 MODEL_TIERS = {
-    "0.5B": {
-        "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-        "filename": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-        "approximate_size_gb": 0.458,
-        "ram_requirement_gb": 4,
-        "vram_requirement_gb": 0,
-        "description": "约 0.5GB，内存 4GB 起的轻量机器也能跑，响应最快，适合兜底与低配设备。",
-    },
-    "1.7B": {
-        "repo": "Qwen/Qwen1.5-1.8B-Chat-GGUF",
-        "filename": "qwen1_5-1_8b-chat-q4_k_m.gguf",
-        "approximate_size_gb": 1.134,
+    "E2B-Q4": {
+        "repo": "unsloth/gemma-4-E2B-it-GGUF",
+        "filename": "gemma-4-E2B-it-Q4_K_M.gguf",
+        "mmproj_filename": "mmproj-BF16.gguf",
+        "mmproj_size_gb": 0.919,
+        "approximate_size_gb": 2.894,
         "ram_requirement_gb": 8,
         "vram_requirement_gb": 0,
-        "description": "约 1.1GB，内存 8GB 起的普通家用机器即可流畅运行，速度与质量均衡（推荐默认档）。",
+        "description": "约 2.9GB（另需约 0.9GB 视觉组件），内存 8GB 起的普通家用机器即可流畅运行，自带看图能力，速度与质量均衡（推荐默认档）。",
     },
-    "4B": {
-        "repo": "Qwen/Qwen3-4B-GGUF",
-        "filename": "Qwen3-4B-Q4_K_M.gguf",
-        "approximate_size_gb": 2.326,
+    "E2B-Q6": {
+        "repo": "unsloth/gemma-4-E2B-it-GGUF",
+        "filename": "gemma-4-E2B-it-Q6_K.gguf",
+        "mmproj_filename": "mmproj-BF16.gguf",
+        "mmproj_size_gb": 0.919,
+        "approximate_size_gb": 4.193,
         "ram_requirement_gb": 16,
-        "vram_requirement_gb": 4,
-        "description": "约 2.3GB，建议内存 16GB（或 4GB 以上显存）的机器，回答质量更好，适合日常主力使用。",
+        "vram_requirement_gb": 0,
+        "description": "约 4.2GB（另需约 0.9GB 视觉组件），建议内存 16GB 的机器，回答质量更高，同样自带看图能力。",
     },
-    "8B": {
-        "repo": "Qwen/Qwen3-8B-GGUF",
-        "filename": "Qwen3-8B-Q4_K_M.gguf",
-        "approximate_size_gb": 4.682,
+    "E4B-Q4": {
+        "repo": "unsloth/gemma-4-E4B-it-GGUF",
+        "filename": "gemma-4-E4B-it-Q4_K_M.gguf",
+        "mmproj_filename": "mmproj-BF16.gguf",
+        "mmproj_size_gb": 0.923,
+        "approximate_size_gb": 4.635,
         "ram_requirement_gb": 16,
         "vram_requirement_gb": 8,
-        "description": "约 4.7GB，建议内存 16GB 且带 8GB 以上显存的高配机器，效果最好但占用与耗时更高。",
+        "description": "约 4.6GB（另需约 0.9GB 视觉组件），建议内存 16GB 且带 8GB 以上显存的机器，能力更强，适合日常主力使用。",
+    },
+    "E4B-Q6": {
+        "repo": "unsloth/gemma-4-E4B-it-GGUF",
+        "filename": "gemma-4-E4B-it-Q6_K.gguf",
+        "mmproj_filename": "mmproj-BF16.gguf",
+        "mmproj_size_gb": 0.923,
+        "approximate_size_gb": 6.589,
+        "ram_requirement_gb": 16,
+        "vram_requirement_gb": 8,
+        "description": "约 6.6GB（另需约 0.9GB 视觉组件），建议内存 16GB 且带 8GB 以上显存的高配机器，效果最好但占用与耗时更高。",
     },
 }
 
-#: 各档位的推荐理由文案（仅 1.7B 沿用既有基线原文，其余按档位说明自动生成）
+#: 各档位的推荐理由文案（仅默认档写明取舍理由，其余按档位说明自动生成）
 _TIER_REASONS = {
-    "1.7B": "1.7B 判定够快 + 断网兜底够用（工程文档 §4.4）",
+    "E2B-Q4": "E2B-Q4 判定够快 + 断网兜底够用 + 原生看图（多模态）",
 }
 
 #: 从 GGUF 文件名中提取量化标识（如 q4_k_m），用于推导 quant 字段
@@ -562,7 +574,7 @@ class LlmDownloader:
         """把档位标识归一化为 ``MODEL_TIERS`` 的规范键（strip + 大小写归一）。
 
         Args:
-            tier: 档位标识（如 ``"1.7B"`` / ``"1.7b"`` / ``" 1.7B "``）；
+            tier: 档位标识（如 ``"E2B-Q4"`` / ``"e2b-q4"`` / ``" E2B-Q4 "``）；
                 ``None`` 时回落 ``DEFAULT_TIER``。
         Returns:
             str: ``MODEL_TIERS`` 中的规范档位键。
@@ -577,22 +589,23 @@ class LlmDownloader:
                 return tkey
         available = " / ".join(sorted(MODEL_TIERS))
         raise ValueError(
-            f"未知模型档位：{tier!r}。可用档位：{available}（例如 \"1.7B\"）。"
+            f"未知模型档位：{tier!r}。可用档位：{available}（例如 \"E2B-Q4\"）。"
             "请传入上述档位之一，不会静默下载错误的模型文件。"
         )
 
     @staticmethod
     def suggest_model(source="modelscope", tier=None) -> dict:
-        """返回指定下载源与档位的推荐小 LLM 信息（Qwen 系 GGUF）。
+        """返回指定下载源与档位的推荐小 LLM 信息（Gemma 4 多模态 GGUF）。
 
         Args:
             source: 下载源（modelscope / huggingface）。
-            tier: 模型档位标识（``"0.5B"`` / ``"1.7B"`` / ``"4B"`` / ``"8B"``）。
-                接受 strip + 大小写归一后的宽容解析（如 ``" 1.7b "``）；``None``
-                时回落默认档 ``"1.7B"``（保持既有默认行为与既有测试通过）。
+            tier: 模型档位标识（``"E2B-Q4"`` / ``"E2B-Q6"`` / ``"E4B-Q4"`` /
+                ``"E4B-Q6"``）。接受 strip + 大小写归一后的宽容解析（如
+                ``" e2b-q4 "``）；``None`` 时回落默认档 ``"E2B-Q4"``。
         Returns:
-            dict: 含 source、repo、filename、approximate_size_gb、disclaimer、
-                url_hint、note 等字段。大小为近似估算，实际以仓库为准。
+            dict: 含 source、repo、filename、approximate_size_gb、mmproj_filename、
+                mmproj_size_gb、disclaimer、url_hint、note 等字段。大小为实测
+                折算的参考值，实际以仓库为准。
         Raises:
             ValueError: tier 归一后不在 MODEL_TIERS 中时抛出（中文错误，列出可用档位）。
         """
@@ -607,7 +620,7 @@ class LlmDownloader:
         filename = entry["filename"]
         family = _family_from_repo(repo)
         quant = _quant_from_filename(filename) or "Q4_K_M"
-        reason = _TIER_REASONS.get(tier_key, f"{tier_key} 档位，Qwen 系 {filename}")
+        reason = _TIER_REASONS.get(tier_key, f"{tier_key} 档位，Gemma 4 {filename}")
         info = {
             "repo": repo,
             "filename": filename,
@@ -617,9 +630,14 @@ class LlmDownloader:
             "reason": reason,
             "tier": tier_key,
             "description": entry["description"],
-            "disclaimer": "approximate_size_gb 为按仓库实测字节数折算的参考值，实际以仓库当前文件为准；"
-                          "四档 repo / 文件名已于 2026-09-19 经 HuggingFace 与魔塔两侧站点核实可下载。",
+            "disclaimer": "approximate_size_gb 为按仓库实测字节数折算的参考值（不含视觉组件），"
+                          "实际以仓库当前文件为准；四档 repo / 文件名 / 视觉组件已于 2026-10-04 "
+                          "经 HuggingFace 与魔塔两侧站点核实可下载。",
         }
+        # 多模态档位：附视觉投影文件信息（下载器按同仓库同目录双文件下载）
+        if entry.get("mmproj_filename"):
+            info["mmproj_filename"] = entry["mmproj_filename"]
+            info["mmproj_size_gb"] = entry.get("mmproj_size_gb")
         if src == "modelscope":
             info.update(
                 source="modelscope",

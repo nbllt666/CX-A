@@ -33,7 +33,42 @@ DEFAULT_VOICE = "cx-open"
 # 首次初始化时注入的默认种子 Agent
 DEFAULT_SEED_ID = "default"
 DEFAULT_SEED_NAME = "软软"
-DEFAULT_SEED_PERSONA = "温柔可靠的赛博伴侣，话少但事事记在心上"
+DEFAULT_SEED_PERSONA = "话不多但事事记在心上，安静又可靠"
+
+# 历史版本默认种子人设（20261004 文案去定义化）：加载时对 default 种子做
+# 精确匹配迁移——仅当人设仍等于旧版默认原文时替换为新默认，用户自定义
+# 人设一律不动。此处保留旧文案原文属迁移判据，非产品文案。
+_LEGACY_SEED_PERSONAS = (
+    "温柔可靠的赛博伴侣，话少但事事记在心上",
+    "温柔可靠的桌面伴侣，话少但事事记在心上",
+)
+
+# ---------------------------------------------------------------- 记忆管理助手（20261005，spec: align-wizard-settings-memory-pet）
+# 内置管理通道 agent：记忆页「记忆管理助手」对话入口复用 /api/chat/message
+# 链路（agent_id=memory-agent），后端解析回复中的 [memory:op {...}] 指令标签
+# 经 BuiltinToolRegistry 记忆工具执行（见 api_server._handle_chat_message）。
+MEMORY_AGENT_ID = "memory-agent"
+MEMORY_AGENT_NAME = "记忆管理助手"
+
+# 指令协议 persona（中文）：向 LLM 说明可用 [memory:op {...}] 标签与操作集。
+# 标签语法对齐既有 [emotion:x] 自造协议先例；op 与 BuiltinToolRegistry 工具一一对应。
+MEMORY_AGENT_PERSONA = (
+    "你是记忆管理助手，负责帮用户整理、检索、新增、修改和删除记忆。"
+    "你可以通过在回复中输出指令标签来操作记忆库，系统会执行指令并把结果回注给你，"
+    "然后你再根据结果用中文向用户汇报。指令标签格式为 [memory:op {json参数}]，"
+    "可用操作如下：\n"
+    "- [memory:search {\"query\": \"关键词\", \"top_k\": 5}] 按关键词检索记忆；\n"
+    "- [memory:read {\"id\": 3}] 按 id 查看某条记忆详情；\n"
+    "- [memory:write {\"content\": \"记忆内容\", \"type\": \"long_term\", "
+    "\"importance\": 3, \"tags\": [\"标签\"]}] 新增记忆"
+    "（type 可选 long_term/short_term/permanent/diary，importance 为 1~5）；\n"
+    "- [memory:update {\"id\": 3, \"content\": \"新内容\"}] 修改记忆"
+    "（可改 content/type/importance/tags）；\n"
+    "- [memory:delete {\"id\": 3}] 删除一条记忆（permanent 类型会被系统拒绝）。\n"
+    "使用规则：一条回复可以包含零个或多个指令标签；标签必须独占输出、不要向用户"
+    "展示标签本身；等系统回注执行结果后，用自然语言总结结果；若某条指令执行失败，"
+    "用中文向用户说明失败原因，不要重复输出失败指令超过一次。"
+)
 
 
 class Agent:
@@ -227,8 +262,8 @@ class AgentManager:
             raw_list = None
 
         if raw_list is None:
-            # 首次初始化：创建含默认种子的空列表
-            self._agents = [self._seed_agent()]
+            # 首次初始化：创建含默认种子（软软）与内置记忆管理助手（memory-agent）的列表
+            self._agents = [self._seed_agent(), self._memory_seed_agent()]
             self._save()
             return
 
@@ -248,15 +283,45 @@ class AgentManager:
         if not any(a.id == DEFAULT_SEED_ID for a in self._agents):
             self._agents.append(self._seed_agent())
             self._save()
+        # 内置记忆管理助手幂等补种（20261005）：既有 agents.json（无 memory-agent）
+        # 升级路径与用户误删后重载恢复——管理通道 agent 不随用户删除而消失
+        if not any(a.id == MEMORY_AGENT_ID for a in self._agents):
+            self._agents.append(self._memory_seed_agent())
+            self._save()
+        # 历史默认人设迁移（20261004 文案去定义化）：精确匹配才替换，自定义不动
+        for agent in self._agents:
+            if agent.id == DEFAULT_SEED_ID and agent.persona in _LEGACY_SEED_PERSONAS:
+                agent.persona = DEFAULT_SEED_PERSONA
+                agent.updated_at = datetime.now().isoformat()
+                self._save()
+                break
 
     @staticmethod
     def _seed_agent():
-        """构造默认种子 Agent（温柔可靠的赛博伴侣「软软」）。"""
+        """构造默认种子 Agent（「软软」）。"""
         now = datetime.now().isoformat()
         return Agent(
             id=DEFAULT_SEED_ID,
             name=DEFAULT_SEED_NAME,
             persona=DEFAULT_SEED_PERSONA,
+            voice=DEFAULT_VOICE,
+            enabled=True,
+            created_at=now,
+            updated_at=now,
+        )
+
+    @staticmethod
+    def _memory_seed_agent():
+        """构造内置记忆管理助手种子 Agent（memory-agent，20261005）。
+
+        管理通道内置 agent：缺失时在 _load 中幂等补种（含用户删除后重载恢复），
+        persona 为 [memory:op {...}] 指令协议说明（见 MEMORY_AGENT_PERSONA）。
+        """
+        now = datetime.now().isoformat()
+        return Agent(
+            id=MEMORY_AGENT_ID,
+            name=MEMORY_AGENT_NAME,
+            persona=MEMORY_AGENT_PERSONA,
             voice=DEFAULT_VOICE,
             enabled=True,
             created_at=now,

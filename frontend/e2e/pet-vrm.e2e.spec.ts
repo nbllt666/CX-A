@@ -81,6 +81,14 @@ async function startBackend(): Promise<void> {
     ? (JSON.parse(fs.readFileSync(rootConfig, 'utf-8')) as Record<string, unknown>)
     : {};
   base.setup = { ...((base.setup as Record<string, unknown>) ?? {}), completed: true };
+  // 嵌入禁止降级（20261005）：后端无嵌入模型会启动失败——显式指向 bundled 真
+  // 嵌入模型（装机同款文件），e2e 走真实嵌入链路（llama-server 本机就绪）
+  base.embedding = {
+    ...((base.embedding as Record<string, unknown>) ?? {}),
+    model_path: path.join(
+      PROJECT_ROOT, 'installer', 'bundled', 'embedding_model', 'Qwen3-Embedding-0.6B-Q8_0.gguf',
+    ),
+  };
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cxa-pet-e2e-'));
   const configPath = path.join(tmpDir, 'config.json');
   fs.writeFileSync(configPath, JSON.stringify(base, null, 2), 'utf-8');
@@ -202,9 +210,16 @@ test.describe.serial('VRM 桌宠渲染链路 E2E', () => {
       // canvas 真实存在且按 286px 宽取景（悬浮窗内的显示尺寸，与 dpr 无关）
       const canvas = overlay.locator('.cx-vrm-host canvas');
       await expect(canvas).toHaveCount(1);
-      const box = await canvas.boundingBox();
-      expect(box).not.toBeNull();
-      expect(Math.round(box?.width ?? 0)).toBe(286);
+      // 建窗/量程校准存在异步窗口尺寸过渡，轮询等待取景稳定（一次性测量会偶发拿到 0）
+      await expect
+        .poll(
+          async () => {
+            const box = await canvas.boundingBox();
+            return Math.round(box?.width ?? 0);
+          },
+          { timeout: 15_000, intervals: [250, 500, 1_000] },
+        )
+        .toBe(286);
 
       // ---- 应用内桌宠页同样要真·3D（两个承载点都渲染 VRM，330px） ----
       await win.getByRole('button', { name: /桌宠/ }).first().click();
@@ -216,36 +231,52 @@ test.describe.serial('VRM 桌宠渲染链路 E2E', () => {
       const pageBox = await pageCanvas.boundingBox();
       expect(Math.round(pageBox?.width ?? 0), '桌宠页 canvas 显示宽度应为 330').toBe(330);
 
-      // ---- 悬浮窗交互闭环（菜单改版）：默认菜单收起 → 点本体弹出 → 心情/说话/大小/关闭 ----
+      // ---- 悬浮窗交互闭环（六项菜单）：默认收起 → 点本体弹出 → 六个功能入口 ----
       // 交互改版后无常驻按钮排：菜单默认收起（挂载后不可见），点击桌宠本体弹出
       await expect(overlay.locator('.pet-overlay-menu')).toHaveCount(0);
       await overlay.locator('.pet-overlay-stage').click();
       await expect(overlay.locator('.pet-overlay-menu')).toBeVisible();
 
-      // 表情：菜单内点「开心」→ data-mood 写入本体（VRM 预设表情随之切换），选中态高亮
-      await overlay.getByRole('button', { name: '开心' }).click();
-      await expect(overlay.locator('.pet-overlay-stage')).toHaveAttribute('data-mood', 'happy');
-      await overlay.getByRole('button', { name: '平静' }).click();
+      // 打开主窗口（对齐 CX-O 应用控制语义）：主窗口保持可见，悬浮窗本体不受影响
+      await overlay.getByRole('button', { name: '打开主窗口' }).click();
+      await expect(win.locator('#root')).toBeVisible();
+      // 表情按钮已按 CX-O 语义移除：data-mood 固定 calm（VRM 常态表情）
       await expect(overlay.locator('.pet-overlay-stage')).toHaveAttribute('data-mood', 'calm');
+      await expect(overlay.getByRole('button', { name: '开心' })).toHaveCount(0);
+      await expect(overlay.getByRole('button', { name: '平静' })).toHaveCount(0);
 
-      // 说话 toggle：data-talking false → true（口型开合由 data-talking 驱动）
+      // 说话 = 语音输入开关（20261004 语义改版，不再是口型动画）。真实录音
+      // 依赖物理麦克风（环境相关），这里不断言按下态——语音闭环的确定性行为
+      // （录音→识别→发送→朗读→表情/历史同步）由组件级单测 petoverlay-voice 覆盖。
       await expect(overlay.locator('.pet-overlay')).toHaveAttribute('data-talking', 'false');
-      await overlay.getByRole('button', { name: '说话' }).click();
-      await expect(overlay.locator('.pet-overlay')).toHaveAttribute('data-talking', 'true');
 
-      // 大小切换：点「小」→ .cx-vrm 内联样式宽变 220px，canvas 实宽跟随
+      // 六项菜单齐全（打开主窗口/说话/屏幕共享/操作授权/大小/关闭）
+      for (const name of ['说话', '屏幕共享', '操作授权', '大小', '关闭']) {
+        await expect(overlay.getByRole('button', { name })).toBeVisible();
+      }
+
+      // 大小：滑块连续调节（React 受控 range，需原生 setter + input 事件）
+      // canvas 宽度实时跟随；窗口尺寸由主进程按公式同步（画布+28 / ×1.05+28）
       // （VrmAvatar 以 key={size} 重挂载，模型字节走模块级缓存，无 loading 间隙）
-      await overlay.getByRole('button', { name: '小' }).click();
-      await expect(overlay.locator('.cx-vrm')).toHaveAttribute('style', /width:\s*220px/);
+      const sizeSlider = overlay.locator('.pet-overlay-slider input');
+      const setSize = (value: number) =>
+        sizeSlider.evaluate((el, v) => {
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+            ?.set;
+          setter?.call(el, String(v));
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        }, value);
+      await setSize(360);
+      await expect(overlay.locator('.cx-vrm')).toHaveAttribute('style', /width:\s*360px/);
       await expect(overlay.locator('.cx-vrm-host canvas')).toBeVisible();
-      const smallBox = await overlay.locator('.cx-vrm-host canvas').boundingBox();
-      expect(Math.round(smallBox?.width ?? 0), '小档 canvas 显示宽度应为 220').toBe(220);
-      // 切回中档：宽度回到 286px（applySize 同步写 localStorage『cx-a.petSize』）
-      await overlay.getByRole('button', { name: '中' }).click();
+      const bigBox = await overlay.locator('.cx-vrm-host canvas').boundingBox();
+      expect(Math.round(bigBox?.width ?? 0), '滑块 360 时 canvas 显示宽度应为 360').toBe(360);
+      // 回默认中档：宽度回到 286px（applySize 同步写 localStorage『cx-a.petSize』）
+      await setSize(286);
       await expect(overlay.locator('.cx-vrm')).toHaveAttribute('style', /width:\s*286px/);
       await expect(overlay.locator('.cx-vrm-host canvas')).toBeVisible();
       const midBox = await overlay.locator('.cx-vrm-host canvas').boundingBox();
-      expect(Math.round(midBox?.width ?? 0), '中档 canvas 显示宽度应为 286').toBe(286);
+      expect(Math.round(midBox?.width ?? 0), '滑块 286 时 canvas 显示宽度应为 286').toBe(286);
 
       // ready 态全程保持（交互 + 档位重挂载不得把渲染打回失败/加载）
       await expect(overlay.locator('[data-vrm-state="ready"]')).toBeAttached();

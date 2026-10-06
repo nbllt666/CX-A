@@ -50,7 +50,20 @@ class RemoteUnreachable(Exception):
 
 
 class RemoteError(Exception):
-    """远端返回非 2xx 响应（未授权 / 服务内部错误等）时抛出的异常。"""
+    """远端返回非 2xx 响应（未授权 / 服务内部错误等）时抛出的异常。
+
+    20261004_模块0_管理面CX-A管理CX-O 向后兼容扩展：可选携带结构化
+    ``status_code`` 与 ``payload``——FleetManager 透传 CX-O 管理端点时据此
+    把远端 HTTP 状态码与 ADMIN_* 错误码**原样透传**给调用方（非 502 包装）。
+    既有仅消息字符串的抛出点不受影响（两个扩展字段默认 None）。
+    """
+
+    def __init__(self, message, status_code=None, payload=None):
+        super().__init__(message)
+        #: 远端原始 HTTP 状态码（结构化，供 API 层透传；None = 未携带）
+        self.status_code = status_code
+        #: 远端响应体（已解析 JSON 或 {"status":..,"reason":..} 兜底）
+        self.payload = payload
 
 
 class RemoteTransport:
@@ -64,13 +77,15 @@ class RemoteTransport:
     隧道，鉴权要求对齐 CX-O 管理文档。
     """
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, headers=None):
         """发起一次远端请求并返回解析后的 JSON dict（抽象方法）。
 
         Args:
             method: HTTP 方法（GET / POST / ...）。
             path: 请求路径；对 HTTP 实现即完整 URL（endpoint + path）。
             body: 可选的 JSON 请求体（dict 或 None）。
+            headers: 可选的额外请求头（20261004_模块0_管理面CX-A管理CX-O
+                扩展：FleetManager 据此注入 Authorization: Bearer）。
 
         Returns:
             dict: 解析后的 JSON 响应。
@@ -93,7 +108,7 @@ class HTTPRemoteTransport(RemoteTransport):
     RemoteUnreachable。
     """
 
-    def request(self, method, url, json_body=None, timeout=10):
+    def request(self, method, url, json_body=None, timeout=10, headers=None):
         """发起一次 HTTP 请求并返回解析后的 JSON（覆盖基类抽象方法）。
 
         Args:
@@ -101,6 +116,8 @@ class HTTPRemoteTransport(RemoteTransport):
             url: 完整请求 URL（endpoint + path）。
             json_body: 可选的 JSON 请求体（None 表示无体）。
             timeout: 请求超时秒数。
+            headers: 可选的额外请求头（20261004 扩展：FleetManager 注入
+                Authorization: Bearer 等鉴权头；None 表示无额外头）。
 
         Returns:
             dict: 解析后的 JSON 响应；响应体非 JSON 时返回 {"raw": <body>}。
@@ -110,11 +127,11 @@ class HTTPRemoteTransport(RemoteTransport):
             urllib.error.URLError / OSError / TimeoutError: 连接失败或超时。
         """
         data = None
-        headers = {}
+        req_headers = dict(headers) if headers else {}
         if json_body is not None:
             data = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            req_headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
         try:

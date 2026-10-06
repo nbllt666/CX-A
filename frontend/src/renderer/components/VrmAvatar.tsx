@@ -34,6 +34,16 @@ import { fetchPetModelBuffer } from '../api';
  * 不同模型身高 / 缩放差异极大，禁止写死单一距离：加载后对 vrm.scene 取包围盒，
  * 依实际高度与相机 FOV 反算取景距离，保证「任何模型都完整可见」。
  *
+ * ============ 自动曝光 ============
+ * 不同模型材质亮度差异极大：旧模型（CX-OPEN）偏暗需强光硬拉，而材质亮度正常的
+ * 模型（CX-A_S 及任意用户导入的 .vrm）在同等光照下必然过曝死白——写死光照参数
+ * 只能适配单一模型。故在模型与相机就位后渲染一帧做亮度采样（autoExpose）：
+ * 偏亮 → 调低 toneMappingExposure，偏暗 → 调高，clamp 到 [0.5, 2.0]、最多
+ * EXPOSURE_MAX_ITER 次迭代；判定逻辑为纯函数 nextExposureStep（单测直接覆盖）。
+ * 配合 Khronos PBR Neutral 色调映射（THREE.NeutralToneMapping，只对超出白点的
+ * 高光做柔和滚降、不改中间调色彩与饱和度，比 ACES 更适合动漫 MToon 渲染）兜底
+ * 高光边缘。灯光基准相应回调至接近 @pixiv/three-vrm 官方口径（单灯 π≈3.14）。
+ *
  * ============ 每帧更新 ============
  * 表情 / 看向 / 弹簧骨均依赖 vrm.update(delta)，必须每帧调用（用 THREE.Clock 求 delta）。
  *
@@ -72,6 +82,11 @@ interface VrmAvatarProps {
   talking: boolean;
   /** 画面宽度（px），高度按 1.05 比例跟随 */
   size?: number;
+  /**
+   * 模型代际计数（可选，默认 0）：变化时作废模块级缓存并重新拉取模型
+   * （更换桌宠模型后立即生效；PetPage / PetOverlay 经 petModelReload 总线递增）。
+   */
+  reloadKey?: number;
 }
 
 /**
@@ -107,6 +122,12 @@ const BLUSH_CANDIDATES = ['blush', 'Blush', 'cheek', 'Cheek', 'cheekColor'];
 const LOAD_ATTEMPTS = 6;
 const LOAD_RETRY_DELAY_MS = 1500;
 
+/** 自动曝光的迭代上限（见 autoExpose：防极端贴图模型下曝光调整震荡发散） */
+const EXPOSURE_MAX_ITER = 6;
+/** 自动曝光的曝光量边界（见 nextExposureStep：既不许过暗也不许无限提亮） */
+const EXPOSURE_MIN = 0.5;
+const EXPOSURE_MAX = 2.0;
+
 /**
  * 模型字节的模块级缓存（约 15MB）。
  *
@@ -117,6 +138,12 @@ const LOAD_RETRY_DELAY_MS = 1500;
  * 注意：主窗口与悬浮窗是两个渲染进程，各自持有独立缓存实例，互不影响。
  */
 let modelBufferCache: ArrayBuffer | null = null;
+
+/**
+ * 缓存对应的模型代际（reloadKey）：换模型后旧代际字节必须作废——缓存命中
+ * 需同时满足「有缓存」且「代际一致」，否则丢弃旧缓存重新拉取。
+ */
+let modelBufferCacheGen: number | null = null;
 
 /** 可被 abort 打断的等待：中止时立即返回，避免卸载后仍挂着定时器。 */
 function delay(ms: number, signal: AbortSignal): Promise<void> {
@@ -146,14 +173,18 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
  * 成功后写入缓存。同一 ArrayBuffer 可被多次消费——three 的 GLTFLoader.parse 不会
  * transfer/detach 输入 buffer，但保守起见 parse 统一传副本，缓存原件零风险。
  */
-async function loadModelBufferWithRetry(signal: AbortSignal): Promise<ArrayBuffer> {
-  if (modelBufferCache) return modelBufferCache;
+async function loadModelBufferWithRetry(signal: AbortSignal, gen: number): Promise<ArrayBuffer> {
+  if (modelBufferCache && modelBufferCacheGen === gen) return modelBufferCache;
+  // 代际不匹配（模型被更换）→ 先作废旧缓存再拉取新模型
+  modelBufferCache = null;
+  modelBufferCacheGen = null;
   let lastError: unknown = null;
   for (let attempt = 0; attempt < LOAD_ATTEMPTS; attempt += 1) {
     if (signal.aborted) break;
     try {
       const buffer = await fetchPetModelBuffer(signal);
       modelBufferCache = buffer; // fetch 成功 → 写入模块级缓存，后续挂载零请求
+      modelBufferCacheGen = gen;
       return buffer;
     } catch (err) {
       lastError = err;
@@ -229,7 +260,72 @@ function setExpressionValue(
   }
 }
 
-export default function VrmAvatar({ mood, talking, size = 220 }: VrmAvatarProps) {
+/**
+ * 自动曝光的单步判定（纯函数，供单测直接覆盖）。
+ *
+ * 输入为一次渲染帧的亮度统计（sRGB 0~255 口径）：
+ * - mean：模型像素（透明背景除外）的平均亮度；
+ * - overRatio：死白像素（亮度 > 250）占比——漫反射高光被 clamp 成纯白的直接信号。
+ *
+ * 判定：偏亮（mean > 190 或 overRatio > 0.10）→ 曝光 ×0.85；偏暗（mean < 70）→
+ * 曝光 ×1.15；正常区间 → 返回 null（收敛停止）。结果 clamp 到 [EXPOSURE_MIN, EXPOSURE_MAX]。
+ */
+export function nextExposureStep(
+  mean: number,
+  overRatio: number,
+  exposure: number,
+): number | null {
+  if (overRatio > 0.1 || mean > 190) {
+    return Math.max(EXPOSURE_MIN, exposure * 0.85);
+  }
+  if (mean < 70) {
+    return Math.min(EXPOSURE_MAX, exposure * 1.15);
+  }
+  return null;
+}
+
+/**
+ * 自动曝光：模型与相机就位后，同步渲染一帧并降采样统计亮度，按 nextExposureStep
+ * 迭代调整 toneMappingExposure，直至落进正常区间或达到 EXPOSURE_MAX_ITER 次上限。
+ *
+ * 为什么在启动动画循环前同步做：曝光只取决于「灯光 × 材质」，加载后算一次即可；
+ * 每帧重算既浪费又可能在透明背景占比波动时引起亮度跳动。采样经 drawImage 把
+ * WebGL 画布拷到 2D canvas 再 getImageData（64×64）——在同一同步流程内 render 后
+ * 立即拷贝无需 preserveDrawingBuffer。取不到 2D 上下文 / 画面全透明（相机没框住
+ * 模型）时静默放弃，保持曝光基准 1.0。
+ */
+function autoExpose(
+  renderer: THREE.WebGLRenderer,
+  scene: THREE.Scene,
+  camera: THREE.PerspectiveCamera,
+): void {
+  const probe = document.createElement('canvas');
+  probe.width = 64;
+  probe.height = 64;
+  const pctx = probe.getContext('2d', { willReadFrequently: true });
+  if (!pctx) return;
+  for (let i = 0; i < EXPOSURE_MAX_ITER; i += 1) {
+    renderer.render(scene, camera);
+    pctx.drawImage(renderer.domElement, 0, 0, probe.width, probe.height);
+    const { data } = pctx.getImageData(0, 0, probe.width, probe.height);
+    let sum = 0;
+    let count = 0;
+    let over = 0;
+    for (let p = 0; p < data.length; p += 4) {
+      if (data[p + 3] < 16) continue; // 透明背景（清屏 alpha=0）不参与统计
+      const lum = 0.2126 * data[p] + 0.7152 * data[p + 1] + 0.0722 * data[p + 2];
+      sum += lum;
+      count += 1;
+      if (lum > 250) over += 1;
+    }
+    if (!count) return; // 全透明：模型未入画，不做亮度判断
+    const next = nextExposureStep(sum / count, over / count, renderer.toneMappingExposure);
+    if (next === null) return; // 已收敛到正常区间
+    renderer.toneMappingExposure = next;
+  }
+}
+
+export default function VrmAvatar({ mood, talking, size = 220, reloadKey = 0 }: VrmAvatarProps) {
   const [state, setState] = useState<VrmState>('loading');
   /** 不支持态的原因文案（按失败阶段给出中文说明） */
   const [failReason, setFailReason] = useState<string>('');
@@ -239,9 +335,9 @@ export default function VrmAvatar({ mood, talking, size = 220 }: VrmAvatarProps)
   const talkingRef = useRef<boolean>(talking);
   const prevExprRef = useRef<string | null>(null);
 
-  // ---- 初始化一次：创建渲染器 → 取模型 → 解析 → 自适应相机 → 启动动画循环 ----
-  // 依赖为空：模型只取一次。PetOverlay 换尺寸档位时经 key={size} 重挂载本组件、
-  // effect 会重跑，但模型字节命中模块级缓存（见 modelBufferCache），零请求零等待。
+  // ---- 初始化：创建渲染器 → 取模型 → 解析 → 自适应相机 → 启动动画循环 ----
+  // 依赖为 [reloadKey]：模型代际变化（更换桌宠模型）时清理旧渲染并按新代际重新拉取；
+  // 其余重挂载（PetOverlay 换尺寸档位经 key={size}）命中模块级缓存（代际一致），零请求零等待。
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -301,6 +397,10 @@ export default function VrmAvatar({ mood, talking, size = 220 }: VrmAvatarProps)
         renderer.setClearAlpha(0);
         renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
         renderer.outputColorSpace = THREE.SRGBColorSpace;
+        // PBR Neutral 色调映射：只压超出白点的高光、不改中间调色彩（动漫渲染不降饱和），
+        // 与 autoExpose 配合兜底高光死白；曝光基准 1.0，实际值由 autoExpose 收敛。
+        renderer.toneMapping = THREE.NeutralToneMapping;
+        renderer.toneMappingExposure = 1.0;
         renderer.setSize(width, height);
         const canvas = renderer.domElement;
         canvas.style.width = '100%';
@@ -313,19 +413,22 @@ export default function VrmAvatar({ mood, talking, size = 220 }: VrmAvatarProps)
         camera = new THREE.PerspectiveCamera(30, width / height, 0.01, 200);
 
         // 光照：three r155+ 起采用**物理光照单位**（useLegacyLights 已移除），旧的
-        // 低强度值（≈1）会渲染得明显发灰发暗——实测首版即是该问题（模型偏暗）。
-        // 故按新单位给足亮度：环境光兜底 + 主光塑形 + 正面补光防半脸发黑。
-        scene.add(new THREE.AmbientLight(0xffffff, 2.4));
-        const keyLight = new THREE.DirectionalLight(0xffffff, 2.6);
+        // 低强度值（≈1）会渲染得明显发灰发暗。但历史值（2.4/2.6/1.2）是为救旧模型
+        // 「偏暗」拉满的，对材质亮度正常的模型（CX-A_S 及任意用户导入模型）必然
+        // 过曝死白。现回调到接近 @pixiv/three-vrm 官方口径（单灯 π≈3.14）的温和
+        // 三点布光基准；最终整体亮度由 autoExpose 按模型实际渲染结果自动收敛。
+        scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+        const keyLight = new THREE.DirectionalLight(0xffffff, 2.2);
         keyLight.position.set(0.6, 1.4, 1.6);
         scene.add(keyLight);
-        const fillLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        const fillLight = new THREE.DirectionalLight(0xffffff, 0.9);
         fillLight.position.set(-0.9, 0.8, 1.4);
         scene.add(fillLight);
 
-        // 取模型字节（HTTP，带 X-Client-Token，带退避重试以跨过后端启动窗口期）
+        // 取模型字节（HTTP，带 X-Client-Token，带退避重试以跨过后端启动窗口期；
+        // 传入当前代际 reloadKey——代际变化时旧缓存作废、重新拉取新模型）
         stage = 'model';
-        const buffer = await loadModelBufferWithRetry(aborter.signal);
+        const buffer = await loadModelBufferWithRetry(aborter.signal, reloadKey);
         if (disposed) return;
 
         stage = 'parse';
@@ -375,6 +478,10 @@ export default function VrmAvatar({ mood, talking, size = 220 }: VrmAvatarProps)
           boxCenter.z,
         );
         camera.updateProjectionMatrix();
+
+        // 自动曝光：按本模型实际渲染亮度收敛 toneMappingExposure（过亮压 / 过暗提，
+        // 见 autoExpose 说明）——任意材质亮度的模型都能落进正常观感区间
+        autoExpose(renderer, scene, camera);
 
         vrmRef.current = vrm;
         if (disposed) {
@@ -450,7 +557,7 @@ export default function VrmAvatar({ mood, talking, size = 220 }: VrmAvatarProps)
       disposeAll();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [reloadKey]);
 
   // 心情联动：写入 VRM 表情（缺失静默降级），并清掉上一档权重
   useEffect(() => {

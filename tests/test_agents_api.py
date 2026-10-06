@@ -61,7 +61,8 @@ def test_list_seed(api_server):
     status, body = http_request(f"{base}/api/agents")
     assert status == 200
     assert isinstance(body, list)
-    assert len(body) == 1
+    # 20261005：内置种子为 default（软软）+ memory-agent（记忆管理助手）
+    assert len(body) == 2
     assert body[0]["id"] == "default"
     assert body[0]["name"] == "软软"
 
@@ -81,9 +82,9 @@ def test_create_agent(api_server):
     assert agent["enabled"] is True
     assert agent["id"].startswith("agent-")
 
-    # 列表现在有 2 个
+    # 列表现在有 3 个（default + memory-agent + 新建）
     status, body = http_request(f"{base}/api/agents")
-    assert len(body) == 2
+    assert len(body) == 3
 
 
 def test_create_missing_persona_400(api_server):
@@ -173,7 +174,7 @@ def test_list_bad_enabled_400(api_server):
 # ---------------------------------------------------------------- 中文 UTF-8 往返
 def test_agents_chinese_utf8(api_server):
     _store, _pipeline, _manager, base = api_server
-    chinese = "温柔可靠的赛博伴侣，话少但事事记在心上"
+    chinese = "温柔可靠，话少但事事记在心上"
     _st, created = http_request(
         f"{base}/api/agents", payload={"name": "软软", "persona": chinese}, method="POST"
     )

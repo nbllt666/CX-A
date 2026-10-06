@@ -46,7 +46,7 @@ async function main() {
   await win.locator('#root').waitFor({ state: 'visible', timeout: 20_000 });
   const title = await win.title();
   log(`STEP2 主窗口就绪 title="${title}" #root 可见`);
-  if (title !== 'CX-A 赛博伴侣') throw new Error(`title 不符: ${title}`);
+  if (title !== 'CX-A') throw new Error(`title 不符: ${title}`);
 
   // 3. 截图留证
   const shotPath = path.join(OUT_DIR, 'test3_smoke_main_window.png');

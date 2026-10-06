@@ -19,35 +19,43 @@ import types
 
 from lite.runtime import hardware_profile as hp
 
-#: 档位替身表（含 repo / filename / 预估体积），仅用于测试注入。
+#: 档位替身表（含 repo / filename / 视觉组件 / 预估体积），仅用于测试注入。
 _FAKE_TIERS = {
-    "0.5B": {
-        "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-        "filename": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-        "approximate_size_gb": 0.4,
-        "family": "Qwen2.5-0.5B",
+    "E2B-Q4": {
+        "repo": "unsloth/gemma-4-E2B-it-GGUF",
+        "filename": "gemma-4-E2B-it-Q4_K_M.gguf",
+        "mmproj_filename": "mmproj-BF16.gguf",
+        "mmproj_size_gb": 0.919,
+        "approximate_size_gb": 2.894,
+        "family": "gemma-4-E2B-it",
         "quant": "Q4_K_M",
     },
-    "1.7B": {
-        "repo": "Qwen/Qwen1.5-1.8B-Chat-GGUF",
-        "filename": "qwen1_5-1_8b-chat-q4_k_m.gguf",
-        "approximate_size_gb": 1.7,
-        "family": "Qwen1.5-1.8B",
+    "E2B-Q6": {
+        "repo": "unsloth/gemma-4-E2B-it-GGUF",
+        "filename": "gemma-4-E2B-it-Q6_K.gguf",
+        "mmproj_filename": "mmproj-BF16.gguf",
+        "mmproj_size_gb": 0.919,
+        "approximate_size_gb": 4.193,
+        "family": "gemma-4-E2B-it",
+        "quant": "Q6_K",
+    },
+    "E4B-Q4": {
+        "repo": "unsloth/gemma-4-E4B-it-GGUF",
+        "filename": "gemma-4-E4B-it-Q4_K_M.gguf",
+        "mmproj_filename": "mmproj-BF16.gguf",
+        "mmproj_size_gb": 0.923,
+        "approximate_size_gb": 4.635,
+        "family": "gemma-4-E4B-it",
         "quant": "Q4_K_M",
     },
-    "4B": {
-        "repo": "Qwen/Qwen3-4B-GGUF",
-        "filename": "qwen3-4b-q4_k_m.gguf",
-        "approximate_size_gb": 2.7,
-        "family": "Qwen3-4B",
-        "quant": "Q4_K_M",
-    },
-    "8B": {
-        "repo": "Qwen/Qwen3-8B-GGUF",
-        "filename": "Qwen3-8B-Q4_K_M.gguf",
-        "approximate_size_gb": 4.682,
-        "family": "Qwen3-8B",
-        "quant": "Q4_K_M",
+    "E4B-Q6": {
+        "repo": "unsloth/gemma-4-E4B-it-GGUF",
+        "filename": "gemma-4-E4B-it-Q6_K.gguf",
+        "mmproj_filename": "mmproj-BF16.gguf",
+        "mmproj_size_gb": 0.923,
+        "approximate_size_gb": 6.589,
+        "family": "gemma-4-E4B-it",
+        "quant": "Q6_K",
     },
 }
 
@@ -146,14 +154,14 @@ def test_recommend_insufficient_memory_goes_cloud(monkeypatch):
     result = hp.recommend_for(profile)
 
     assert result["use_local"] is False
-    assert result["tier"] == "0.5B"
+    assert result["tier"] == "E2B-Q4"
     assert result["config_patch"]["local_llm"] == {"enabled": False, "device": "cpu"}
     assert result["model"] is None
     assert any("内存" in reason and "云端" in reason for reason in result["reasons"])
 
 
-def test_recommend_8gb_memory_cpu_1_7b(monkeypatch):
-    """内存 8GB → 本机 cpu + 1.7B 档，model 含 repo / 文件名 / 预估体积。"""
+def test_recommend_8gb_memory_cpu_e2b_q4(monkeypatch):
+    """内存 8GB → 本机 cpu + E2B-Q4 档，model 含 repo / 文件名 / 预估体积。"""
     _inject_tiers(monkeypatch)
     profile = _profile(ram_gb=8.0)
 
@@ -161,16 +169,16 @@ def test_recommend_8gb_memory_cpu_1_7b(monkeypatch):
 
     assert result["use_local"] is True
     assert result["device"] == "cpu"
-    assert result["tier"] == "1.7B"
+    assert result["tier"] == "E2B-Q4"
     assert result["config_patch"]["local_llm"] == {"enabled": True, "device": "cpu"}
     assert "embedding" not in result["config_patch"]
     assert result["model"]["repo"]
     assert result["model"]["filename"]
-    assert result["model"]["approximate_size_gb"] == 1.7
+    assert result["model"]["approximate_size_gb"] == 2.894
 
 
-def test_recommend_nvidia_10gb_vram_gpu_8b(monkeypatch):
-    """nvidia 10GB 显存 + 内存充足 → device=gpu、tier=8B、embedding 同步走 gpu。"""
+def test_recommend_nvidia_10gb_vram_gpu_e4b_q6(monkeypatch):
+    """nvidia 10GB 显存 + 内存充足 → device=gpu、tier=E4B-Q6、embedding 同步走 gpu。"""
     _inject_tiers(monkeypatch)
     profile = _profile(ram_gb=32.0, gpu_vendor="nvidia", vram_gb=10.0, cuda_version="12.4")
 
@@ -178,7 +186,7 @@ def test_recommend_nvidia_10gb_vram_gpu_8b(monkeypatch):
 
     assert result["use_local"] is True
     assert result["device"] == "gpu"
-    assert result["tier"] == "8B"
+    assert result["tier"] == "E4B-Q6"
     # 20261002 批 A：N 卡走 GPU 时 config_patch 并入 backend=cuda（既有断言变更留痕）
     assert result["config_patch"]["local_llm"] == {
         "enabled": True, "device": "gpu", "backend": "cuda",
@@ -187,64 +195,64 @@ def test_recommend_nvidia_10gb_vram_gpu_8b(monkeypatch):
     assert any("显存" in reason for reason in result["reasons"])
 
 
-def test_recommend_nvidia_6gb_vram_gpu_4b(monkeypatch):
-    """nvidia 6GB 显存 → device=gpu、tier=4B。"""
+def test_recommend_nvidia_6gb_vram_gpu_e4b_q4(monkeypatch):
+    """nvidia 6GB 显存 → device=gpu、tier=E4B-Q4。"""
     _inject_tiers(monkeypatch)
     profile = _profile(ram_gb=32.0, gpu_vendor="nvidia", vram_gb=6.0)
 
     result = hp.recommend_for(profile)
 
     assert result["device"] == "gpu"
-    assert result["tier"] == "4B"
-    assert result["model"]["approximate_size_gb"] == 2.7
+    assert result["tier"] == "E4B-Q4"
+    assert result["model"]["approximate_size_gb"] == 4.635
 
 
 def test_recommend_nvidia_high_vram_capped_by_memory(monkeypatch):
-    """显存 10GB 但内存 < 16GB → 档位受内存上限约束，最高 4B。"""
+    """显存 10GB 但内存 < 16GB → 档位受内存上限约束，最高 E4B-Q4。"""
     _inject_tiers(monkeypatch)
     profile = _profile(ram_gb=8.0, gpu_vendor="nvidia", vram_gb=10.0)
 
     result = hp.recommend_for(profile)
 
     assert result["device"] == "gpu"
-    assert result["tier"] == "4B"
-    assert any("内存" in reason and "4B" in reason for reason in result["reasons"])
+    assert result["tier"] == "E4B-Q4"
+    assert any("内存" in reason and "E4B-Q4" in reason for reason in result["reasons"])
 
 
 def test_recommend_vram_below_4gb_keeps_cpu(monkeypatch):
-    """显存 < 4GB → 维持 cpu + 1.7B，不上 GPU。"""
+    """显存 < 4GB → 维持 cpu + E2B-Q4，不上 GPU。"""
     _inject_tiers(monkeypatch)
     profile = _profile(ram_gb=32.0, gpu_vendor="nvidia", vram_gb=2.0)
 
     result = hp.recommend_for(profile)
 
     assert result["device"] == "cpu"
-    assert result["tier"] == "1.7B"
+    assert result["tier"] == "E2B-Q4"
     assert result["config_patch"]["local_llm"] == {"enabled": True, "device": "cpu"}
     assert "embedding" not in result["config_patch"]
 
 
 def test_recommend_disk_insufficient_downgrades_tier(monkeypatch):
-    """磁盘 3.0GB 放不下 8B（4.682×1.05）→ 逐级降档到 4B。"""
+    """磁盘 4.5GB 放不下 E4B-Q4（4.635×1.05）→ 逐级降档到 E2B-Q6。"""
     _inject_tiers(monkeypatch)
     profile = _profile(ram_gb=32.0, gpu_vendor="nvidia", vram_gb=10.0)
 
-    result = hp.recommend_for(profile, disk_free_gb=3.0)
+    result = hp.recommend_for(profile, disk_free_gb=4.5)
 
     assert result["use_local"] is True
-    assert result["tier"] == "4B"
-    assert any("磁盘" in reason and "4B" in reason for reason in result["reasons"])
+    assert result["tier"] == "E2B-Q6"
+    assert any("磁盘" in reason and "E2B-Q6" in reason for reason in result["reasons"])
 
 
 def test_recommend_disk_insufficient_even_for_smallest_goes_cloud(monkeypatch):
-    """连最小档 0.5B（0.4×1.05）都不足 → use_local=False，理由含所需/可用对比。"""
+    """连最小档 E2B-Q4（2.894×1.05）都不足 → use_local=False，理由含所需/可用对比。"""
     _inject_tiers(monkeypatch)
     profile = _profile(ram_gb=32.0, gpu_vendor="nvidia", vram_gb=10.0)
 
     result = hp.recommend_for(profile, disk_free_gb=0.1)
 
     assert result["use_local"] is False
-    assert result["tier"] == "0.5B"
+    assert result["tier"] == "E2B-Q4"
     assert result["config_patch"]["local_llm"]["enabled"] is False
     assert any(
         "所需" in reason and "可用" in reason and "磁盘" in reason
@@ -257,9 +265,9 @@ def test_recommend_disk_param_overrides_profile_field(monkeypatch):
     _inject_tiers(monkeypatch)
     profile = _profile(ram_gb=32.0, gpu_vendor="nvidia", vram_gb=10.0, disk_free_gb=100.0)
 
-    result = hp.recommend_for(profile, disk_free_gb=3.0)
+    result = hp.recommend_for(profile, disk_free_gb=3.5)
 
-    assert result["tier"] == "4B"
+    assert result["tier"] == "E2B-Q4"
 
 
 # ------------------------------------------------------------------ #

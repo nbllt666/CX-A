@@ -7,6 +7,27 @@
     GET    /api/memories/search     记忆检索（?q= &agent_id= &top_k=，走 MemoryRetrievalPipeline）
     DELETE /api/memories/{id}       软删除一条记忆
 
+记忆页完整控制与核心能力（20261005，spec: align-wizard-settings-memory-pet）：
+    POST   /api/memories            新建记忆（body {content, memory_type?, importance?,
+                                    tags?, agent_id?}；memory_type 四值域
+                                    long_term/short_term/permanent/diary；非法 400 中文）
+    PUT    /api/memories/{id}       编辑记忆（字段补丁，走 MemoryStore.update；404/400）
+    POST   /api/memories/batch-delete  批量软删（body {ids:[]}；permanent 保护跳过，
+                                    返回 deleted_count 与 skipped 明细）
+    GET    /api/memories/decay-stats  遗忘衰减统计（CX-O 遗忘曲线口径；permanent 豁免；
+                                    含即将遗忘/已衰减分布）
+    POST   /api/memories/sync-decay   执行衰减同步（低分记忆软删归档；permanent 豁免）
+    GET    /api/memories/diary      日记视图（?date= &type= &agent_id= &limit=；按
+                                    created_at 本地日期分组，日期降序）
+    GET    /api/memories/3d         三维加权检索（?query= &w_importance= &w_time= &w_rel=
+                                    &type= &agent_id= &limit=；默认权重 0.35/0.25/0.4）
+
+记忆管理助手工具环（20261005）：POST /api/chat/message 命中内置 agent memory-agent 时，
+    解析回复中的 [memory:op {...}] 指令标签（对齐 [emotion:x] 自造协议先例），经
+    BuiltinToolRegistry 记忆工具（memory_search/read/write/update/delete）执行并把
+    结果回注一轮（最多 2 轮），最终 clean_text 剥离全部指令标签；工具失败以中文
+    说明原因（不崩、不污染记忆库）。
+
 电脑控制（Task D3，走 ToolBridge 全链路）：
     GET    /api/computer/status     授权状态（authorized / confirm_dangerous）
     POST   /api/computer/authorize  开启/撤销授权（body {enabled: bool}）
@@ -14,10 +35,11 @@
 
 配置与管理 API（记录在 `.trae/documents/20260826_模块0_差异审查登记与处理计划.md`）：
     GET    /api/status              轻量系统状态（app / version / uptime）
-    GET    /api/settings            用户可读配置视图（不含 API Key）
-    PUT    /api/settings            更新可热更配置（白名单键；body 为补丁）
+    GET    /api/settings            用户可读配置视图（api_key 脱敏回显 sk-****尾4位，明文绝不外泄）
+    PUT    /api/settings            更新可热更配置（白名单键；body 为补丁；download.channel
+                                    合法时派生写入 local_llm.source，与向导同口径）
     POST   /api/chat/messages       聊天发送（未启用守卫：明确提示走前端 Mock）
-    GET    /api/chat/history        聊天历史（未启用守卫：返回空列表 + 提示）
+    GET    /api/chat/history        聊天历史（20261004 持久化：data/chat_history.json 最近 200 条）
 
 生产装配接线 API（批次E，记录在 `.trae/documents/20260828_模块0_生产装配接线.md`）：
     GET    /api/tools               内置工具清单（含 usage 端点用法自述）
@@ -69,6 +91,11 @@ CXFC relay 前端转接（Task H1，对齐 C:\\CX-O\\docs\\CXFC开发文档.md �
                                     404 pet_model_missing）。路径经 app_root()
                                     （frozen-aware）解析为 <app_root>/data/pet/cx-open.vrm。
                                     过既有 Host / 令牌闸（不新增豁免端点），仅 GET。
+    POST   /api/pet/model/import    导入用户自选 VRM 模型替换默认模型（Task 4；
+                                    body {source_path}；原模型自动备份 .bak，
+                                    非 .vrm/不可读 400，复制失败 500 原模型不动）
+    POST   /api/pet/model/reset     从 .bak 备份还原默认模型（备份缺失 404
+                                    pet_model_backup_missing）。均过既有令牌闸。
 
 首启向导接口族（Task 6 / Task 7，对齐 spec「首启向导后端接口」「向导内下载」）：
     GET    /api/setup/status            向导门控（completed / wizard_required / 当前通道与模型仓库；不含 api_key）
@@ -97,11 +124,13 @@ LiteCXFC 内部 Event 在调用方线程承载，不占用 HTTP 线程（Task H1
 import argparse
 import atexit
 import base64
+import datetime
 import hmac
 import importlib.util
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import threading
@@ -121,9 +150,87 @@ CHAT_OFFLINE_TEXT = "现在连不上云端…"
 # 表情聊天默认 system 提示（agent_id 未命中本地 Agent 时使用）：引导 LLM 以
 # [emotion:x] 标签表达情绪，情绪集与 lite/avatar/tags.SUPPORTED_EMOTIONS 一致
 _CHAT_DEFAULT_SYSTEM = (
-    "你是用户的虚拟伴侣，回复请自然、温暖；可在句中插入情绪标签表达当下心情，"
+    "你是 CX-A，回复请自然、温暖；可在句中插入情绪标签表达当下心情，"
     "格式为 [emotion:情绪]，支持：happy/calm/sad/surprised/angry/sleepy/shy。"
 )
+
+# 对话持久化（20261004 悬浮窗语音闭环）：/api/chat/message 成功后追加落盘，
+# GET /api/chat/history 返回最近消息——桌宠语音对话与主窗口聊天页共享同一份
+# 对话真相（跨窗口刷新经前端 localStorage ``cx-a.chatTick`` 总线驱动）。
+_CHAT_HISTORY_FILENAME = "chat_history.json"
+_CHAT_HISTORY_CAP = 200
+_CHAT_HISTORY_LOCK = threading.Lock()
+
+
+def _chat_history_path(data_dir=None):
+    """对话历史文件绝对路径（缺省 ``<data>/chat_history.json``，frozen-aware 根解析）。
+
+    :param data_dir: 数据目录；None 时经 :func:`data_root` 解析（生产默认）。
+        handler 场景由 make_handler 按其数据目录传入（测试 tmp_path 隔离）。
+    """
+    return os.path.join(data_dir or data_root(), _CHAT_HISTORY_FILENAME)
+
+
+def _load_chat_history(path=None):
+    """读取对话历史（缺失 / 损坏静默回空——历史损坏不得阻断聊天主链路）。
+
+    :param path: 历史文件绝对路径；None 用 :func:`_chat_history_path` 默认解析。
+    :return: list[dict]（``{role, content, time}``；非列表结构按空处理）。
+    """
+    try:
+        with open(path or _chat_history_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _append_chat_history(user_text, assistant_text, path=None):
+    """追加一轮对话（用户原文 + clean 回复 + 时间），cap 截断 + 原子写。
+
+    写失败仅告警不抛（历史落盘不得阻断聊天主链路）；``.tmp`` + ``os.replace``
+    原子改名，避免损坏一半的历史文件落在正式位。
+
+    :param user_text: 用户消息原文（已 strip）
+    :param assistant_text: 助手回复 clean_text（已剥离情绪标签）
+    :param path: 历史文件绝对路径；None 用 :func:`_chat_history_path` 默认解析。
+    """
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    entries = [
+        {"role": "user", "content": str(user_text), "time": now},
+        {"role": "assistant", "content": str(assistant_text), "time": now},
+    ]
+    with _CHAT_HISTORY_LOCK:
+        history = _load_chat_history(path)
+        history.extend(entries)
+        if len(history) > _CHAT_HISTORY_CAP:
+            history = history[-_CHAT_HISTORY_CAP:]
+        target = path or _chat_history_path()
+        tmp = target + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(history, fh, ensure_ascii=False)
+            os.replace(tmp, target)
+        except OSError as exc:
+            LOGGER.warning("对话历史落盘失败（不阻断聊天主链路）：%s", exc)
+
+
+def _offline_placeholder_texts():
+    """离线占位文案集合（fallback 管理器的引导提示；延迟导入防导入环）。
+
+    这些文案经 ``/api/chat/message`` 成功路径返回（offline:true），但**不是
+    真实对话**——持久化前据此跳过，避免占位文案污染 chat_history.json。
+    """
+    try:
+        from lite.cloud.fallback import (  # noqa: PLC0415
+            CONFIG_ERROR_PROMPT,
+            LOCAL_NOT_READY_PROMPT,
+            OFFLINE_PROMPT,
+        )
+    except Exception:  # noqa: BLE001 - 导入失败按仅自身常量兜底
+        return {CHAT_OFFLINE_TEXT}
+    return {OFFLINE_PROMPT, LOCAL_NOT_READY_PROMPT, CONFIG_ERROR_PROMPT, CHAT_OFFLINE_TEXT}
 
 
 def _warm_chat_runtime(runtime):
@@ -368,6 +475,25 @@ class _BodyTooLarge(Exception):
 # （收到时收集进 ignored 数组回显，消除静默丢弃——L2 收口）
 _SETTINGS_READONLY_TOP_KEYS = ("acp", "remote", "vector")
 
+
+def _mask_api_key(value):
+    """云端 API Key 脱敏回显（Task 5：向导选项入设置；spec「API Key 脱敏回显」）。
+
+    规则（示例口径 ``sk-****last4``）：
+    - 未配置（空串 / 非字符串）→ 空串，前端按「未配置」渲染；
+    - 长度 ≤ 4 → 全遮 ``****``（避免短值泄露）；
+    - 否则保留 ``sk-`` 前缀（若原文以此开头）+ ``****`` + 尾 4 位明文，
+      如 ``sk-abcdefgh12345678`` → ``sk-****5678``。
+
+    :param value: 配置中的 api_key 原文（ConfigManager 读回时已解密）。
+    :return: str 脱敏展示值；明文任何形式不出现在返回结果中。
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    tail = value[-4:] if len(value) > 4 else ""
+    prefix = "sk-" if value.startswith("sk-") else ""
+    return f"{prefix}****{tail}"
+
 # CSRF/CORS 加固：受信任的跨源 Origin 白名单。
 # "null" 是 Electron 生产态（file:// 页面）发出的 Origin 字面量；
 # 不使用通配符 *，未命中白名单的一律不返回 CORS 头（浏览器侧即被同源策略拦截）。
@@ -402,6 +528,16 @@ _TOOLS_USAGE = {
         "args": "无",
         "result": "200 原始 VRM 字节（Content-Type: model/gltf-binary）；文件缺失 404 pet_model_missing",
     },
+    "POST /api/pet/model/import": {
+        "body": {"source_path": "用户自选 VRM 模型的本地绝对路径"},
+        "result": "200 {ok:true, message}（导入成功，原模型自动备份为 cx-open.vrm.bak）；"
+        "缺 source_path / 非 .vrm 后缀 / 文件不存在 400 中文错误；"
+        "复制失败 500 pet_model_import_failed（原模型保持不变）",
+    },
+    "POST /api/pet/model/reset": {
+        "args": "无 body",
+        "result": "200 {ok:true, message}（从 .bak 备份还原默认模型）；备份缺失 404 pet_model_backup_missing",
+    },
 }
 
 # ------------------------------------------------------------------ 路径推导
@@ -421,6 +557,13 @@ from lite.memory.storage import MemoryStore  # noqa: E402
 from lite.memory.vector_store import InMemoryVectorStore, SQLiteVectorStore  # noqa: E402
 from lite import __version__ as LITE_VERSION  # noqa: E402
 from lite.management.local_agents import AgentManager, AgentNotFound  # noqa: E402
+from lite.management.fleet import (  # noqa: E402
+    FleetInvalid,
+    FleetManager,
+    FleetNotFound,
+    FleetRemoteError,
+    is_loopback_client,
+)
 from lite.management.remote import (  # noqa: E402
     RemoteController,
     RemoteDisabled,
@@ -435,6 +578,7 @@ from lite.computer_control.control import (  # noqa: E402
 from lite.computer_control.security import ControlAuthorizer  # noqa: E402
 from lite.computer_control.tool_bridge import ToolBridge  # noqa: E402
 from lite.config.config_manager import DEFAULTS, ConfigManager  # noqa: E402
+from lite.config.paths import app_root, data_root  # noqa: E402
 from lite.config.download_sources import (  # noqa: E402
     CHANNELS,
     DEFAULT_CHANNEL,
@@ -446,7 +590,13 @@ from lite.config.paths import app_root  # noqa: E402
 from lite.cloud.adapter import PROVIDER_BASE_URLS  # noqa: E402
 from lite.cloud.adapter import CloudAdapter, CloudConfigError, CloudUnavailableError  # noqa: E402
 from lite.avatar import EmotionTagParser  # noqa: E402
+from lite.management.local_agents import MEMORY_AGENT_ID  # noqa: E402
 from lite.memory.distillation import DistillationPaused, MemoryDistiller  # noqa: E402
+from lite.memory.schema import MEMORY_TYPES as MEMORY_TYPES_ALLOWED  # noqa: E402
+from lite.memory.scoring import (  # noqa: E402
+    DEFAULT_WEIGHTS as _MEMORY_3D_DEFAULT_WEIGHTS,
+)
+from lite.memory.scoring import score_memories as _memory_score_3d  # noqa: E402
 from lite.runtime.download_manager import ModelDownloadManager  # noqa: E402
 from lite.runtime.hardware_profile import (  # noqa: E402
     accel_plan,
@@ -466,6 +616,179 @@ from lite.vision.sampler import AdaptiveSampler  # noqa: E402
 # 云端 provider 白名单（L-8：从 adapter.PROVIDER_BASE_URLS 派生，单一真相源，
 # 新增 provider 无需再同步本文件；置于 lite 包 import 之后——派生依赖其符号）
 CLOUD_PROVIDER_ALLOWLIST = tuple(PROVIDER_BASE_URLS.keys())
+
+# ---------------------------------------------------------------- 记忆管理助手指令协议（20261005，spec: align-wizard-settings-memory-pet）
+# [memory:op {...}] 指令标签：对齐 [emotion:x] 自造协议先例。LLM 回复中的标签由
+# 后端解析、经 BuiltinToolRegistry 记忆工具执行、结果回注一轮后从最终展示文本剥离。
+#: op 名 -> BuiltinToolRegistry 工具 id 映射（工具由 builtin_registry.memory 系列提供）
+_MEMORY_OP_TO_TOOL = {
+    "search": "memory_search",
+    "read": "memory_read",
+    "write": "memory_write",
+    "update": "memory_update",
+    "delete": "memory_delete",
+}
+#: 指令标签起始标记
+_MEMORY_TAG_MARKER = "[memory:"
+#: 助手单次对话最多执行的指令标签数（防失控输出刷库）
+_MEMORY_MAX_OPS_PER_TURN = 8
+#: 工具环最多回注轮数（首轮 LLM 回复 + 最多 2 轮回注，符合「递归不超过 2 轮」约束）
+_MEMORY_MAX_TOOL_ROUNDS = 2
+
+#: 聊天记忆注入条数上限（RAG 闭环，20261005）：每次聊天检索并拼入 system 的
+#: 记忆条数（经管线三维打分/衰减/去重后取前 N）
+_MEMORY_INJECT_TOP_K = 8
+#: 回注执行结果 JSON 的截断长度（防超长检索结果撑爆上下文）
+_MEMORY_RESULT_SNIPPET_CHARS = 2000
+#: 批量删除单请求 id 上限（防单请求串行刷全表）
+_MAX_BATCH_MEMORY_IDS = 200
+#: 3D 检索默认返回条数（对齐 CX-O /memories/3d 的 limit=10）
+_MEMORY_3D_DEFAULT_LIMIT = 10
+#: 3D 检索候选拉取条数（送三维打分前的候选池上限）
+_MEMORY_3D_CANDIDATE_LIMIT = 100
+
+
+def _match_json_object(text, brace_index):
+    """从 ``text[brace_index] == '{'`` 起做括号平衡扫描，返回匹配 ``}`` 的下标。
+
+    扫描考虑 JSON 字符串内的引号与反斜杠转义（字符串内的花括号不参与计数）。
+    未闭合返回 -1。供指令标签解析与标签剥离共用（单一实现防口径漂移）。
+    """
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(brace_index, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _extract_memory_ops(text):
+    """从 LLM 回复文本中按序提取全部 ``[memory:op {...}]`` 指令标签。
+
+    Args:
+        text: LLM 原始回复文本。
+    Returns:
+        list[tuple]: ``[(op, arguments, raw_tag), ...]``。
+            - op: 指令名（str，可能是未知 op——由调用方白名单过滤）；
+            - arguments: JSON 解析后的 dict；JSON 非法/非对象时为 None
+              （调用方据此生成「参数非法」失败回执）；
+            - raw_tag: 标签原文（回注消息中引用，便于 LLM 对应多条指令）。
+    """
+    s = str(text or "")
+    if _MEMORY_TAG_MARKER not in s:
+        return []
+    ops = []
+    cursor = 0
+    while len(ops) < _MEMORY_MAX_OPS_PER_TURN * 2:  # 硬上限防异常输入死循环
+        start = s.find(_MEMORY_TAG_MARKER, cursor)
+        if start < 0:
+            break
+        head = start + len(_MEMORY_TAG_MARKER)
+        # op token：marker 后的连续字母/数字/下划线（\w+）
+        j = head
+        while j < len(s) and (s[j].isalnum() or s[j] == "_"):
+            j += 1
+        op = s[head:j]
+        cursor = j  # 至少推进到 op 之后，保证外层循环收敛
+        if not op:
+            continue
+        brace = s.find("{", j)
+        bracket = s.find("]", j)
+        if brace < 0 or (0 <= bracket < brace):
+            # 裸标签（无 JSON 参数体）：协议要求带参数，跳过由调用方提示
+            continue
+        end = _match_json_object(s, brace)
+        if end < 0:
+            json_text = s[brace:]
+            cursor = len(s)
+        else:
+            json_text = s[brace:end + 1]
+            cursor = end + 1
+        try:
+            args = json.loads(json_text)
+            if not isinstance(args, dict):
+                args = None
+        except (ValueError, TypeError):
+            args = None
+        close = s.find("]", cursor if end < 0 else end + 1)
+        raw = s[start:(close + 1) if close >= 0 else len(s)]
+        ops.append((op, args, raw))
+        if end < 0 or close < 0:
+            break
+    return ops
+
+
+def _strip_memory_tags(text):
+    """剥离文本中全部 ``[memory:...]`` 指令标签（含 JSON 非法的残缺标签）。
+
+    用与 :func:`_extract_memory_ops` 同源的括号平衡扫描定位标签区间（非贪婪
+    正则会误伤 JSON 内容里的 ``]``）；剥离后清理残留空白行。最终展示文本
+    （clean_text）必须经本函数处理，保证指令标签不泄漏到前端。
+    """
+    s = str(text or "")
+    while True:
+        start = s.find(_MEMORY_TAG_MARKER)
+        if start < 0:
+            break
+        brace = s.find("{", start + len(_MEMORY_TAG_MARKER))
+        end = -1
+        if brace >= 0:
+            obj_end = _match_json_object(s, brace)
+            if obj_end >= 0:
+                close = s.find("]", obj_end + 1)
+                end = close if close >= 0 else obj_end
+        if end < 0:
+            # 残缺标签（无 JSON 或未闭合）：兜底剥到下一个 "]"（无则剥到结尾）
+            close = s.find("]", start)
+            end = (close - 1) if close >= 0 else (len(s) - 1)
+        s = s[:start] + s[end + 1:]
+    # 清理剥离残留的多余空白行（保留正常段落结构）
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def _memory_tool_result_message(op, raw_tag, outcome):
+    """把一次指令执行结果格式化为回注消息内容（以 user 角色回注的系统回执）。
+
+    本聊天链路的 messages 为简单 system/user 列表（无 role:"tool" 通道），
+    故用带「系统回执」前缀的 user 消息承载工具结果（见 _handle_chat_message 注释）。
+
+    隐私边界说明（GN-004 OB-2）：工具回执含记忆内容（≤2000 字符截断）。
+    本地模式下（local_llm.enabled）聊天走本地运行时，回执全程不出本机；
+    云端模式下回执随 messages 上行云端 LLM——与普通聊天把用户消息上行
+    云端的语义一致，属该模式的既定隐私边界，不做额外截停。
+    """
+    success = bool(outcome.get("success"))
+    if success:
+        detail = json.dumps(outcome.get("result"), ensure_ascii=False, default=str)
+        status = "成功"
+    else:
+        detail = str(outcome.get("error") or "未知错误")
+        status = "失败"
+    if len(detail) > _MEMORY_RESULT_SNIPPET_CHARS:
+        detail = detail[:_MEMORY_RESULT_SNIPPET_CHARS] + "…（结果过长已截断）"
+    return (
+        "系统回执（你之前的指令已由系统执行，请据此用中文向用户汇报，"
+        "不要输出任何 [memory:...] 指令标签）：\n"
+        f"指令 {raw_tag} 执行{status}。\n结果：{detail}"
+    )
 
 # 全组件加速值域白名单（与 lite/config/config_manager.DEFAULTS 对齐；非法值一律入
 # ignored 显式回显，不静默丢弃）。accel.mode = 运行偏好；tts.accel = 语音合成后端；
@@ -533,7 +856,8 @@ def _close_voice_backends(voice):
 _VISION_TICK_INTERVAL_S = 1.0
 
 
-def build_vision_pipeline(config=None, memory_store=None, cloud=None):
+def build_vision_pipeline(config=None, memory_store=None, cloud=None,
+                          local_understanding=None):
     """装配主动视觉管线（Task C）：屏幕后端 + 自适应采样器 + VisionPipeline。
 
     - 屏幕后端：Windows 下构建纯标准库 GDI 后端
@@ -552,6 +876,9 @@ def build_vision_pipeline(config=None, memory_store=None, cloud=None):
         memory_store: 记忆存储（理解结果沉淀目标；None 时理解结果告警跳过沉淀）。
         cloud: CloudAdapter 实例（云端理解通道；None 时走注入 understanding 或
             理解失败告警隔离）。
+        local_understanding: 本地多模态理解回调（20261004 Gemma 4 本地视觉，
+            callable(messages) -> str）；注入后默认理解优先走本地（截图帧
+            image_url / 灰度拓扑交本地小 LLM），未就绪/失败回落云端。
 
     Returns:
         VisionPipeline: 已接线 queue consumer 的视觉管线实例。
@@ -573,7 +900,8 @@ def build_vision_pipeline(config=None, memory_store=None, cloud=None):
         backend, min_interval_s=min_interval_s, max_interval_s=max_interval_s
     )
     return VisionPipeline(
-        sampler=sampler, cloud=cloud, memory_store=memory_store, config=config
+        sampler=sampler, cloud=cloud, memory_store=memory_store, config=config,
+        local_understanding=local_understanding,
     )
 
 
@@ -611,6 +939,10 @@ DEFAULT_PORT = 8600
 # 与 installer/manifest.json 中 pet_model 组件的 install_target 保持同一口径。
 PET_MODEL_REL_PATH = os.path.join("data", "pet", "cx-open.vrm")
 
+# 导入用户自选模型前对现模型的备份相对路径（同目录 cx-open.vrm.bak，导入时覆盖旧备份；
+# 「恢复默认」端点从该备份还原）。Task 4（用户自定义 VRM 桌宠模型）。
+PET_MODEL_BACKUP_REL_PATH = PET_MODEL_REL_PATH + ".bak"
+
 
 def pet_model_path() -> str:
     """推导悬浮桌宠默认 VRM 模型的绝对路径：``<app_root>/data/pet/cx-open.vrm``。
@@ -631,21 +963,28 @@ def _resolve_data_dir(data_dir=None) -> str:
 
 
 def _build_embedding_provider(config):
-    """装配嵌入提供者：真实（llama-server 外部路径）优先，失败降级 64 维哈希桩。
+    """装配嵌入提供者：真实（llama-server 外部路径）唯一路径，**禁止降级**。
 
     20260926_模块0_真实嵌入与向量持久化：模型路径经
     ``resolve_embedding_model_path`` 解析（``embedding.model_path`` 配置优先，
-    否则约定目录 ``<root>/data/local_llm/qwen3-embedding-0.6b/*.gguf``）。真实路径
-    不可用（模型缺失 / llama-server 不可用 / 启动失败）时中文告警并回落桩嵌入——
-    后端启动绝不因此失败。桩嵌入下向量库走内存（哈希向量无持久价值）。
+    否则约定目录 ``<root>/data/local_llm/qwen3-embedding-0.6b/*.gguf``）。
+
+    20261005 人类裁决（嵌入禁止降级，关闭原"哈希桩回落"开放确认项）：模型路径
+    为空 / llama-server 启动失败 / 加载未就绪，一律 raise RuntimeError（中文，
+    含处置指引）——嵌入模型随安装包内置（装机即用），缺失说明安装不完整或被
+    误删，绝不静默回落桩嵌入。
 
     Args:
         config: ConfigManager 实例。
 
     Returns:
-        tuple[EmbeddingProvider, str, dict]: (提供者, 标识 ``"llama"``/``"stub"``,
+        tuple[EmbeddingProvider, str, dict]: (提供者, 标识 ``"llama"``,
             元信息 ``{"dim": int|None, "model_tag": str}``)——元信息供持久向量库
             ``prepare()`` 校准（换模型 / 换维度时重置索引表）。
+
+    Raises:
+        RuntimeError: 嵌入模型 GGUF 缺失 / llama-server 启动失败 / 加载未就绪
+            （禁止降级语义，启动中止）。
     """
     # 函数内延迟导入：llama_runtime 导入链不进入本模块顶层导入路径
     # （与 build_local_chat_runtime 同口径）
@@ -657,25 +996,28 @@ def _build_embedding_provider(config):
 
     model_path = resolve_embedding_model_path(config)
     if not model_path:
-        LOGGER.warning(
+        raise RuntimeError(
             "未找到嵌入模型 GGUF（embedding.model_path 为空且约定目录 "
-            "<root>/data/local_llm/qwen3-embedding-0.6b/*.gguf 下无文件），"
-            "已降级为哈希桩嵌入（64 维：语义召回退化为词面近似）"
+            "<root>/data/local_llm/qwen3-embedding-0.6b/*.gguf 下无文件）——"
+            "嵌入模型随安装包内置，缺失说明安装不完整或被误删；禁止降级，"
+            "请重新安装或将 embedding.model_path 指向有效的嵌入 GGUF 后重启"
         )
-        return LiteEmbeddingProvider(dim=64), "stub", {"dim": None, "model_tag": "stub-64"}
 
     runtime = LlamaRuntime(config=config)
     try:
         ready = runtime.load_embedding_model(model_path)
     except RuntimeError as exc:
-        LOGGER.warning("真实嵌入不可用，已降级为哈希桩嵌入：%s", exc)
-        return LiteEmbeddingProvider(dim=64), "stub", {"dim": None, "model_tag": "stub-64"}
+        raise RuntimeError(
+            f"嵌入模型加载失败（禁止降级，启动中止）：{exc}。"
+            f"模型路径：{model_path}；请确认文件完整（可校验后从安装包重新释放）"
+            "或将 embedding.model_path 指向有效的嵌入 GGUF。"
+        ) from exc
     if not ready:
-        LOGGER.warning(
-            "真实嵌入模型加载失败（%s），已降级为哈希桩嵌入：%s",
-            model_path, "; ".join(runtime.warnings) or "未知原因",
+        raise RuntimeError(
+            "嵌入模型加载未就绪（禁止降级，启动中止）："
+            f"{model_path}；详情：{'; '.join(runtime.warnings) or '未知原因'}。"
+            "请确认模型文件完整或将 embedding.model_path 指向有效的嵌入 GGUF。"
         )
-        return LiteEmbeddingProvider(dim=64), "stub", {"dim": None, "model_tag": "stub-64"}
 
     # 优雅退出回收：llama-server 为常驻子进程（PyInstaller 冻结态无 atexit 保障的
     # 硬终止路径由 Electron 壳的进程树回收兜底，见 frontend/src/main/main.js）。
@@ -696,14 +1038,13 @@ def _build_embedding_provider(config):
 
 
 def _build_vector_store(config, data_dir, embed_kind, embed_meta):
-    """装配向量库：真实嵌入 → SQLite 持久库（默认）；桩嵌入 → 内存库。
+    """装配向量库：按配置唯一真值构建，**禁止降级**（20261005 人类裁决）。
 
-    - ``backend=sqlite``（默认）：``SQLiteVectorStore``（与 memories.db 同库，
-      cosine 口径与 InMemoryVectorStore 逐位一致，跨重启持久）；
-    - ``backend=lancedb`` 且依赖可用（仅开发态可选）：``LanceVectorStore``
-      （排序语义为 L2 归一，与生产 cosine 口径不同轨，按显式配置启用）；
-    - ``backend=lancedb`` 但依赖缺失：中文告警后按嵌入类型降级
-      （真实嵌入 → SQLite 持久 / 桩嵌入 → 内存）。
+    - ``backend=lancedb``（默认）：``LanceVectorStore``——依赖缺失 / 初始化失败
+      一律 raise RuntimeError（中文，含安装指引），**绝不静默回落**其他后端；
+    - ``backend=sqlite``：``SQLiteVectorStore``（显式选择，非降级；cosine 口径
+      与 InMemoryVectorStore 逐位一致，跨重启持久）；
+    - 空串 / 未知值：raise（不再回落内存库——降级路径已按裁决移除）。
 
     Args:
         config: ConfigManager 实例。
@@ -713,29 +1054,36 @@ def _build_vector_store(config, data_dir, embed_kind, embed_meta):
 
     Returns:
         VectorStore: 向量存储实例（SQLite 路径已完成 prepare 校准；不匹配时已重置）。
+
+    Raises:
+        RuntimeError: backend=lancedb 但 lancedb 依赖缺失 / 初始化失败；
+            backend 为空串或未知值（中文消息，启动失败——禁止降级语义）。
     """
     backend = str(
         config.get("vector", "backend", DEFAULTS["vector"]["backend"]) or ""
     ).strip().lower()
     if backend == "lancedb":
         if importlib.util.find_spec("lancedb") is None:
-            if embed_kind == "llama":
-                LOGGER.warning("配置指定 LanceDB 但当前环境不可用，已降级为 SQLite 持久向量库")
-            else:
-                LOGGER.warning("配置指定 LanceDB 但当前环境不可用，已降级为内存向量库")
-        else:
-            try:
-                from lite.memory.vector_store import LanceVectorStore
+            raise RuntimeError(
+                "向量后端配置为 LanceDB 但当前环境未安装 lancedb（禁止降级："
+                "请安装 lancedb（pip install lancedb），或将 vector.backend "
+                "显式改为 sqlite 后重启）"
+            )
+        try:
+            from lite.memory.vector_store import LanceVectorStore
 
-                store = LanceVectorStore(db_path=os.path.join(data_dir, "lancedb"))
-                LOGGER.warning(
-                    "向量后端按配置使用 LanceDB（开发态可选）：排序语义为 L2 归一，"
-                    "与生产 cosine 口径不同轨"
-                )
-                return store
-            except Exception as exc:  # noqa: BLE001 - 初始化失败降级不阻断启动
-                LOGGER.warning("LanceDB 初始化失败（%s），已降级", exc)
-    if embed_kind == "llama":
+            store = LanceVectorStore(db_path=os.path.join(data_dir, "lancedb"))
+        except Exception as exc:  # noqa: BLE001 - 初始化失败按禁止降级语义硬失败
+            raise RuntimeError(
+                f"LanceDB 初始化失败（禁止降级，启动中止）：{exc}。"
+                "请检查 lancedb 安装完整性或将 vector.backend 显式改为 sqlite。"
+            ) from exc
+        LOGGER.warning(
+            "向量后端使用 LanceDB：排序语义为 L2 归一，与 cosine 口径不同轨"
+        )
+        return store
+    if backend == "sqlite":
+        # 嵌入禁止降级（20261005）后 embed_kind 恒为 "llama"，桩分支已移除
         store = SQLiteVectorStore(
             db_path=os.path.join(data_dir, "memories.db"),
             model_tag=str(embed_meta.get("model_tag", "")),
@@ -745,7 +1093,10 @@ def _build_vector_store(config, data_dir, embed_kind, embed_meta):
         if result["action"] == "reset":
             LOGGER.warning("嵌入模型标识已变化，向量索引已重置（将由启动预热按新模型重建）")
         return store
-    return InMemoryVectorStore()
+    raise RuntimeError(
+        f"未知向量后端配置：{backend!r}（允许值：lancedb / sqlite；禁止降级语义下"
+        "不再回落内存库，请修正 vector.backend 后重启）"
+    )
 
 
 def build_deps(data_dir=None, config_path=None):
@@ -882,7 +1233,7 @@ def build_runtime_deps(data_dir=None, config=None, store=None, pipeline=None, co
 
 
 def make_handler(
-    store, pipeline, manager=None, remote=None,
+    store, pipeline, manager=None, remote=None, fleet=None,
     computer=None, authorizer=None, bridge=None, config=None,
     registry=None, distiller=None, voice=None, cxfc=None, chat_cloud=None,
     chat_fallback=None, download_manager=None, vision_pipeline=None,
@@ -942,6 +1293,9 @@ def make_handler(
         if reused:
             default_data_dir = reused
             break
+    # 对话历史文件（20261004）：跟随 handler 数据目录——测试经依赖注入的
+    # tmp_path 天然隔离，生产为 <app_root>/data/chat_history.json
+    chat_history_file = os.path.join(default_data_dir, _CHAT_HISTORY_FILENAME)
     if computer is None or authorizer is None or bridge is None:
         built_computer, built_authorizer, built_bridge = build_computer_deps(default_data_dir)
         if computer is None:
@@ -1021,6 +1375,18 @@ def make_handler(
         download_manager = ModelDownloadManager(
             config_manager=config, write_lock=_CONFIG_WRITE_LOCK
         )
+    # 20261004 Gemma 4 本地视觉：理解回调复用聊天运行时持有器（禁止同一模型
+    # 加载两份），把多模态消息交本地小 LLM；未就绪 / 失败返回 None → 管线回落
+    # 云端（本地优先、云端拓扑兜底的双通道语义见 lite/vision/pipeline.py）。
+    def _vision_local_understanding(messages):
+        runtime = _local_holder.get()
+        if runtime is None:
+            return None
+        try:
+            return runtime.offline_chat(messages)
+        except Exception:  # noqa: BLE001 - LlamaNotReady / 服务失败 → 回落云端
+            return None
+
     # Task C「主动视觉接线」（N8 语义延续）：仅对显式为 None 的视觉管线回落默认
     # 装配——纯标准库 GDI 屏幕后端（非 Windows 注入 None 空转）+ 自适应采样器
     # （间隔读 config vision 段）+ VisionPipeline（``vision.enabled`` 默认 False，
@@ -1028,7 +1394,10 @@ def make_handler(
     _resolved_vision = vision_pipeline
     if _resolved_vision is None:
         try:
-            _resolved_vision = build_vision_pipeline(config=config, memory_store=store, cloud=chat_cloud)
+            _resolved_vision = build_vision_pipeline(
+                config=config, memory_store=store, cloud=chat_cloud,
+                local_understanding=_vision_local_understanding,
+            )
         except Exception as exc:  # noqa: BLE001 - 视觉装配失败不阻断服务启动
             LOGGER.warning("主动视觉管线装配失败（%s）：%s", exc.__class__.__name__, exc)
     # tick 线程（daemon）对注入实例同样启动：enabled=False 时 run_once 零开销空转，
@@ -1051,6 +1420,7 @@ def make_handler(
         _pipeline = pipeline
         _manager = manager
         _remote = remote
+        _fleet = fleet
         _computer = computer
         _authorizer = authorizer
         _bridge = bridge
@@ -1061,6 +1431,7 @@ def make_handler(
         _cxfc = cxfc
         _chat_cloud = chat_cloud
         _chat_fallback = _resolved_chat_fallback
+        _chat_history_file = chat_history_file
         _download_manager = download_manager
         _vision = _resolved_vision
         _vision_thread = _resolved_vision_thread
@@ -1183,10 +1554,17 @@ def make_handler(
             self.end_headers()
 
         def _parse_query(self):
-            """解析查询串为 dict[str, str|None]（首个值优先，空串归一为 None）。"""
+            """解析查询串为 dict[str, str|None]（首个值优先，空串归一为 None）。
+
+            20261005 追加记忆核心能力参数：query/w_importance/w_time/w_rel（3D
+            检索）、date（日记视图）。保持白名单制（未登记参数一律丢弃）。
+            """
             qs = parse_qs(urlparse(self.path).query)
             out = {}
-            for key in ("type", "agent_id", "limit", "q", "top_k", "enabled", "plugin_id"):
+            for key in (
+                "type", "agent_id", "limit", "offset", "q", "top_k", "enabled", "plugin_id",
+                "query", "w_importance", "w_time", "w_rel", "date",
+            ):
                 vals = qs.get(key)
                 if vals:
                     out[key] = vals[0] or None
@@ -1205,12 +1583,35 @@ def make_handler(
                 }
             )
 
+        def _local_llm_source_view(self):
+            """当前 local_llm.source 视图值：配置真相优先，缺失/非法按通道派生回落。
+
+            与 :meth:`_handle_setup_status` 同口径（读取真实值而非重新派生；
+            ``local_llm.source`` 不在 ``MODEL_REPOS`` 时回落
+            ``model_repo_for_channel(channel)``，保证与下载线路语义一致）。
+            """
+            channel = normalize_channel(self._config.get("download", "channel", DEFAULT_CHANNEL))
+            source = str(self._config.get("local_llm", "source", "") or "").strip().lower()
+            if source not in MODEL_REPOS:
+                source = model_repo_for_channel(channel)
+            return source
+
         def _settings_view(self):
-            """组装用户可读配置视图（**不含 API Key**，避免敏感信息外泄）。"""
+            """组装用户可读配置视图（api_key 仅脱敏回显，明文绝不外泄）。"""
             return {
                 "cloud": {
                     "provider": self._config.get("cloud", "provider", "deepseek"),
                     "base_url": self._config.get("cloud", "base_url", ""),
+                    # Task 5（向导选项入设置）：api_key 脱敏回显（sk-****尾4位；
+                    # 未配置为空串）——明文仅存在于 ConfigManager 内存/加密落盘，
+                    # 视图层任何路径不回显明文
+                    "api_key": _mask_api_key(self._config.get("cloud", "api_key", "")),
+                },
+                # Task 5：下载线路回显（normalize_channel 归一，写坏配置不致前端空白）
+                "download": {
+                    "channel": normalize_channel(
+                        self._config.get("download", "channel", DEFAULT_CHANNEL)
+                    ),
                 },
                 "tts": {
                     "voice": self._config.get("tts", "voice", "cx-open"),
@@ -1224,9 +1625,20 @@ def make_handler(
                 "local_llm": {
                     "enabled": bool(self._config.get("local_llm", "enabled", False)),
                     "ready": bool(_local_holder.ready()),
+                    # Task 5：当前模型仓库回显（缺失/非法按通道派生回落，见上方法）
+                    "source": self._local_llm_source_view(),
+                    # 20261005 设置页档位管理卡「当前模型」展示数据源（缺失为空串，
+                    # 前端按「不可得即隐藏」降级）
+                    "model_path": str(self._config.get("local_llm", "model_path", "") or ""),
                 },
                 "acp": {"enabled": bool(self._config.get("acp", "enabled", False))},
                 "remote": {"enabled": bool(self._config.get("remote", "enabled", False))},
+                # 聊天记忆注入开关（RAG 闭环，20261005）：设置页「聊天时自动回忆」回显
+                "memory": {
+                    "context_inject": bool(
+                        self._config.get("memory", "context_inject", True)
+                    ),
+                },
                 # 主动视觉（Task C）：设置页开关回显；开启后由 vision tick 线程
                 # 驱动采样（默认 False，隐私红线：关闭状态绝不产生屏幕采样）
                 "vision": {"enabled": bool(self._config.get("vision", "enabled", False))},
@@ -1239,7 +1651,13 @@ def make_handler(
         def _handle_settings_update(self):
             """PUT /api/settings：应用白名单补丁并热更新落盘。
 
-            支持键：``cloud.provider``（须在 provider 白名单内）、``tts.voice``、
+            支持键：``cloud.provider``（须在 provider 白名单内）、``cloud.api_key``
+            （Fernet 加密落盘，GET 视图仅脱敏回显）、``download.channel``
+            （mirror/official 白名单；合法时派生写入 ``local_llm.source``——经
+            ``model_repo_for_channel`` 唯一映射，applied 登记 ``download.channel``
+            与 ``local_llm.source`` 各一次，与向导 ``_collect_setup_patch`` 同口径）、
+            ``tts.voice``、``tts.accel`` / ``tts.accel_device``（值域白名单，
+            与向导同口径；非法入 ignored 显式回显）、
             ``local_llm.enabled``（本地模式真正本地：True 经本地聊天运行时持有器
             ``ensure_started`` 幂等拉起后台加载线程——立即返回不阻塞请求、不持
             ``_CONFIG_WRITE_LOCK``；False 经 ``release()`` 释放运行时，无需重启）、
@@ -1272,7 +1690,7 @@ def make_handler(
                 return
             # 先做段类型校验——段存在但非 dict 一律 400，不做 .get() 取值
             invalid_sections = [
-                name for name in ("cloud", "tts", "local_llm", "accel", "vision")
+                name for name in ("cloud", "tts", "local_llm", "accel", "vision", "download")
                 if name in body and not isinstance(body[name], dict)
             ]
             if invalid_sections:
@@ -1311,6 +1729,23 @@ def make_handler(
                 else:
                     ignored.append("cloud.api_key（必须为非空字符串）")
 
+            # Task 5（向导选项入设置）：下载线路——mirror/official 白名单；合法时
+            # 派生写入 local_llm.source（model_repo_for_channel 唯一映射），applied
+            # 登记 download.channel 与 local_llm.source 各一次（与向导
+            # _collect_setup_patch 同口径）；非法值入 ignored 显式回显，不静默丢弃。
+            channel = body.get("download", {}).get("channel")
+            if channel is not None:
+                normalized_channel = channel.strip().lower() if isinstance(channel, str) else ""
+                if normalized_channel in CHANNELS:
+                    self._config.set("download", "channel", normalized_channel)
+                    applied.append("download.channel")
+                    self._config.set("local_llm", "source", model_repo_for_channel(normalized_channel))
+                    applied.append("local_llm.source")
+                else:
+                    ignored.append(
+                        f"download.channel={channel!r}（不在白名单 {list(CHANNELS)}）"
+                    )
+
             voice = body.get("tts", {}).get("voice")
             if voice is not None:
                 if isinstance(voice, str) and voice.strip():
@@ -1318,6 +1753,39 @@ def make_handler(
                     applied.append("tts.voice")
                 else:
                     ignored.append("tts.voice（必须为非空字符串）")
+
+            # Task 5（向导选项入设置）：语音加速两键——值域白名单校验（与向导
+            # _collect_setup_patch 同口径，_TTS_ACCEL_VALUES / _TTS_ACCEL_DEVICE_VALUES
+            # 单一真相源），合法写入并在 applied 登记、非法入 ignored 显式回显。
+            tts_accel = body.get("tts", {}).get("accel")
+            tts_accel_applied = False
+            if tts_accel is not None:
+                normalized_accel = (
+                    tts_accel.strip().lower() if isinstance(tts_accel, str) else ""
+                )
+                if normalized_accel in _TTS_ACCEL_VALUES:
+                    self._config.set("tts", "accel", normalized_accel)
+                    applied.append("tts.accel")
+                    tts_accel_applied = True
+                else:
+                    ignored.append(
+                        f"tts.accel={tts_accel!r}（不在白名单 {list(_TTS_ACCEL_VALUES)}）"
+                    )
+
+            tts_device = body.get("tts", {}).get("accel_device")
+            if tts_device is not None:
+                normalized_device = (
+                    tts_device.strip().lower() if isinstance(tts_device, str) else None
+                )
+                if normalized_device in _TTS_ACCEL_DEVICE_VALUES:
+                    self._config.set("tts", "accel_device", normalized_device)
+                    applied.append("tts.accel_device")
+                    tts_accel_applied = True
+                else:
+                    ignored.append(
+                        f"tts.accel_device={tts_device!r}"
+                        f"（不在白名单 {list(_TTS_ACCEL_DEVICE_VALUES)}）"
+                    )
 
             local_enabled = body.get("local_llm", {}).get("enabled")
             if local_enabled is not None:
@@ -1344,6 +1812,16 @@ def make_handler(
                     applied.append("vision.enabled")
                 else:
                     ignored.append("vision.enabled（必须为布尔）")
+
+            # 聊天记忆注入开关（RAG 闭环，20261005）：布尔校验，非法入 ignored。
+            # memory 为热更段——内存写即时生效（_build_memory_context 逐次读取）。
+            context_inject = body.get("memory", {}).get("context_inject")
+            if context_inject is not None:
+                if isinstance(context_inject, bool):
+                    self._config.set("memory", "context_inject", context_inject)
+                    applied.append("memory.context_inject")
+                else:
+                    ignored.append("memory.context_inject（必须为布尔）")
 
             # 运行偏好（性能/节能双模式）：保存 accel.mode 时经唯一真相源 accel_plan
             # 展开全部组件落点（tts.accel / tts.accel_device / asr / local_llm /
@@ -1386,8 +1864,10 @@ def make_handler(
                     )
                     return
                 # 语音桥重建（N-6）：配置已落盘 → 关旧 sidecar → 按新 tts.accel 重建；
-                # 失败不静默（响应附 needs_restart + 中文 message）。
-                if accel_applied:
+                # 失败不静默（响应附 needs_restart + 中文 message）。Task 5：
+                # 单独热更 tts.accel / tts.accel_device 同样改变 sidecar 参数，
+                # 与 accel.mode 展开路径一并不重建则新值不生效，故一并触发。
+                if accel_applied or tts_accel_applied:
                     voice_backend = self._rebuild_voice_backend()
 
             response = {"ok": True, "applied": applied, "ignored": ignored,
@@ -1749,7 +2229,7 @@ def make_handler(
             """POST /api/setup/model/download：启动本地小 LLM 后台下载（幂等）。
 
             body（可选）``{source, tier}``；缺省取配置 ``local_llm.source`` 与默认档
-            ``1.7B``。显式 ``source`` 须在 ``MODEL_REPOS`` 白名单内，否则 400（中文
+            ``E2B-Q4``。显式 ``source`` 须在 ``MODEL_REPOS`` 白名单内，否则 400（中文
             错误，不静默改换下载来源）。下载在后台 daemon 线程执行，本端点**立即
             返回**；进行中重复调用返回 ``already_running: true`` 且不启动第二个线程。
             未知档位 400（中文错误），不静默下载错误文件。
@@ -1805,20 +2285,49 @@ def make_handler(
                 }
             )
 
-        def _handle_chat_history_guard(self):
-            """GET /api/chat/history：聊天历史守卫（同样返回未启用提示 + 空列表）。"""
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": CHAT_SERVICE_DISABLED,
-                    "message": "聊天服务未启用（本期前端走 Mock 演示）",
-                    "messages": [],
-                }
-            )
+        def _handle_chat_history(self):
+            """GET /api/chat/history：返回最近对话历史（20261004 持久化接线）。
+
+            ``{"ok": True, "messages": [...]}``（最近 ``_CHAT_HISTORY_CAP`` 条，
+            每条 ``{role, content, time}``）；文件缺失 / 损坏返回空列表（不 5xx，
+            前端按无历史渲染）。
+            """
+            self._send_json({"ok": True, "messages": _load_chat_history(self._chat_history_file)})
 
         # ------------------------------------------------------------ 表情聊天（Task H3）
+        def _build_memory_context(self, message, agent_id):
+            """聊天记忆注入（RAG 闭环，20261005）：检索 top-K 记忆拼【回忆】上下文块。
+
+            - 开关 ``memory.context_inject``（默认开，热更段逐次读取即时生效）；
+            - memory-agent 跳过（其工具环自带检索，双份注入语义混乱）；
+            - 检索失败仅告警不阻塞聊天（功能容错，非向量库降级——向量库后端
+              的禁止降级语义见 _build_vector_store）；
+            - 空库不注入空块（无回忆时保持 prompt 干净）。
+
+            :return: str 上下文块（含「【回忆】」头）或空串。
+            """
+            if agent_id == MEMORY_AGENT_ID:
+                return ""
+            try:
+                enabled = bool(self._config.get("memory", "context_inject", True))
+            except Exception:  # noqa: BLE001 - 配置读取异常按开启处理（默认行为）
+                enabled = True
+            if not enabled or self._pipeline is None:
+                return ""
+            try:
+                result = self._pipeline.retrieve(
+                    message, agent_id=agent_id or "default", top_k=_MEMORY_INJECT_TOP_K
+                )
+            except Exception as exc:  # noqa: BLE001 - 检索失败不阻塞聊天主链路
+                LOGGER.warning("聊天记忆检索失败（不阻塞聊天）：%s", exc)
+                return ""
+            memories = (result or {}).get("memories") or []
+            if not memories:
+                return ""
+            return str((result or {}).get("context_text") or "").strip()
+
         def _build_chat_messages(self, message, agent_id):
-            """组装表情聊天的消息列表（system 人设 + user 输入）。
+            """组装表情聊天的消息列表（system 人设 + 记忆注入 + user 输入）。
 
             :param message: 用户输入文本（已 strip 非空）
             :param agent_id: 归一化后的 agent_id；命中本地 Agent 时以其 persona
@@ -1834,6 +2343,11 @@ def make_handler(
                 system = f"你的角色设定：{persona}\n{_CHAT_DEFAULT_SYSTEM}"
             else:
                 system = _CHAT_DEFAULT_SYSTEM
+            # 记忆注入（RAG 闭环，20261005）：开关开且有回忆时把【回忆】块拼入 system，
+            # 让聊天回复自然引用记忆（memory-agent 跳过、空库/失败不注入）
+            memory_block = self._build_memory_context(message, agent_id)
+            if memory_block:
+                system = f"{system}\n{memory_block}"
             return [
                 {"role": "system", "content": system},
                 {"role": "user", "content": message},
@@ -1852,7 +2366,15 @@ def make_handler(
             - 兜底管理器 status != "cloud"（离线提示/本地承接）→ 附带 offline:true；
               兜底管理器自身抛 CloudConfigError / CloudUnavailableError（保底）→
               返回 200 固定友好文案 + offline:true，不抛 5xx——前端把提示文案作为
-              伴侣气泡真实展示（后端真实回传，非前端伪造）。
+              回复气泡真实展示（后端真实回传，非前端伪造）；
+            - 记忆管理助手工具环（20261005，spec: align-wizard-settings-memory-pet）：
+              agent_id=memory-agent 时，回复中的 [memory:op {...}] 指令标签经
+              BuiltinToolRegistry 记忆工具逐个执行，执行结果以「系统回执」user 消息
+              回注再调一轮 LLM（最多 _MEMORY_MAX_TOOL_ROUNDS 轮，不无限递归）；
+              最终 clean_text 剥离全部 [memory:...] 标签（协议细节不泄漏到展示层）；
+              工具执行失败时回执带中文失败原因，由助手二次回复向用户说明（不崩）。
+              memory-agent 对话不落 chat_history（管理通道非日常对话，落盘会污染
+              悬浮窗/桌宠的日常历史气泡——取舍依据见下方落盘条件注释）。
             """
             body = self._read_body_json()
             if body is None:
@@ -1890,7 +2412,49 @@ def make_handler(
                     }
                 )
                 return
-            parsed = EmotionTagParser().parse(full_text)
+            # ---- 记忆管理助手工具环（20261005）----
+            # agent_id=memory-agent 时：解析首轮回复中的 [memory:op {...}] 标签
+            # （可零/多个），经 self._registry（make_handler 闭包绑定）逐个执行，
+            # 结果以系统回执 user 消息回注二次调用；回注轮最多 _MEMORY_MAX_TOOL_ROUNDS。
+            # 本地小 LLM 承接（offline=True）同样可能产出标签，故不按 offline 排除；
+            # 无标签时解析零成本直接跳过，其他 agent 完全不受影响。
+            if agent_id == MEMORY_AGENT_ID and self._registry is not None:
+                pending_ops = _extract_memory_ops(full_text)
+                follow_up_messages = list(messages)
+                for _round in range(_MEMORY_MAX_TOOL_ROUNDS):
+                    if not pending_ops:
+                        break
+                    follow_up_messages.append({"role": "assistant", "content": full_text})
+                    for op, args, raw_tag in pending_ops[:_MEMORY_MAX_OPS_PER_TURN]:
+                        tool_id = _MEMORY_OP_TO_TOOL.get(op)
+                        if tool_id is None:
+                            outcome = {"success": False, "error": f"未知记忆指令 op：{op!r}"}
+                        elif args is None:
+                            outcome = {"success": False, "error": "指令参数必须是合法 JSON 对象"}
+                        else:
+                            outcome = self._registry.call(tool_id, args)
+                        follow_up_messages.append(
+                            {"role": "user", "content": _memory_tool_result_message(op, raw_tag, outcome)}
+                        )
+                    try:
+                        # 回注二次调用：messages + assistant 首轮回复 + 逐条工具回执
+                        if self._chat_fallback is not None:
+                            full_text = "".join(self._chat_fallback.chat(follow_up_messages))
+                        else:
+                            full_text = "".join(self._chat_cloud.chat(follow_up_messages))
+                    except (CloudConfigError, CloudUnavailableError) as exc:
+                        # 二轮调用云端不可用：剥离标签后以首轮文本兜底返回（不 5xx）
+                        LOGGER.warning(
+                            "记忆助手回注轮云端不可用（%s），以首轮回复剥标签兜底", exc.__class__.__name__
+                        )
+                        full_text = _strip_memory_tags(full_text)
+                        break
+                    pending_ops = _extract_memory_ops(full_text)
+                # 轮次耗尽仍有标签：下方 _strip_memory_tags 强制剥离，不再递归
+            # 最终展示文本：memory-agent 剥离全部 [memory:...] 指令标签（含轮次耗尽
+            # 残留与 JSON 非法残缺标签）；其他 agent 保持 EmotionTagParser 既有语义
+            display_text = _strip_memory_tags(full_text) if agent_id == MEMORY_AGENT_ID else full_text
+            parsed = EmotionTagParser().parse(display_text)
             payload = {
                 "ok": True,
                 "clean_text": parsed["clean_text"],
@@ -1900,6 +2464,18 @@ def make_handler(
             # 保持既有成功响应形状：offline 仅在为真时附带，不新增噪声字段
             if offline:
                 payload["offline"] = True
+            # 对话持久化（20261004）：真实对话（云端与本地承接一视同仁）落盘；
+            # 离线占位文案（断网 / 本地未就绪 / 配置未完成提示，offline:true 走
+            # 成功路径）不落盘——不是真实对话，落盘会污染历史；
+            # memory-agent（20261005）为记忆页管理通道，指令往返非日常对话，
+            # 不落盘——避免管理指令污染悬浮窗/桌宠的日常聊天历史。
+            if (
+                agent_id != MEMORY_AGENT_ID
+                and not (offline and parsed["clean_text"] in _offline_placeholder_texts())
+            ):
+                _append_chat_history(
+                    message, parsed["clean_text"], path=self._chat_history_file
+                )
             self._send_json(payload)
 
         # ------------------------------------------------------------ 悬浮桌宠模型分发（20260924_模块0_接入VRM悬浮桌宠）
@@ -1947,6 +2523,141 @@ def make_handler(
             self.end_headers()
             self.wfile.write(data)
 
+        def _handle_pet_model_import(self):
+            """POST /api/pet/model/import：导入用户自选 VRM 模型（Task 4）。
+
+            行为契约（spec「用户自定义 VRM 桌宠模型」）：
+            - body ``{source_path}`` 必须存在、可读、后缀 .vrm（大小写不敏感），
+              否则 400 中文错误（missing_source_path / invalid_source_path /
+              source_not_found）；
+            - 现模型（pet_model_path()）存在时先复制备份为同目录
+              ``cx-open.vrm.bak``（覆盖旧备份）；备份失败 → 500 且现模型不动；
+            - 新文件先复制到同目录临时名再 ``os.replace`` 原子替换——复制中途
+              失败（磁盘满 / 权限）原模型文件保持原样（500 pet_model_import_failed）；
+            - 成功返回 ``{ok: true, message}`` 中文（前端经 localStorage 总线
+              触发 VRM 立即重载）；
+            - 走既有 Host / 令牌闸（do_POST 统一入口，无豁免）。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            source_path = body.get("source_path") if isinstance(body, dict) else None
+            if not isinstance(source_path, str) or not source_path.strip():
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "missing_source_path",
+                        "message": "缺少 source_path：请通过文件选择器选择要导入的 .vrm 模型文件",
+                    },
+                    400,
+                )
+                return
+            source_path = source_path.strip()
+            # 后缀白名单（大小写不敏感）：仅接受 .vrm，防止任意文件覆盖进模型位
+            if not source_path.lower().endswith(".vrm"):
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "invalid_source_path",
+                        "message": "仅支持 .vrm 格式的桌宠模型文件，请重新选择",
+                    },
+                    400,
+                )
+                return
+            if not os.path.isfile(source_path):
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "source_not_found",
+                        "message": f"所选模型文件不存在或不可读：{source_path}",
+                    },
+                    400,
+                )
+                return
+            target = pet_model_path()
+            backup = target + ".bak"
+            tmp_target = target + ".importing"
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                # 现模型存在 → 先备份（覆盖旧备份）；备份失败则整体中止，现模型不动
+                if os.path.isfile(target):
+                    shutil.copyfile(target, backup)
+                # 先复制到同目录临时名再原子替换（同盘 os.replace）：
+                # 复制中途失败原模型不受影响，替换后不留临时残留
+                shutil.copyfile(source_path, tmp_target)
+                os.replace(tmp_target, target)
+            except OSError as exc:
+                # 兜底清理可能残留的临时文件（best-effort，不影响错误响应）
+                try:
+                    if os.path.isfile(tmp_target):
+                        os.remove(tmp_target)
+                except OSError:
+                    pass
+                LOGGER.error("导入桌宠模型失败（原模型未受影响）：%s", exc)
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "pet_model_import_failed",
+                        "message": f"导入桌宠模型失败，原模型保持不变：{exc}",
+                    },
+                    500,
+                )
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    "message": "桌宠模型导入成功，悬浮窗与桌宠页将立即加载新模型",
+                }
+            )
+
+        def _handle_pet_model_reset(self):
+            """POST /api/pet/model/reset：从备份还原默认桌宠模型（Task 4）。
+
+            - ``cx-open.vrm.bak`` 存在 → 复制还原为 ``cx-open.vrm``，返回 ok:true；
+            - 备份缺失 → 404 ``pet_model_backup_missing`` + 中文 message；
+            - 还原同样经同目录临时名 + ``os.replace`` 原子替换，中途失败不破坏现模型；
+            - 走既有 Host / 令牌闸（do_POST 统一入口，无豁免）。
+            """
+            target = pet_model_path()
+            backup = target + ".bak"
+            if not os.path.isfile(backup):
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "pet_model_backup_missing",
+                        "message": "没有可恢复的模型备份（尚未导入过自定义模型），无法恢复默认",
+                    },
+                    404,
+                )
+                return
+            tmp_target = target + ".restoring"
+            try:
+                shutil.copyfile(backup, tmp_target)
+                os.replace(tmp_target, target)
+            except OSError as exc:
+                try:
+                    if os.path.isfile(tmp_target):
+                        os.remove(tmp_target)
+                except OSError:
+                    pass
+                LOGGER.error("恢复默认桌宠模型失败：%s", exc)
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "pet_model_reset_failed",
+                        "message": f"恢复默认桌宠模型失败：{exc}",
+                    },
+                    500,
+                )
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    "message": "已恢复默认桌宠模型，悬浮窗与桌宠页将立即重新加载",
+                }
+            )
+
         # ------------------------------------------------------------ 路由
         def do_GET(self):
             """处理 GET：health/status/settings/chat 守卫、记忆/Agent/远端/电脑状态、/api/tools、/api/pet/model。
@@ -1989,11 +2700,20 @@ def make_handler(
                     return
 
                 if path == "/api/chat/history":
-                    self._handle_chat_history_guard()
+                    self._handle_chat_history()
                     return
 
                 if path == "/api/remote/status":
                     self._handle_remote_status()
+                    return
+
+                # 管理面（20261004_模块0_管理面CX-A管理CX-O）：实例台账与治理透传
+                if path == "/api/fleet/instances":
+                    self._handle_fleet_list()
+                    return
+                fleet_route = self._parse_fleet_instance_route(path)
+                if fleet_route is not None:
+                    self._handle_fleet_instance_get(fleet_route[0], fleet_route[1], query)
                     return
 
                 if path == "/api/memories":
@@ -2002,6 +2722,19 @@ def make_handler(
 
                 if path == "/api/memories/search":
                     self._handle_search(query)
+                    return
+
+                # 记忆页核心能力（20261005）：衰减统计 / 日记视图 / 3D 检索
+                if path == "/api/memories/decay-stats":
+                    self._handle_memory_decay_stats()
+                    return
+
+                if path == "/api/memories/diary":
+                    self._handle_memory_diary(query)
+                    return
+
+                if path == "/api/memories/3d":
+                    self._handle_memory_search_3d(query)
                     return
 
                 if path == "/api/agents":
@@ -2040,8 +2773,9 @@ def make_handler(
                 return
             try:
                 path = urlparse(self.path).path
-                # N1：POST 无豁免端点，统一在 path 解析后过启动令牌闸（与 do_GET 次序对齐）
-                if not self._check_token():
+                # N1：POST 统一过启动令牌闸（与 do_GET 次序对齐）；唯一豁免
+                # /api/admin/register——CX-O 侧无 CX-A 令牌，回环来源校验在 handler 内执行
+                if path != "/api/admin/register" and not self._check_token():
                     return
                 if path == "/api/chat/messages":
                     self._handle_chat_send_guard()
@@ -2061,11 +2795,32 @@ def make_handler(
                 if path == "/api/agents":
                     self._handle_agents_create()
                     return
+                # 记忆 CRUD（20261005）：新建 / 批量删除 / 衰减同步
+                if path == "/api/memories":
+                    self._handle_memory_create()
+                    return
+                if path == "/api/memories/batch-delete":
+                    self._handle_memory_batch_delete()
+                    return
+                if path == "/api/memories/sync-decay":
+                    self._handle_memory_sync_decay()
+                    return
                 if path == "/api/remote/control":
                     self._handle_remote_control()
                     return
                 if path == "/api/remote/push_config":
                     self._handle_remote_push_config()
+                    return
+                # 管理面（20261004_模块0_管理面CX-A管理CX-O）：注册接收 / 台账登记 / 治理下发
+                if path == "/api/admin/register":
+                    self._handle_fleet_register()
+                    return
+                if path == "/api/fleet/instances":
+                    self._handle_fleet_add()
+                    return
+                fleet_route = self._parse_fleet_instance_route(path)
+                if fleet_route is not None:
+                    self._handle_fleet_instance_post(fleet_route[0], fleet_route[1])
                     return
                 if path == "/api/computer/authorize":
                     self._handle_computer_authorize()
@@ -2087,6 +2842,14 @@ def make_handler(
                     return
                 if path == "/api/voice/synthesize_stream":
                     self._handle_voice_synthesize_stream()
+                    return
+                # 桌宠模型导入/恢复（Task 4：用户自定义 VRM 桌宠模型）——
+                # 走上方统一令牌闸（无豁免），与 GET /api/pet/model 同一防线
+                if path == "/api/pet/model/import":
+                    self._handle_pet_model_import()
+                    return
+                if path == "/api/pet/model/reset":
+                    self._handle_pet_model_reset()
                     return
                 if path == "/api/voices/import":
                     self._handle_voices_import()
@@ -2114,6 +2877,12 @@ def make_handler(
                 if path == "/api/settings":
                     self._handle_settings_update()
                     return
+                # 记忆编辑（20261005）：PUT /api/memories/{id}
+                if path.startswith("/api/memories/"):
+                    raw = path[len("/api/memories/"):]
+                    if raw and "/" not in raw:
+                        self._handle_memory_update(raw)
+                        return
                 agent_id = self._extract_agents_id(path)
                 if agent_id is None:
                     self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
@@ -2143,6 +2912,13 @@ def make_handler(
                 if agent_id is not None:
                     self._handle_agents_delete(agent_id)
                     return
+                # 管理面：注销实例（/api/fleet/instances/{id}）
+                fleet_prefix = "/api/fleet/instances/"
+                if path.startswith(fleet_prefix):
+                    raw = path[len(fleet_prefix):]
+                    if raw and "/" not in raw:
+                        self._handle_fleet_remove(raw)
+                        return
                 self._send_json({"ok": False, "error": "not_found", "message": f"未找到接口 {path}"}, 404)
             except Exception as exc:  # noqa: BLE001 - 兜底：超大 int 触发 sqlite OverflowError 等畸形输入均结构化响应
                 self._guard_internal_error(exc)
@@ -2258,6 +3034,465 @@ def make_handler(
                 return
             self._send_json(result)
 
+        # ------------------------------------------------------------ 记忆页完整控制（20261005，spec: align-wizard-settings-memory-pet）
+        @staticmethod
+        def _parse_memory_id(raw_id):
+            """解析记忆 id 字符串为 int；非法返回 (None, 中文错误消息)。
+
+            校验口径与 _delete_memory 一致：整数 + 64 位有符号范围（防 sqlite
+            OverflowError 500）。
+            """
+            if raw_id is None or raw_id == "" or "/" in str(raw_id):
+                return None, "非法记忆 id"
+            try:
+                memory_id = int(raw_id)
+            except ValueError:
+                return None, "id 必须是整数"
+            if not (_INT64_MIN <= memory_id <= _INT64_MAX):
+                return None, "id 超出有效范围（64 位整数）"
+            return memory_id, None
+
+        @staticmethod
+        def _parse_memory_importance(raw):
+            """校验 importance 入参（1~5 整数）；非法返回 None（由调用方回 400）。"""
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                return None
+            return value if 1 <= value <= 5 else None
+
+        @staticmethod
+        def _normalize_memory_tags(raw):
+            """规范化 tags 入参：list[str] -> JSON 文本；str 原样；None -> None。
+
+            返回 (tags, error)；error 非 None 表示入参非法（非字符串/列表）。
+            """
+            if raw is None:
+                return None, None
+            if isinstance(raw, str):
+                return raw, None
+            if isinstance(raw, list) and all(isinstance(t, str) for t in raw):
+                return json.dumps(raw, ensure_ascii=False), None
+            return None, "tags 必须为字符串列表或字符串"
+
+        def _memory_write_target(self):
+            """解析记忆写入口：优先 MemoryManager（相似去重 + 向量化），回落 store.add。
+
+            与 MEMORY_TYPES 四值域校验（schema.py）共用 store/manager 侧既有校验。
+            """
+            manager = getattr(self._pipeline, "manager", None)
+            return manager, self._store
+
+        def _handle_memory_create(self):
+            """POST /api/memories：新建一条记忆（记忆页新建弹窗）。
+
+            body {content, memory_type?, importance?, tags?, agent_id?}：
+            - content 必填非空（str），否则 400；
+            - memory_type ∈ long_term/short_term/permanent/diary（兼容键 type），
+              非法 400（中文）；
+            - importance 1~5 整数（缺省 3），越界 400；
+            - tags 字符串列表或字符串；agent_id 经 sanitize（空值回落 default）。
+            - 写入口优先 manager.add_memory（相似去重返回 None → deduplicated:true），
+              回落 store.add；成功 200 {ok, id, deduplicated?}。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            content = body.get("content")
+            if not isinstance(content, str) or not content.strip():
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "content 为必填字段且不能为空"}, 400
+                )
+                return
+            mem_type = body.get("memory_type", body.get("type", "long_term"))
+            if mem_type not in MEMORY_TYPES_ALLOWED:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "bad_request",
+                        "message": f"memory_type 非法：{mem_type!r}，可选：{list(MEMORY_TYPES_ALLOWED)}",
+                    },
+                    400,
+                )
+                return
+            importance_raw = body.get("importance", 3)
+            importance = self._parse_memory_importance(importance_raw)
+            if importance is None:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "importance 必须为 1~5 的整数"}, 400
+                )
+                return
+            tags, tag_err = self._normalize_memory_tags(body.get("tags"))
+            if tag_err:
+                self._send_json({"ok": False, "error": "bad_request", "message": tag_err}, 400)
+                return
+            agent_id = self._sanitize_agent_id(body.get("agent_id"))
+            manager, store = self._memory_write_target()
+            try:
+                if manager is not None:
+                    mem_id = manager.add_memory(
+                        content=content,
+                        type=mem_type,
+                        importance=importance,
+                        agent_id=agent_id,
+                        tags=tags,
+                    )
+                    if mem_id is None:
+                        # 相似去重命中：未实际写入（G-1 统一写入口语义）
+                        self._send_json({"ok": True, "id": None, "deduplicated": True})
+                        return
+                else:
+                    mem_id = store.add(
+                        {
+                            "content": content,
+                            "type": mem_type,
+                            "importance": importance,
+                            "tags": tags,
+                            "agent_id": agent_id,
+                        }
+                    )
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
+                return
+            self._send_json({"ok": True, "id": mem_id})
+
+        def _handle_memory_update(self, raw_id):
+            """PUT /api/memories/{id}：编辑一条记忆（走 MemoryStore.update 既有校验）。
+
+            body 为字段补丁：content / memory_type(兼容 type) / importance / tags /
+            agent_id 任选其一或组合。id 不存在或已软删 → 404；字段非法 → 400；
+            全部为可更新白名单之外的字段 → 400（store.update 全未知键返回 0）。
+            """
+            memory_id, err = self._parse_memory_id(raw_id)
+            if err:
+                self._send_json({"ok": False, "error": "bad_request", "message": err}, 400)
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            fields = {}
+            if "content" in body:
+                content = body.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    self._send_json(
+                        {"ok": False, "error": "bad_request", "message": "content 不能为空"}, 400
+                    )
+                    return
+                fields["content"] = content
+            if "memory_type" in body or "type" in body:
+                mem_type = body.get("memory_type", body.get("type"))
+                if mem_type not in MEMORY_TYPES_ALLOWED:
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": "bad_request",
+                            "message": f"memory_type 非法：{mem_type!r}，可选：{list(MEMORY_TYPES_ALLOWED)}",
+                        },
+                        400,
+                    )
+                    return
+                fields["type"] = mem_type
+            if "importance" in body:
+                importance = self._parse_memory_importance(body.get("importance"))
+                if importance is None:
+                    self._send_json(
+                        {"ok": False, "error": "bad_request", "message": "importance 必须为 1~5 的整数"},
+                        400,
+                    )
+                    return
+                fields["importance"] = importance
+            if "tags" in body:
+                tags, tag_err = self._normalize_memory_tags(body.get("tags"))
+                if tag_err:
+                    self._send_json({"ok": False, "error": "bad_request", "message": tag_err}, 400)
+                    return
+                fields["tags"] = tags
+            if "agent_id" in body:
+                fields["agent_id"] = self._sanitize_agent_id(body.get("agent_id"))
+            if not fields:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "bad_request",
+                        "message": "请求体中没有可更新字段（可用：content/memory_type/importance/tags/agent_id）",
+                    },
+                    400,
+                )
+                return
+            store = self._store
+            try:
+                existing = store.get(memory_id)
+            except Exception:  # noqa: BLE001 - 探测异常按不存在处理
+                existing = None
+            if existing is None or existing.get("is_deleted"):
+                self._send_json(
+                    {"ok": False, "error": "not_found", "message": f"记忆 {memory_id} 不存在"}, 404
+                )
+                return
+            try:
+                updated = store.update(memory_id, fields)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
+                return
+            if updated <= 0:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "没有生效的更新字段"}, 400
+                )
+                return
+            self._send_json({"ok": True, "id": memory_id, "memory": store.get(memory_id)})
+
+        def _handle_memory_batch_delete(self):
+            """POST /api/memories/batch-delete：批量软删除记忆（记忆页批量模式）。
+
+            body {ids: [...]}：id 列表（int/数字字符串均可）。逐条处理：
+            - 不存在 / 已软删 → skipped（reason=not_found）；
+            - permanent 类型（permanent 标记或 type=='permanent'）→ 保护跳过
+              （reason=permanent_protected，spec 硬性要求：批量删除需单条确认，
+              permanent 一律不删）；
+            - 其余走 manager.soft_delete（清理向量孤儿）/ store.soft_delete。
+            返回 {ok, deleted_count, deleted_ids, skipped, total}。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            ids = body.get("ids")
+            if not isinstance(ids, list) or not ids:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "ids 必须为非空列表"}, 400
+                )
+                return
+            manager = getattr(self._pipeline, "manager", None)
+            store = self._store
+            deleted_ids, skipped = [], []
+            for raw in ids[:_MAX_BATCH_MEMORY_IDS]:
+                try:
+                    memory_id = int(raw)
+                except (TypeError, ValueError):
+                    skipped.append({"id": raw, "reason": "invalid_id"})
+                    continue
+                try:
+                    mem = store.get(memory_id)
+                except Exception:  # noqa: BLE001 - 探测异常按不存在处理
+                    mem = None
+                if mem is None or mem.get("is_deleted"):
+                    skipped.append({"id": memory_id, "reason": "not_found"})
+                    continue
+                if bool(mem.get("permanent")) or mem.get("type") == "permanent":
+                    skipped.append({"id": memory_id, "reason": "permanent_protected"})
+                    continue
+                try:
+                    ok = manager.soft_delete(memory_id) if manager is not None else store.soft_delete(memory_id)
+                except Exception:  # noqa: BLE001 - 单条失败不阻断批量
+                    ok = False
+                if ok:
+                    deleted_ids.append(memory_id)
+                else:
+                    skipped.append({"id": memory_id, "reason": "delete_failed"})
+            overflow = len(ids) - _MAX_BATCH_MEMORY_IDS
+            if overflow > 0:
+                skipped.append({"id": f"+{overflow}条未处理", "reason": "batch_limit_exceeded"})
+            self._send_json(
+                {
+                    "ok": True,
+                    "deleted_count": len(deleted_ids),
+                    "deleted_ids": deleted_ids,
+                    "skipped": skipped,
+                    "total": len(ids),
+                }
+            )
+
+        def _handle_memory_decay_stats(self):
+            """GET /api/memories/decay-stats：遗忘衰减统计（衰减面板展示）。
+
+            走 MemoryStore.decay_stats（CX-O 遗忘曲线口径，permanent 豁免），
+            返回 {ok, statistics}，statistics 含即将遗忘(fading)/已衰减(faded)分桶。
+            """
+            try:
+                stats = self._store.decay_stats()
+            except Exception as exc:  # noqa: BLE001 - 统计异常结构化 500
+                LOGGER.exception("decay-stats 统计失败：%s", exc)
+                self._send_json({"ok": False, "error": "internal error"}, 500)
+                return
+            self._send_json({"ok": True, "statistics": stats})
+
+        def _handle_memory_sync_decay(self):
+            """POST /api/memories/sync-decay：执行衰减同步，低分记忆软删归档。
+
+            走 MemoryStore.sync_decay（阈值 SYNC_DECAY_ARCHIVE_THRESHOLD，permanent
+            豁免）；deleter 优先传 manager.soft_delete（同步清理向量库孤儿向量）。
+            返回 {ok, scanned, deleted_count, deleted_ids, skipped_permanent,
+            archive_threshold}。
+            """
+            manager = getattr(self._pipeline, "manager", None)
+            deleter = manager.soft_delete if manager is not None else None
+            try:
+                result = self._store.sync_decay(deleter=deleter)
+            except Exception as exc:  # noqa: BLE001 - 同步异常结构化 500
+                LOGGER.exception("sync-decay 执行失败：%s", exc)
+                self._send_json({"ok": False, "error": "internal error"}, 500)
+                return
+            result = dict(result)
+            result["ok"] = True
+            self._send_json(result)
+
+        def _handle_memory_diary(self, query):
+            """GET /api/memories/diary?date=&agent_id=&type=&limit=：日记视图。
+
+            按 created_at 本地日期（YYYY-MM-DD，取时间戳前 10 字符）分组返回记忆，
+            分组按日期降序（对齐 CX-O get_diary_entries 的 diary_groups 结构，
+            出自 C:\\CX-O\\CX-O-SERVER\\server\\api\\routers\\memory.py；CX-O 按
+            metadata.date 分组，CX-A 按 spec 澄清改为 created_at 本地日期）。
+            - date=YYYY-MM-DD：只返回该日期组（其余日期仍计入 groups 便于前端导航）；
+            - type 可选过滤（缺省全类型——日记视图为「按日期分组的浏览模式」，
+              与卡片/列表视图并列，浏览同一批数据；type=diary 即过滤日记类型）。
+            返回 {ok, date, diary_groups: [{date, entries, count}], count}。
+            """
+            limit = None
+            if query.get("limit") is not None:
+                limit = self._parse_limit_param(query["limit"], "limit")
+                if limit is None:
+                    return
+            mem_type = query.get("type") or None
+            if mem_type is not None and mem_type not in MEMORY_TYPES_ALLOWED:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "bad_request",
+                        "message": f"type 非法：{mem_type!r}，可选：{list(MEMORY_TYPES_ALLOWED)}",
+                    },
+                    400,
+                )
+                return
+            agent_id = self._sanitize_agent_id(query.get("agent_id")) if query.get("agent_id") else None
+            try:
+                rows = self._store.list(type=mem_type, agent_id=agent_id, limit=limit, include_deleted=False)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
+                return
+            grouped = {}
+            for mem in rows:
+                created = str(mem.get("created_at") or "")
+                day = created[:10] if len(created) >= 10 else created or "未知日期"
+                grouped.setdefault(day, []).append(mem)
+            diary_groups = [
+                {"date": day, "entries": items, "count": len(items)}
+                for day, items in sorted(grouped.items(), reverse=True)
+            ]
+            target_date = query.get("date")
+            if target_date:
+                diary_groups = [g for g in diary_groups if g["date"] == target_date]
+            total = sum(g["count"] for g in diary_groups)
+            self._send_json(
+                {"ok": True, "date": target_date, "diary_groups": diary_groups, "count": total}
+            )
+
+        def _handle_memory_search_3d(self, query):
+            """GET /api/memories/3d?query=&w_importance=&w_time=&w_rel=&type=&agent_id=&limit=：
+            重要性/时间/相关性三维加权检索（检索面板，权重可调）。
+
+            打分公式（对齐 CX-O MemoryRouter._score_memories 主链路，已在
+            lite/memory/scoring.py 移植为 score_memories）：
+                final = importance·w_i + time·w_t + relevance·w_r（上限 1.0）
+            其中 time 为衰减后分数（CX-O 遗忘曲线口径，permanent 豁免），relevance
+            来自既有检索链路（MemoryRetrievalPipeline 向量相似度，缺省 0.5）。
+            说明：CX-O 的 /memories/3d 端点走乘性门控变体
+            （final = relevance × (w_i·imp + w_t·time)/(w_i+w_t)，出自
+            C:\\CX-O\\CX-O-SERVER\\server\\core\\memory\\mixins\\advanced_mixin.py），
+            CX-A 贴合既有 scoring 体系（spec 要求「实现贴合既有 lite/memory SQLite
+            体系」）沿用线性加权主链路口径，默认权重 0.35/0.25/0.4 与 CX-O 一致。
+            """
+            w_importance = _MEMORY_3D_DEFAULT_WEIGHTS["importance"]
+            w_time = _MEMORY_3D_DEFAULT_WEIGHTS["time"]
+            w_rel = _MEMORY_3D_DEFAULT_WEIGHTS["relevance"]
+            for key, target in (
+                ("w_importance", "importance"),
+                ("w_time", "time"),
+                ("w_rel", "relevance"),
+            ):
+                raw = query.get(key)
+                if raw is None:
+                    continue
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    self._send_json(
+                        {"ok": False, "error": "bad_request", "message": f"{key} 必须为 0~1 的数值"}, 400
+                    )
+                    return
+                if not (0.0 <= value <= 1.0):
+                    self._send_json(
+                        {"ok": False, "error": "bad_request", "message": f"{key} 必须在 0~1 之间"}, 400
+                    )
+                    return
+                setattr_placeholder = value  # noqa: F841 - 仅示位，下方按 target 赋值
+                if target == "importance":
+                    w_importance = value
+                elif target == "time":
+                    w_time = value
+                else:
+                    w_rel = value
+            limit = _MEMORY_3D_DEFAULT_LIMIT
+            if query.get("limit") is not None:
+                limit = self._parse_limit_param(query["limit"], "limit")
+                if limit is None:
+                    return
+            mem_type = query.get("type") or None
+            if mem_type is not None and mem_type not in MEMORY_TYPES_ALLOWED:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "bad_request",
+                        "message": f"type 非法：{mem_type!r}，可选：{list(MEMORY_TYPES_ALLOWED)}",
+                    },
+                    400,
+                )
+                return
+            agent_id = self._sanitize_agent_id(query.get("agent_id"))
+            q = (query.get("query") or "").strip()
+            # 相关性维度走既有检索链路：pipeline 向量检索给出候选及其相似度 score；
+            # 不可用/无 query 时退化 store.list_recent（relevance 缺省 0.5，对齐
+            # CX-O「向量库不可用时无损降级」口径）。
+            candidates = None
+            degraded = False
+            pipeline = self._pipeline
+            if q and pipeline is not None:
+                try:
+                    result = pipeline.retrieve(q, agent_id=agent_id, top_k=_MEMORY_3D_CANDIDATE_LIMIT)
+                    candidates = list(result.get("memories") or [])
+                except Exception as exc:  # noqa: BLE001 - 检索链异常降级（不 500）
+                    LOGGER.warning("3D 检索候选预取失败，降级列表扫描：%s", exc)
+                    candidates = None
+            if candidates is None:
+                degraded = True
+                try:
+                    rows = self._store.list(type=mem_type, agent_id=None if agent_id == "default" else agent_id)
+                except ValueError as exc:
+                    self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
+                    return
+                if q:
+                    # 子串过滤模拟相关性（与 builtin_registry 退化检索同口径）
+                    rows = [m for m in rows if q in str(m.get("content") or "")]
+                candidates = rows
+            scored = _memory_score_3d(
+                candidates,
+                query=q,
+                importance_weight=w_importance,
+                time_weight=w_time,
+                relevance_weight=w_rel,
+            )
+            self._send_json(
+                {
+                    "ok": True,
+                    "memories": scored[:limit],
+                    "total": len(scored),
+                    "applied_weights": {"importance": w_importance, "time": w_time, "relevance": w_rel},
+                    "degraded": degraded,
+                }
+            )
+
         # ------------------------------------------------------------ 远端遥控接口
         def _map_remote_error(self, exc):
             """把远端遥控异常映射为可发送的 (payload, status)。
@@ -2327,6 +3562,172 @@ def make_handler(
                 self._send_json(payload, status)
                 return
             self._send_json(data)
+
+        # ------------------------------------------------------------ 管理面接口（CX-A 管理 CX-O）
+        @staticmethod
+        def _parse_fleet_instance_route(path):
+            """解析 /api/fleet/instances/{id}/{action} → (id, action)；不匹配返回 None。"""
+            prefix = "/api/fleet/instances/"
+            if not path.startswith(prefix):
+                return None
+            parts = path[len(prefix):].split("/")
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                return None
+            return parts[0], parts[1]
+
+        @staticmethod
+        def _query_int(query, key, default):
+            """查询参数转 int；缺失/非法回落默认值。"""
+            try:
+                return int(query.get(key))
+            except (TypeError, ValueError):
+                return default
+
+        def _fleet_ready(self):
+            """FleetManager 未装配（直调 make_handler 的旧测试路径）时回 503。"""
+            if self._fleet is None:
+                self._send_json(
+                    {"ok": False, "error": "fleet_unavailable", "message": "管理面未装配"}, 503
+                )
+                return False
+            return True
+
+        def _map_fleet_error(self, exc):
+            """管理面异常 → (payload, status)：404/400/504/远端原样透传。
+
+            FleetRemoteError 携带结构化 status_code + payload——CX-O 的
+            ADMIN_* 错误码与 HTTP 状态码**原样透传**（非 502 包装）。
+            FleetNotFound（未命中 404）必须先于 FleetInvalid（400）判定——
+            前者是后者的子类，顺序颠倒会把 404 退化成 400。
+            """
+            if isinstance(exc, FleetNotFound):
+                return {"ok": False, "error": "not_found", "message": f"未找到实例 {exc.args[0]}"}, 404
+            if isinstance(exc, FleetInvalid):
+                return {"ok": False, "error": "bad_request", "message": str(exc)}, 400
+            if isinstance(exc, RemoteUnreachable):
+                return {"ok": False, "error": "fleet_unreachable", "message": str(exc)}, 504
+            if isinstance(exc, FleetRemoteError):
+                payload = exc.payload if isinstance(exc.payload, dict) else {"raw": exc.payload}
+                return payload, exc.status_code
+            return {"ok": False, "error": "internal_error", "message": str(exc)}, 500
+
+        def _handle_fleet_list(self):
+            """GET /api/fleet/instances：台账列表（脱敏视图，被动 last_seen 新鲜度）。"""
+            if not self._fleet_ready():
+                return
+            self._send_json({"status": "success", "instances": self._fleet.list_instances()})
+
+        def _handle_fleet_add(self):
+            """POST /api/fleet/instances：手动登记实例 {name, base_url, token}。"""
+            if not self._fleet_ready():
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            try:
+                view = self._fleet.add_manual(
+                    name=body.get("name"),
+                    base_url=body.get("base_url"),
+                    token=body.get("token"),
+                )
+            except FleetInvalid as exc:
+                self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
+                return
+            self._send_json({"status": "success", "instance": view})
+
+        def _handle_fleet_remove(self, instance_id):
+            """DELETE /api/fleet/instances/{id}：注销实例（移除记录，非阻止注册）。"""
+            if not self._fleet_ready():
+                return
+            try:
+                self._fleet.remove(instance_id)
+            except FleetNotFound:
+                self._send_json(
+                    {"ok": False, "error": "not_found", "message": f"未找到实例 {instance_id}"}, 404
+                )
+                return
+            self._send_json({"status": "success"})
+
+        def _handle_fleet_instance_get(self, instance_id, action, query):
+            """GET /api/fleet/instances/{id}/{manifest|status|audit|health}：只读透传。"""
+            if not self._fleet_ready():
+                return
+            try:
+                if action == "manifest":
+                    data = self._fleet.get_manifest(instance_id)
+                elif action == "status":
+                    data = self._fleet.get_status(instance_id)
+                elif action == "audit":
+                    data = self._fleet.get_audit(
+                        instance_id,
+                        limit=self._query_int(query, "limit", 50),
+                        offset=self._query_int(query, "offset", 0),
+                    )
+                elif action == "health":
+                    data = self._fleet.get_health(instance_id)
+                else:
+                    self._send_json(
+                        {"ok": False, "error": "not_found", "message": f"未找到接口 {action}"}, 404
+                    )
+                    return
+            except (FleetInvalid, RemoteUnreachable, FleetRemoteError) as exc:
+                payload, status = self._map_fleet_error(exc)
+                self._send_json(payload, status)
+                return
+            self._send_json(data)
+
+        def _handle_fleet_instance_post(self, instance_id, action):
+            """POST /api/fleet/instances/{id}/{control|batch}：治理指令透传。"""
+            if not self._fleet_ready():
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            try:
+                if action == "control":
+                    data = self._fleet.control(instance_id, body)
+                elif action == "batch":
+                    data = self._fleet.batch(instance_id, body)
+                else:
+                    self._send_json(
+                        {"ok": False, "error": "not_found", "message": f"未找到接口 {action}"}, 404
+                    )
+                    return
+            except (FleetInvalid, RemoteUnreachable, FleetRemoteError) as exc:
+                payload, status = self._map_fleet_error(exc)
+                self._send_json(payload, status)
+                return
+            self._send_json(data)
+
+        def _handle_fleet_register(self):
+            """POST /api/admin/register：接收 CX-O 主动注册/心跳（豁免令牌闸）。
+
+            安全口径（spec establish-fleet-admin-plane / GN-004 D-1 固化）：
+            仅限同机实例注册上门——client_address 非回环直接 403，跨机实例走
+            手动登记通道（POST /api/fleet/instances）。
+            """
+            if not self._fleet_ready():
+                return
+            client_host = str(self.client_address[0]) if self.client_address else ""
+            if not is_loopback_client(client_host):
+                self._send_json(
+                    {"ok": False, "error": "forbidden",
+                     "message": "注册仅限本机实例（回环地址）；跨机实例请在 CX-A 手动登记"},
+                    403,
+                )
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            try:
+                view = self._fleet.register(body)
+            except FleetInvalid as exc:
+                self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
+                return
+            self._send_json({"status": "success", "instance": view})
 
         # ------------------------------------------------------------ 电脑控制接口
         def _handle_computer_status(self):
@@ -3047,8 +4448,10 @@ def create_app(data_dir=None, config_path=None):
         pipeline=pipeline,
         computer_deps=(computer, authorizer, bridge),
     )
+    #: 管理面（20261004_模块0_管理面CX-A管理CX-O）：CX-O 实例群台账 + 注册接收 + 治理透传
+    fleet = FleetManager(data_dir=data_dir)
     handler = make_handler(
-        store, pipeline, manager, remote,
+        store, pipeline, manager, remote, fleet=fleet,
         computer=computer, authorizer=authorizer, bridge=bridge, config=config,
         registry=registry, distiller=distiller, voice=voice,
     )
@@ -3059,6 +4462,48 @@ def create_server(host=DEFAULT_HOST, port=DEFAULT_PORT, data_dir=None, config_pa
     """构建并返回配置好的 HTTPServer（单线程串行处理）。"""
     _store, _pipeline, handler = create_app(data_dir, config_path=config_path)
     return HTTPServer((host, port), handler)
+
+
+# 管理 API 令牌落盘（20261004_模块0_管理API令牌落盘）：外部管理 Agent 在应用运行时
+# 读 <app_root>/logs/api_token.json 拿当次令牌，带 X-Client-Token 调管理 API。
+# 安全边界与令牌本身一致（N1 防浏览器侧 CSRF→RCE，非同用户本机进程）。
+TOKEN_FILE_NAME = "api_token.json"
+
+
+def _token_file_path() -> str:
+    """令牌文件路径：<app_root>/logs/api_token.json。"""
+    return os.path.join(app_root(), "logs", TOKEN_FILE_NAME)
+
+
+def write_token_file(port: int) -> None:
+    """令牌模式下把当次启动令牌落盘；开放模式（未设令牌）不写。
+
+    令牌每次启动随机轮换，文件随启动覆盖；pid 供管理 Agent 判断服务存活
+    （防读到崩溃残留旧文件）。原子写，避免读到半截 JSON。
+    """
+    token = _env_api_token()
+    if not token:
+        return
+    logs_dir = os.path.dirname(_token_file_path())
+    os.makedirs(logs_dir, exist_ok=True)
+    payload = {
+        "token": token,
+        "port": port,
+        "pid": os.getpid(),
+        "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    tmp_path = f"{_token_file_path()}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp_path, _token_file_path())
+
+
+def remove_token_file() -> None:
+    """尽力删除令牌文件（正常退出路径收敛披露面；崩溃残留由 pid 字段辨识）。"""
+    try:
+        os.remove(_token_file_path())
+    except OSError:
+        pass
 
 
 def main(argv=None):
@@ -3100,6 +4545,7 @@ def main(argv=None):
             )
             sys.exit(1)
     server = create_server(host=host, port=port, data_dir=args.data_dir, config_path=args.config)
+    write_token_file(port)
     print(f"[INFO] 记忆 API 服务已启动: http://{host}:{port}/api/health")
     try:
         server.serve_forever()
@@ -3107,6 +4553,7 @@ def main(argv=None):
         print("\n[INFO] 收到 Ctrl+C，正在优雅退出…")
     finally:
         server.server_close()
+        remove_token_file()
         print("[INFO] 服务已关闭")
 
 

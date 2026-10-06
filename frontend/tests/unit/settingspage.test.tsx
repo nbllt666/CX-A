@@ -109,8 +109,9 @@ describe('SettingsPage：PUT 失败 → 内联错误提示', () => {
     // 操作1：本地模式开关 → PUT 挂起（序号1）
     fireEvent.click(screen.getByRole('switch', { name: '本地模式' }));
     // 操作2：切音色 → 同步清错 + PUT 挂起（序号2，成为最新）
+    // （Task 9 后新增语音加速两个下拉，音色不再是最后一个 combobox；固定取第 2 个 = 音色）
     const combos = screen.getAllByRole('combobox');
-    fireEvent.change(combos[combos.length - 1], { target: { value: 'ling' } });
+    fireEvent.change(combos[1], { target: { value: 'ling' } });
     // requestJson 内部有 await，PUT 实际发出在微任务中：先冲刷再断言挂起数量
     await act(async () => {});
     expect(pending.length).toBe(2);
@@ -194,8 +195,9 @@ describe('SettingsPage：PUT 失败 → 内联错误提示', () => {
     fireEvent.click(screen.getByRole('switch', { name: '电脑控制授权' }));
 
     // 操作2：切音色 → PUT 立即失败（settings 桶序号1，与授权桶无关）
+    // （Task 9 后新增语音加速两个下拉，音色不再是最后一个 combobox；固定取第 2 个 = 音色）
     const combos = screen.getAllByRole('combobox');
-    fireEvent.change(combos[combos.length - 1], { target: { value: 'ling' } });
+    fireEvent.change(combos[1], { target: { value: 'ling' } });
     await screen.findByText(VOICE_ERROR); // 配置桶失败提示正常出现
 
     // 授权 POST 迟到失败：auth 桶内序号仍最新 → 失败分支必须执行（修复前被静默跳过）

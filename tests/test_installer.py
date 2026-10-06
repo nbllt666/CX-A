@@ -280,7 +280,7 @@ def test_first_run_full_flow(tmp_path):
     # 步骤4：本地小 LLM 引导提示输出 + source=modelscope
     joined = "\n".join(output_lines)
     assert "本地小 LLM" in joined
-    assert "1.7B" in joined
+    assert "Gemma 4 E2B" in joined
     assert "data/local_llm/" in joined
     assert driver.cm.get("local_llm", "source") == "modelscope"
 
@@ -455,7 +455,11 @@ def test_api_server_config_path_unifies_install_and_runtime(tmp_path):
 
 
 def test_settings_put_api_key_encrypted_and_hidden(tmp_path):
-    """H-6：PUT /api/settings 支持 cloud.api_key——Fernet 加密落盘且 GET 视图不含。"""
+    """H-6：PUT /api/settings 支持 cloud.api_key——Fernet 加密落盘且 GET 视图仅脱敏回显。
+
+    Task 5（向导选项入设置）契约升级：GET 视图由「不含 api_key 键」改为
+    「脱敏回显 sk-****尾4位」；明文任何形式不出现在视图与配置文件中。
+    """
     import urllib.error
     import urllib.request
     import threading
@@ -485,10 +489,10 @@ def test_settings_put_api_key_encrypted_and_hidden(tmp_path):
             payload = json.loads(resp.read().decode("utf-8"))
         assert payload["ok"] is True
         assert "cloud.api_key" in payload["applied"]
-        # GET 视图不含 api_key（脱敏不变）
+        # Task 5 契约：GET 视图 api_key 脱敏回显（sk-test-abc123 → sk-****c123）
         with urllib.request.urlopen(f"{base}/api/settings", timeout=5) as resp:
             view = json.loads(resp.read().decode("utf-8"))
-        assert "api_key" not in view["cloud"]
+        assert view["cloud"]["api_key"] == "sk-****c123"
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -734,7 +738,7 @@ def _t9_driver(root, responses, downloader=None):
     return driver, outputs
 
 
-def _t9_stub_hardware(monkeypatch, use_local=True, tier="1.7B", device="cpu"):
+def _t9_stub_hardware(monkeypatch, use_local=True, tier="E2B-Q4", device="cpu"):
     """把 first_run 的硬件探测替换为确定性替身（不触碰真实硬件与外部命令）。"""
     from installer import first_run as first_run_mod
 
@@ -1012,7 +1016,7 @@ def test_t9_first_run_short_input_sequence_uses_defaults(tmp_path, monkeypatch):
     assert driver.cm.get("local_llm", "source") == "modelscope"
     assert driver.cm.get("setup", "completed") is True
     joined = "\n".join(outputs)
-    assert "本地小 LLM" in joined and "1.7B" in joined and "data/local_llm/" in joined
+    assert "本地小 LLM" in joined and "Gemma 4 E2B" in joined and "data/local_llm/" in joined
 
 
 def test_t9_first_run_hardware_probe_failure_degrades(tmp_path, monkeypatch):
@@ -1049,14 +1053,18 @@ def test_t9_first_run_downloader_injected_and_called(tmp_path, monkeypatch):
 
     result = driver.run()
 
-    assert len(fake.calls) == 1
+    assert len(fake.calls) == 2  # 多模态档位双文件：主模型 + mmproj 视觉组件
     assert fake.calls[0]["source"] == "modelscope"
     assert fake.calls[0]["repo"].count("/") == 1
     assert fake.calls[0]["filename"].endswith(".gguf")
-    assert fake.calls[0]["verify_size_gb"] == 1.134  # 推荐档位 1.7B 的实测体积（2026-09-19 联网核实）
+    assert fake.calls[0]["verify_size_gb"] == 2.894  # 推荐档位 E2B-Q4 的实测体积（2026-10-04 联网核实）
+    # 视觉组件与主模型同仓库同目录（llama-server --mmproj 挂载来源）
+    assert fake.calls[1]["repo"] == fake.calls[0]["repo"]
+    assert fake.calls[1]["filename"] == "mmproj-BF16.gguf"
     joined = "\n".join(outputs)
     assert "下载进度：50%" in joined
     assert "下载完成" in joined
+    assert "视觉组件下载完成" in joined
     assert result["local_llm_source"] == "modelscope"
 
 
@@ -1175,7 +1183,7 @@ def _t5_stub_hardware(monkeypatch, profile):
         lambda profile, disk_free_gb=None: {
             "use_local": True,
             "device": "cpu",
-            "tier": "1.7B",
+            "tier": "E2B-Q4",
             "config_patch": {"local_llm": {"enabled": True, "device": "cpu"}},
             "model": None,
             "reasons": ["测试替身：内存满足本地推理阈值"],

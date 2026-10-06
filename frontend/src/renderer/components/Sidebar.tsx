@@ -3,12 +3,14 @@ import { Brain, Cat, MessageSquareText, Settings, type LucideIcon } from 'lucide
 import { useRouter } from '../App';
 import type { View } from '../App';
 import BrandMark from './BrandMark';
+import { useHiddenFleetEntrance } from '../hooks/useHiddenFleetEntrance';
 
 /**
- * 侧边导航：伴侣面（聊天 / 桌宠 / 记忆 / 设置）。
+ * 侧边导航：主界面（聊天 / 桌宠 / 记忆 / 设置）。
  *
- * 管理面已收敛为纯后端 API（/api/agents、/api/remote/*、/api/status），
- * 不再进入前端导航，由另一 Agent / 管理工具调用。
+ * 管理面 API（/api/fleet/*、/api/agents、/api/remote/*、/api/status）由另一
+ * Agent / 管理工具调用；管理面前端页（FleetPage）无可见入口——经本文件品牌区
+ * 连点 5 次解锁进入（spec add-fleet-frontend-hidden），不在导航列表出现。
  *
  * 图标统一走 lucide-react（与设计参考项目同一套图标语言），**不使用 emoji 当图标**：
  * emoji 的字形由系统字体决定（跨机器观感不一致、基线不齐），且高饱和色与
@@ -20,6 +22,10 @@ import BrandMark from './BrandMark';
 export default function Sidebar() {
   const { view, navigate } = useRouter();
 
+  // 隐藏入口（spec add-fleet-frontend-hidden）：连点品牌区 5 次进入管理面，
+  // 逻辑收口在 useHiddenFleetEntrance（TopBar 品牌区共用同一 hook）。
+  const handleBrandTap = useHiddenFleetEntrance();
+
   const companionItems: { view: View; label: string; icon: LucideIcon }[] = [
     { view: 'chat', label: '聊天', icon: MessageSquareText },
     { view: 'pet', label: '桌宠', icon: Cat },
@@ -30,13 +36,14 @@ export default function Sidebar() {
   return (
     <aside className="absolute bottom-0 left-0 top-14 z-10 w-56 border-r border-[var(--glass-border)] bg-[var(--glass-bg)] p-4 backdrop-blur-[var(--glass-blur)]">
       <nav className="flex h-full flex-col gap-1">
-        <div className="mb-3 flex items-center gap-2 px-1">
+        <div
+          className="mb-3 flex items-center gap-2 px-1"
+          onClick={handleBrandTap}
+          data-testid="sidebar-brand"
+        >
           <BrandMark size={22} />
           <span className="text-sm font-semibold text-gradient">CX-A</span>
         </div>
-        <p className="px-3 pb-1 text-xs font-medium tracking-wider text-[var(--text-tertiary)]">
-          伴侣
-        </p>
         {companionItems.map((item) => (
           <NavItem
             key={item.view}

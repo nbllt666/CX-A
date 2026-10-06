@@ -271,6 +271,119 @@ def test_update_all_unknown_keys_returns_zero_without_touch(store, caplog):
     assert "hacker_field" in caplog.text
 
 
+# ---------------------------------------------------------------- diary 类型（20261005 记忆页对齐 CX-O）
+def test_add_diary_type_accepted(store):
+    """memory_type 四值域：diary 类型可写入并可按类型过滤（spec Task 2.4）。"""
+    mid = store.add({"type": "diary", "content": "今天的日记"})
+    row = store.get(mid)
+    assert row["type"] == "diary"
+    rows = store.list(type="diary")
+    assert [r["id"] for r in rows] == [mid]
+    # 其他类型不受影响
+    assert all(r["type"] != "diary" for r in store.list(type="long_term"))
+
+
+def test_diary_type_rejected_value_invalid():
+    """diary 之外的非法值依旧被 _validate_type 拒绝。"""
+    s = MemoryStore(db_path=":memory:")
+    try:
+        with pytest.raises(ValueError):
+            s.add({"type": "not_a_type", "content": "x"})
+    finally:
+        s.close()
+
+
+# ---------------------------------------------------------------- 衰减统计与同步（20261005 spec Task 2.1）
+def _frozen_calculator(at):
+    """构造冻结基准时间的 DecayCalculator（测试注入用）。"""
+    from datetime import datetime
+
+    from lite.memory.decay import DecayCalculator
+
+    calc = DecayCalculator()
+    calc.set_current_time(at)
+    return at, calc
+
+
+def test_decay_stats_permanent_exempt(store):
+    """衰减统计：permanent 记忆豁免衰减（分数恒 1.0 桶），普通记忆按时间衰减。"""
+    from datetime import datetime, timedelta
+
+    now, calc = _frozen_calculator(datetime(2026, 12, 4, 12, 0, 0))
+    old = (now - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S.%f")
+    store.add({"type": "short_term", "content": "新鲜记忆", "importance": 3})
+    store.add({"type": "short_term", "content": "古老普通", "importance": 1, "created_at": old})
+    store.add({"type": "permanent", "content": "古老永久", "importance": 1, "permanent": True, "created_at": old})
+    stats = store.decay_stats(now=now, calculator=calc)
+    assert stats["total_memories"] == 3
+    assert stats["permanent_count"] == 1
+    assert stats["non_permanent_count"] == 2
+    assert stats["decay_distribution"]["healthy"] == 1  # 新鲜记忆
+    assert stats["decay_distribution"]["faded"] == 1  # 90 天低分记忆衰减到归档线以下
+    # permanent 不进时间衰减均值（豁免口径对齐 CX-O get_decay_statistics）
+    assert stats["avg_time_score"] > 0.0
+    assert "fading" in stats["decay_distribution"] and "thresholds" in stats
+
+
+def test_sync_decay_soft_deletes_low_score_and_spares_permanent(store):
+    """衰减同步：低分软删归档、permanent 豁免、新鲜记忆不受影响（spec Task 2.1）。"""
+    from datetime import datetime, timedelta
+
+    now, calc = _frozen_calculator(datetime(2026, 12, 4, 12, 0, 0))
+    old = (now - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S.%f")
+    fresh_id = store.add({"type": "short_term", "content": "新鲜", "importance": 3})
+    old_id = store.add({"type": "short_term", "content": "古老低分", "importance": 1, "created_at": old})
+    perm_id = store.add(
+        {"type": "permanent", "content": "古老永久", "importance": 1, "permanent": True, "created_at": old}
+    )
+    result = store.sync_decay(now=now, calculator=calc)
+    assert result["scanned"] == 3
+    assert result["deleted_count"] == 1 and result["deleted_ids"] == [old_id]
+    assert result["skipped_permanent"] == 1
+    # 软删落库校验
+    assert store.get(fresh_id)["is_deleted"] == 0
+    assert store.get(old_id)["is_deleted"] == 1
+    assert store.get(perm_id)["is_deleted"] == 0
+
+
+def test_sync_decay_custom_threshold_and_deleter(store):
+    """sync_decay 支持自定义阈值与软删回调（api 层传 manager.soft_delete 清向量）。"""
+    from datetime import datetime, timedelta
+
+    now, calc = _frozen_calculator(datetime(2026, 12, 4, 12, 0, 0))
+    old = (now - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S.%f")
+    mid = store.add({"type": "short_term", "content": "古老", "importance": 2, "created_at": old})
+    deleted_via = []
+
+    def fake_deleter(memory_id):
+        deleted_via.append(memory_id)
+        return True
+
+    result = store.sync_decay(archive_threshold=0.9, now=now, calculator=calc, deleter=fake_deleter)
+    # 阈值放宽到 0.9：古老记忆衰减分必然低于阈值，经回调删除
+    assert mid in result["deleted_ids"]
+    assert deleted_via == [mid]
+    # 阈值收紧到 0：什么都不删
+    result2 = store.sync_decay(archive_threshold=0.0, now=now, calculator=calc)
+    assert result2["deleted_count"] == 0
+
+
+def test_diary_not_promoted_by_manager(tmp_path):
+    """diary 类型豁免分层升降级：高重要性日记不被自动改写类型（manager 联动）。"""
+    from lite.memory.manager import MemoryManager
+
+    mgr = MemoryManager(db_path=str(tmp_path / "m.db"))
+    try:
+        mid = mgr.store.add({"type": "diary", "content": "高重要性日记", "importance": 5, "importance_score": 1.0})
+        mgr.update_reactivation(mid)  # 触发 _maybe_promote
+        assert mgr.store.get(mid)["type"] == "diary"
+        # demote 同样豁免
+        mgr.demote(mid)
+        assert mgr.store.get(mid)["type"] == "diary"
+    finally:
+        mgr.store.close()
+
+
 def test_update_partial_unknown_keys_warn_and_apply(store, caplog):
     """部分未知键：合法键照常生效，被忽略键名写入告警日志。"""
     import logging as _logging

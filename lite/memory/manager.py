@@ -269,10 +269,16 @@ class MemoryManager:
         return self._maybe_promote(memory_id)
 
     def _maybe_promote(self, memory_id):
-        """根据 importance 与再激活次数自动判断是否升级（short_term->long_term->permanent）。"""
+        """根据 importance 与再激活次数自动判断是否升级（short_term->long_term->permanent）。
+
+        diary 豁免（20261005 记忆页对齐 CX-O）：diary 是独立于分层轴的日记类型，
+        不参与 short_term/long_term/permanent 升降级——防止高重要性日记被自动改写类型。
+        """
         mem = self._get_memory(memory_id)
         if mem is None or mem.get("permanent"):
             return mem
+        if mem.get("type") == "diary":
+            return self._get_memory(memory_id)
         importance = float(mem.get("importance_score", 0.6) or 0.0)
         reac = int(mem.get("reactivation_count", 0))
         current = mem.get("type", "short_term")
@@ -316,10 +322,14 @@ class MemoryManager:
 
         Returns:
             dict|None: 更新后的记忆；记忆不存在或已是短期记忆返回原样。
+            diary 类型豁免（对齐 _maybe_promote）：日记不参与分层降级，原样返回。
         """
         mem = self._get_memory(memory_id)
         if mem is None:
             return None
+        # diary 豁免：日记不参与分层降级（与 _maybe_promote 口径一致）
+        if mem.get("type") == "diary":
+            return mem
         current = mem.get("type", "short_term")
         if target_type is None:
             if current == "permanent":

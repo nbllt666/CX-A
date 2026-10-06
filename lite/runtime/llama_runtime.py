@@ -3,7 +3,8 @@
 
 承载两块 GGUF 模型（见工程文档 §6）：
 1. qwen3-embedding:0.6b —— 记忆检索嵌入（内置）；
-2. 本地小 LLM（建议 ~1.7B）——「是否回复」判定 + 断网兜底回复（可选下载，存 data/local_llm/）。
+2. 本地小 LLM（20261004 全换 Gemma 4 多模态，默认档 E2B-Q4）——「是否回复」判定 +
+   断网兜底回复 + 本地视觉理解（可选下载，存 data/local_llm/）。
 
 设计要点（对齐 Task C1 必做清单）：
 - **真实调用路径 + 无库降级双轨**：``load_embedding_model`` / ``load_local_llm``
@@ -742,7 +743,11 @@ class LlamaRuntime:
         root = self._app_root()
         # 20261002 批 A：按本地 LLM 后端意图选目录（口径同嵌入路径，见
         # resolve_llama_dir；缺省/非法值与历史 runtime/llama 推导逐字等价）
-        from lite.runtime.llama_server import LLAMA_SERVER_EXE_NAME, resolve_llama_dir
+        from lite.runtime.llama_server import (
+            CHAT_SERVER_N_CTX,
+            LLAMA_SERVER_EXE_NAME,
+            resolve_llama_dir,
+        )
 
         exe = os.path.join(resolve_llama_dir(root, self._llm_backend), LLAMA_SERVER_EXE_NAME)
         if not os.path.isfile(exe):
@@ -756,7 +761,9 @@ class LlamaRuntime:
                 exe,
                 str(path),
                 n_gpu_layers=int(self._llm_n_gpu_layers),
-                n_ctx=int(self._n_ctx),
+                # 20261004 Gemma 4：chat 服务上下文固定 8192（KV cache 显式封顶 +
+                # 覆盖多模态图片 token），不再沿用嵌入口径的 self._n_ctx（2048）
+                n_ctx=int(CHAT_SERVER_N_CTX),
             )
         except Exception as exc:  # noqa: BLE001 - 构造失败按外部不可用处理
             self.warnings.append(f"常驻 chat 路径不可用：{exc}")
@@ -856,6 +863,12 @@ class LlamaRuntime:
             for m in (messages or [])
         ]
         if not msgs:
+            return msgs
+
+        # 20261004 Gemma 4 多模态：任一消息 content 为数组（text + image_url）
+        # 时整体跳过裁剪——base64 数据 URL 不参与 token 估算，硬截断会损坏
+        # 数据 URL（服务端 400）；上下文预算由常驻服务 -c（CHAT_SERVER_N_CTX）兜底
+        if any(not isinstance(m.get("content"), str) for m in msgs):
             return msgs
 
         def _est(items):

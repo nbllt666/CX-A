@@ -66,3 +66,44 @@ Task 0 完成（变更文档 + 本 note 已创建）；Task 1-6 未开始。
 **未闭合项**：无。备忘（GN-004 O5）：云端填钥匙后点「跳过，先用本地」→ 确认页钥匙行显示与提交不一致（跳过语义明确，影响极小），未来向导迭代时让钥匙行随 cloudSkipped 联动。
 
 **接续入口**：无（任务闭合）。提醒：本次只重打了便携根，**安装程序尚未含本变更**——用户需要时执行 `python installer/build.py` 重出 Setup exe。
+
+---
+
+## 追加变更：管理面 CX-A 管理 CX-O（establish-fleet-admin-plane，20261004）
+
+**做到哪了**：spec 三件套定稿（GN-004 T1/T2 两轮计划审查 [Agent f4241310 / 2ce0525b]，SB-1/SB-2/SB-3 人类裁决：health 过闸 / 错误码原样透传 / 注册体按源码实证；人类批准 spec）。Task 1-3 实现闭合：`lite/management/fleet.py`（台账/注册/补录/透传）+ remote.py 向后兼容扩展（headers 注入 + RemoteError.status_code）+ api_server `/api/fleet/*` 与 `/api/admin/register`（令牌闸豁免 + 回环校验）+ 25 单测 + 18 契约用例 + README/CX-O 文档 §7。回归：pytest 241 passed、vitest 101/101、tsc 0、双 e2e 6+2。真实冒烟 SMOKE OK（注册上门 → 补录 → api_token.json 令牌透传 manifest，fleet.json 留痕保留）。
+
+**为什么**：用户明确「管理面应该是 CX-A 管理 CX-O 的」。CX-O 侧已有完整控制平面（manifest/status/control/batch/audit + cx_a_endpoint 主动注册），CX-A 侧仅单实例无鉴权遥控；本变更补齐「注册接收 → 实例台账（data/fleet.json，token 脱敏）→ Bearer 透传（错误码原样透传）」闭环，管理 Agent 经 logs/api_token.json 调 /api/fleet/*。
+
+**未闭合项**：Task 4.1 已闭合（GN-004 收口审查 [Agent 3d4b409e] 警示放行，F1-F4 修正已完成：F3 端到端 403 用例、F4 冒烟留痕、F1/F2 文档回填）；Task 4.2（人类裁决 + 重跑打包）进行中。实现期修订「补录分支」（注册实例无 token，同 base_url 手动登记即补录）已记入 spec 并经审查认可。
+
+**接续入口**：Task 4.2 人类裁决 → `python installer/build.py` 重打包（合并管理面 + 去伴侣化 + 推荐免选 + 令牌落盘 + 人设迁移）→ 变更文档第五章收尾。
+
+---
+
+## 新变更：管理面前端·隐藏入口（add-fleet-frontend-hidden，20261004）
+
+**做到哪了**：spec 三件套定稿（GN-004 T1 计划审查警示放行 [Agent 3253e959]，D-1/D-2 修正、建议 1-5 吸收；人类批准）。Task 1-4.2 实现闭合：api.ts 6 封装 + App 路由 'fleet' + Sidebar 连点 5 次解锁（3 秒窗口）+ FleetPage（台账脱敏/登记补录/注销两段确认/健康探测/能力清单/治理面板矩阵级联）+ 单测 21 项。回归：vitest 122/122、tsc 0、build 通过、app.e2e 7 passed（含场景7 连点进入+降级卡）、pet-vrm 2 passed。Task 4.3 GN-004 收口审查**通过** [Agent 6246fb40]（观察项 O-1~O-4，无阻断）。
+
+**为什么**：用户「管理面用的那部分前端也搞一下（入口藏深一点，普通用户不需要）」；裁决：连点侧栏 logo 5 次解锁 + 含治理操作面板。解除上一 spec「前端管理界面 out of scope」边界（仅此一条）。
+
+**未闭合项**：无阻塞性未闭合项。Task 4.4 已闭合（人类裁决「批准并重打包」；CX-A-Setup-0.1.0.exe 15:37 产出，含管理面前端 + 管理面 API + 此前全部改动）。观察项登记：O-1 补录信号取 POST 响应体（语义等价，备查）；O-4 build chunk 警告既有问题备忘。「当前不可判定」（移交人类日常使用）：真机连点手感；真实 CX-O 实例的治理端到端。
+
+**接续入口**：任务全部闭合，无接续工作。若连点手感或管理面页面体验需调整，以新 change-id 开启变更。
+
+---
+
+## 追加变更：本地模型全换 Gemma 4 + 悬浮窗语音/视觉/授权闭环 + 对话持久化（20261004_模块0_本地模型换装Gemma4与悬浮窗语音闭环）
+
+**做到哪了**：Task 1-5、7-10 已闭合（主线程内联执行，无 subagent）：①MODEL_TIERS 四档全换 Gemma 4（E2B-Q4/Q6、E4B-Q4/Q6，HF+魔塔双站实测，mmproj 双文件下载，DEFAULT_TIER=E2B-Q4）；②llama-server --mmproj 同目录自动挂载 + CHAT_SERVER_N_CTX=8192 + 多模态数组 content 透传；③视觉链路本地优先（screen_backend 纯标准库 PNG base64 截图 → sampler 剧变事件 image_b64 → pipeline local_understanding 回调，云端维持灰度拓扑隐私红线）；④对话持久化 data/chat_history.json（cap200 原子写，占位文案不落盘）+ GET /api/chat/history + vision 回调装配；⑤前端六项悬浮窗菜单（说话=ASR 开关→录音→识别→直发→流式朗读+pushMood+chatTick；屏幕共享 vision.enabled 热开关；操作授权 confirm+authorize）+ ChatPage 历史加载/chatTick 刷新 + pushMood 改造。验证：后端全量 pytest 1450 passed/1 skipped；前端 vitest 141 passed、tsc 0、build 通过、双 e2e 7+2 全绿。
+
+**为什么**：用户指出「说话应是语音链路 ASR 输入开关（不应是静音）」，并要求补屏幕共享、操作授权、测试操作功能、本地模型视觉；裁决全换 Gemma 4（原生多模态）、一次做完、含历史持久化、本地视觉=本地多模态真图片理解。
+
+**未闭合项**：
+- ~~Task 6 / Task 11~~：均已闭合（2026-10-04 23:20 升级完成、23:30 打包完成）。
+- 真机待验 5 项（当前不可判定，移交人类日常使用验收）：Gemma 4 下载与本地聊天；开屏幕共享问「我屏幕上是什么」；悬浮窗说话语音回复；授权后电脑控制；跨窗口历史同步。
+- GN-004 交付前审查（Agent 1775b23a）：**警示放行**（无阻断无 SOFT_BLOCK）；两项警示（F-1 note 状态滞后 / F-2 Setup 体积数字失真）已在人类裁决前修正。遗留观察：全量测试未全量复跑（抽样一致采信）；release/ 目录历史调试残留（移交 s0602 技术债扫描）。
+
+**接续入口**：无（人类 [V] 裁决「批准交付」，2026-10-04）。接续仅剩真机体验反馈——新问题开新变更（严禁回溯修改本变更文档）。
+
+**终态处理**：**吸收完毕**（2026-10-04）：全 Task 闭合 + GN-004 警示放行（警示已修正）+ 人类批准交付。

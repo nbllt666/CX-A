@@ -7,8 +7,11 @@ origin 为同步预留字段——本阶段仅建列登记，不实现任何同�
 
 import uuid
 
-# 记忆类型取值枚举（与 CX-O 对齐）
-MEMORY_TYPES = ("long_term", "short_term", "permanent")
+# 记忆类型取值枚举（与 CX-O 对齐）。
+# 20261005 记忆页对齐 CX-O（spec: align-wizard-settings-memory-pet）：
+# 扩为 CX-O 同款四值域——long_term / short_term / permanent / diary。
+# diary 为独立轴（日记），不参与 MemoryManager 的分层升降级（见 manager._maybe_promote）。
+MEMORY_TYPES = ("long_term", "short_term", "permanent", "diary")
 
 # 表名
 TABLE_NAME = "memories"

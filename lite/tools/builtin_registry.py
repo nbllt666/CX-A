@@ -383,7 +383,13 @@ class BuiltinToolRegistry:
     # ----- 记忆读写 -----
 
     def _register_memory_tools(self) -> None:
-        """注册记忆读写工具（memory_write / memory_search），受 memory_tools 开关约束。"""
+        """注册记忆读写工具（memory_write / memory_search / memory_read /
+        memory_update / memory_delete），受 memory_tools 开关约束。
+
+        memory_read / memory_update / memory_delete 为 20261005 记忆管理助手
+        工具环新增（spec: align-wizard-settings-memory-pet）：助手经
+        ``[memory:op {...}]`` 指令标签驱动的完整记忆操作集（读/写/检索/改/删）。
+        """
         enabled = self._tools_enabled("memory_tools", True)
         self._register(
             tool_id="memory_write",
@@ -399,6 +405,36 @@ class BuiltinToolRegistry:
             name="memory_search",
             description="检索记忆（query 必填；top_k 可选，缺省用系统默认条数）。",
             handler=self._make_memory_search_handler(),
+            category="memory_tools",
+            enabled=enabled,
+            disabled_error="记忆读写工具未启用",
+        )
+        self._register(
+            tool_id="memory_read",
+            name="memory_read",
+            description="按 id 读取一条记忆详情（id 必填）。",
+            handler=self._make_memory_read_handler(),
+            category="memory_tools",
+            enabled=enabled,
+            disabled_error="记忆读写工具未启用",
+        )
+        self._register(
+            tool_id="memory_update",
+            name="memory_update",
+            description=(
+                "按 id 更新一条记忆（id 必填；content/type/importance/tags "
+                "任选其一或组合，type 可选 long_term/short_term/permanent/diary）。"
+            ),
+            handler=self._make_memory_update_handler(),
+            category="memory_tools",
+            enabled=enabled,
+            disabled_error="记忆读写工具未启用",
+        )
+        self._register(
+            tool_id="memory_delete",
+            name="memory_delete",
+            description="按 id 软删除一条记忆（id 必填；permanent 类型会被拒绝）。",
+            handler=self._make_memory_delete_handler(),
             category="memory_tools",
             enabled=enabled,
             disabled_error="记忆读写工具未启用",
@@ -570,6 +606,218 @@ class BuiltinToolRegistry:
                 "authorized": True,
                 "error": "记忆检索后端未注入（memory_store / pipeline 均为 None）",
                 "result": None,
+            }
+
+        return handler
+
+    def _resolve_memory_store(self):
+        """解析记忆存储后端：memory_store 优先，回落 pipeline.store（与 write/search 一致）。"""
+        store = self.memory_store
+        if store is None and self.pipeline is not None:
+            store = getattr(self.pipeline, "store", None)
+        return store
+
+    def _make_memory_read_handler(self) -> Callable:
+        """构造 memory_read handler：按 id 读取单条记忆（含已软删标记说明）。"""
+
+        def handler(arguments: Dict[str, Any]) -> Dict[str, Any]:
+            store = self._resolve_memory_store()
+            if store is None:
+                return {
+                    "success": False,
+                    "tool": "memory_read",
+                    "authorized": True,
+                    "error": "记忆存储后端未注入（memory_store / pipeline 均为 None）",
+                    "result": None,
+                }
+            try:
+                memory_id = int((arguments or {}).get("id"))
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "tool": "memory_read",
+                    "authorized": True,
+                    "error": "参数非法：id 必须为整数",
+                    "result": None,
+                }
+            try:
+                mem = store.get(memory_id)
+            except Exception as exc:  # noqa: BLE001 - 异常包装返回
+                return {
+                    "success": False,
+                    "tool": "memory_read",
+                    "authorized": True,
+                    "error": str(exc),
+                    "result": None,
+                }
+            if mem is None:
+                return {
+                    "success": False,
+                    "tool": "memory_read",
+                    "authorized": True,
+                    "error": f"记忆 {memory_id} 不存在",
+                    "result": None,
+                }
+            return {
+                "success": True,
+                "tool": "memory_read",
+                "authorized": True,
+                "result": {"memory": mem, "deleted": bool(mem.get("is_deleted"))},
+            }
+
+        return handler
+
+    def _make_memory_update_handler(self) -> Callable:
+        """构造 memory_update handler：按 id 更新字段（走 MemoryStore.update 校验）。"""
+
+        def handler(arguments: Dict[str, Any]) -> Dict[str, Any]:
+            store = self._resolve_memory_store()
+            if store is None:
+                return {
+                    "success": False,
+                    "tool": "memory_update",
+                    "authorized": True,
+                    "error": "记忆存储后端未注入（memory_store / pipeline 均为 None）",
+                    "result": None,
+                }
+            args = dict(arguments or {})
+            try:
+                memory_id = int(args.pop("id", None))
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "tool": "memory_update",
+                    "authorized": True,
+                    "error": "参数非法：id 必须为整数",
+                    "result": None,
+                }
+            # 白名单字段裁剪（与 API PUT /api/memories/{id} 同口径）
+            allowed = ("content", "type", "importance", "tags", "metadata")
+            fields = {k: args[k] for k in allowed if k in args}
+            if not fields:
+                return {
+                    "success": False,
+                    "tool": "memory_update",
+                    "authorized": True,
+                    "error": "参数非法：至少提供 content/type/importance/tags/metadata 之一",
+                    "result": None,
+                }
+            if "tags" in fields and not isinstance(fields["tags"], str):
+                fields["tags"] = json.dumps(fields["tags"], ensure_ascii=False)
+            # 存在性校验：软删除/不存在的记忆不可编辑（与 API PUT 同口径）
+            try:
+                probe = store.get(memory_id)
+            except Exception:  # noqa: BLE001 - 探测失败交给 update 校验兜底
+                probe = None
+            if probe is None or probe.get("is_deleted"):
+                return {
+                    "success": False,
+                    "tool": "memory_update",
+                    "authorized": True,
+                    "error": f"记忆 {memory_id} 不存在",
+                    "result": None,
+                }
+            try:
+                updated = store.update(memory_id, fields)
+            except ValueError as exc:
+                # type 非法等契约校验失败：明确回执（不崩、不写库）
+                return {
+                    "success": False,
+                    "tool": "memory_update",
+                    "authorized": True,
+                    "error": str(exc),
+                    "result": None,
+                }
+            except Exception as exc:  # noqa: BLE001 - 异常包装返回
+                return {
+                    "success": False,
+                    "tool": "memory_update",
+                    "authorized": True,
+                    "error": str(exc),
+                    "result": None,
+                }
+            if updated <= 0:
+                return {
+                    "success": False,
+                    "tool": "memory_update",
+                    "authorized": True,
+                    "error": f"记忆 {memory_id} 不存在或没有可更新的有效字段",
+                    "result": None,
+                }
+            return {
+                "success": True,
+                "tool": "memory_update",
+                "authorized": True,
+                "result": {"id": memory_id, "updated_fields": sorted(fields.keys())},
+            }
+
+        return handler
+
+    def _make_memory_delete_handler(self) -> Callable:
+        """构造 memory_delete handler：按 id 软删除；permanent 类型拒绝（保护）。"""
+
+        def handler(arguments: Dict[str, Any]) -> Dict[str, Any]:
+            # 软删优先走 manager.soft_delete（M-10：同步清理向量库孤儿向量）
+            manager = self.manager
+            store = self._resolve_memory_store()
+            if store is None and manager is None:
+                return {
+                    "success": False,
+                    "tool": "memory_delete",
+                    "authorized": True,
+                    "error": "记忆存储后端未注入（memory_store / pipeline / manager 均为 None）",
+                    "result": None,
+                }
+            try:
+                memory_id = int((arguments or {}).get("id"))
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "tool": "memory_delete",
+                    "authorized": True,
+                    "error": "参数非法：id 必须为整数",
+                    "result": None,
+                }
+            # permanent 保护（spec：批量/助手删除 permanent 需拒绝）
+            probe = store if store is not None else getattr(manager, "store", None)
+            try:
+                mem = probe.get(memory_id) if probe is not None else None
+            except Exception:  # noqa: BLE001 - 探测失败不阻断删除
+                mem = None
+            if mem is not None and (bool(mem.get("permanent")) or mem.get("type") == "permanent"):
+                return {
+                    "success": False,
+                    "tool": "memory_delete",
+                    "authorized": True,
+                    "error": f"记忆 {memory_id} 为 permanent 类型，禁止删除（需先改为其他类型）",
+                    "result": None,
+                }
+            try:
+                if manager is not None:
+                    deleted = manager.soft_delete(memory_id)
+                else:
+                    deleted = store.soft_delete(memory_id)
+            except Exception as exc:  # noqa: BLE001 - 异常包装返回
+                return {
+                    "success": False,
+                    "tool": "memory_delete",
+                    "authorized": True,
+                    "error": str(exc),
+                    "result": None,
+                }
+            if not deleted:
+                return {
+                    "success": False,
+                    "tool": "memory_delete",
+                    "authorized": True,
+                    "error": f"记忆 {memory_id} 不存在",
+                    "result": None,
+                }
+            return {
+                "success": True,
+                "tool": "memory_delete",
+                "authorized": True,
+                "result": {"id": memory_id, "deleted": True},
             }
 
         return handler

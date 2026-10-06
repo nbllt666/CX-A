@@ -73,7 +73,9 @@ def test_defaults_values():
         "model_path": "",
         "backend": "",
     }
-    assert DEFAULTS["vector"] == {"backend": "sqlite", "path": "data/lancedb"}
+    assert DEFAULTS["vector"] == {"backend": "lancedb", "path": "data/lancedb"}
+    # 20261005：聊天记忆注入开关（RAG 闭环）默认开
+    assert DEFAULTS["memory"]["context_inject"] is True
     # 全组件加速双模式 spec：tts 段新增 accel（默认 auto）与 accel_device（默认 ""）
     assert DEFAULTS["tts"] == {
         "engine": "melotts",
@@ -86,7 +88,10 @@ def test_defaults_values():
     assert DEFAULTS["accel"] == {"mode": "performance"}
     assert DEFAULTS["asr"] == {"engine": "sensevoice", "device": "cpu"}
     assert DEFAULTS["vad"] == {"mode": "webrtc"}
-    assert DEFAULTS["memory"] == {"max_memories": 30, "dedup": 0.85, "permanent_threshold": 0.95}
+    assert DEFAULTS["memory"] == {
+        "max_memories": 30, "dedup": 0.85, "permanent_threshold": 0.95,
+        "context_inject": True,
+    }
     assert DEFAULTS["computer_control"] == {"authorized": False, "confirm_dangerous": True}
     assert DEFAULTS["sync"] == {"enabled": False}
     assert DEFAULTS["remote"] == {"endpoint": "", "enabled": False}

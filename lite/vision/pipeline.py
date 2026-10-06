@@ -64,7 +64,8 @@ class VisionPipeline:
     """主动视觉生产管线：自适应采样 → 有界队列 → 云端理解 → 记忆沉淀。"""
 
     def __init__(self, sampler=None, queue: VisionClipQueue = None, cloud=None,
-                 memory_store=None, config=None, understanding=None):
+                 memory_store=None, config=None, understanding=None,
+                 local_understanding=None):
         """构造管线（全部组件可注入，缺省仅队列可自建）。
 
         :param sampler: :class:`~lite.vision.sampler.AdaptiveSampler` 实例；
@@ -77,13 +78,19 @@ class VisionPipeline:
         :param config: 配置载体——ConfigManager 或含 ``vision`` 段的 dict；
             enabled 取 ``vision.enabled``（默认 False）
         :param understanding: 理解注入点，callable(item) -> str 摘要文本；
-            缺省用 :meth:`_default_understanding`（CloudAdapter 多模态消息）
+            缺省用 :meth:`_default_understanding`（本地多模态优先 → 云端拓扑）
+        :param local_understanding: 本地多模态理解回调，callable(messages) -> str；
+            缺省 None 时直接走云端路径。注入后（20261004 Gemma 4 本地视觉）
+            默认理解优先把截图帧（image_url base64）/ 灰度拓扑交给本地小 LLM
+            （llama-server ``--mmproj``）理解——数据不出本机；回调未就绪（返回
+            None）/ 抛异常时自动回落云端。
         """
         self._sampler = sampler
         self._cloud = cloud
         self._memory_store = memory_store
         self._config = config
         self._understanding = understanding if understanding is not None else self._default_understanding
+        self._local_understanding = local_understanding
         self._queue = queue if queue is not None else VisionClipQueue()
         # consumer 接线（对齐 CX-O register_vision_pipeline 的装配职责）
         self._queue.set_consumer(self._consume)
@@ -191,20 +198,53 @@ class VisionPipeline:
         return False
 
     def _default_understanding(self, item: dict) -> str:
-        """生产默认理解实现：CloudAdapter.chat 多模态消息 → 流式摘要拼接。
+        """生产默认理解实现：本地多模态优先 → 云端灰度拓扑降级。
 
-        消息 content 为数组：提示词 + 视觉描述。视觉描述两条路径——
-        - item 含 ``image_b64``（base64 编码帧，预留）→ image_url 数据 URL；
-        - 否则 → 纯文本降级描述（降采样亮度拓扑，隐私红线：原始帧不出本机）。
+        双通道语义（20261004 Gemma 4 本地视觉）：
+        - **本地优先**：注入 ``local_understanding`` 回调时，把截图帧（事件含
+          ``image_b64`` → image_url 数据 URL）或灰度拓扑文本组装为多模态消息，
+          交本地小 LLM（llama-server ``--mmproj``）理解——数据不出本机；回调
+          返回 None / 抛异常时告警并自动回落云端；
+        - **云端**：维持既有隐私红线——**仅用灰度拓扑文本，不传输截图 base64**
+          （原始帧不出本机；事件携带的 image_b64 只供本地通道消费）。
 
-        :raises CloudUnavailableError: 未注入 CloudAdapter 或云端调用失败
+        :raises CloudUnavailableError: 本地未就绪且未注入 CloudAdapter / 云端调用失败
         """
+        if self._local_understanding is not None:
+            try:
+                summary = self._local_understanding(self._build_local_messages(item))
+                if summary is not None and str(summary).strip():
+                    return str(summary).strip()
+                LOGGER.warning(
+                    "[VisionPipeline][WARN] 本地视觉理解未就绪（返回空），回落云端理解"
+                )
+            except Exception as exc:  # noqa: BLE001 —— 本地失败不阻断，回落云端
+                LOGGER.warning("[VisionPipeline][WARN] 本地视觉理解失败，回落云端：%s", exc)
+        # 云端路径：灰度拓扑（隐私红线——原始帧不出本机，截图 base64 不上云）
         if self._cloud is None:
             raise CloudUnavailableError("未注入 CloudAdapter，无法执行云端视觉理解")
+        topology = _render_brightness_map(item.get("frame") or [])
+        content = [
+            {"type": "text", "text": VISION_PROMPT},
+            {
+                "type": "text",
+                "text": "画面亮度拓扑（64x36 灰度降采样，字符越靠后越亮）：\n" + topology,
+            },
+        ]
+        messages = [{"role": "user", "content": content}]
+        chunks = [chunk for chunk in self._cloud.chat(messages)]
+        return "".join(chunks).strip()
+
+    def _build_local_messages(self, item: dict) -> list:
+        """组装本地多模态理解消息（截图帧 image_url 优先，无截图回落灰度拓扑）。
+
+        :param item: 视觉事件 dict（可含 ``image_b64`` PNG base64 截图）。
+        :return: OpenAI 兼容消息列表（content 为数组，llama-server 多模态直收）。
+        """
         content = [{"type": "text", "text": VISION_PROMPT}]
         image_b64 = item.get("image_b64")
         if image_b64:
-            # 预留路径：backend 提供 base64 编码帧时走多模态 image_url
+            # 本地多模态路径：截图帧以 image_url 数据 URL 直投本地推理服务
             data_url = "data:image/png;base64," + str(image_b64)
             content.append({"type": "image_url", "image_url": {"url": data_url}})
         else:
@@ -213,9 +253,7 @@ class VisionPipeline:
                 "type": "text",
                 "text": "画面亮度拓扑（64x36 灰度降采样，字符越靠后越亮）：\n" + topology,
             })
-        messages = [{"role": "user", "content": content}]
-        chunks = [chunk for chunk in self._cloud.chat(messages)]
-        return "".join(chunks).strip()
+        return [{"role": "user", "content": content}]
 
 
 #: 导出提示词常量供下游复用（提示词属于理解契约的一部分）

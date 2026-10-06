@@ -194,8 +194,8 @@ class ModelDownloadManager:
         """启动一次后台下载（幂等：进行中时不启动第二个线程）。
 
         :param source: 下载源；``None`` 时取配置 ``local_llm.source``（再回落魔塔）。
-        :param tier: 模型档位（``0.5B`` / ``1.7B`` / ``4B`` / ``8B``）；``None`` 时
-            回落默认档 ``1.7B``。
+        :param tier: 模型档位（``E2B-Q4`` / ``E2B-Q6`` / ``E4B-Q4`` / ``E4B-Q6``）；
+            ``None`` 时回落默认档 ``E2B-Q4``。
         :return: ``{"ok": True, "state": "downloading", "already_running": bool,
             "model": {...}}``；``already_running=True`` 表示复用进行中的任务。
         :raises ValueError: 档位不在 ``MODEL_TIERS`` 中（中文错误，由调用方映射 400）。
@@ -309,6 +309,20 @@ class ModelDownloadManager:
                 progress_cb=_progress,
                 verify_size_gb=verify_size_gb,
             )
+            # 多模态档位（20261004 Gemma 4）：主模型就位后同仓库下载视觉投影
+            # 文件（mmproj，落同目录；llama-server 经 --mmproj 挂载后具备看图
+            # 能力）。失败与主模型同口径落 failed（文本聊天不可缺视觉组件的
+            # 语义一致性由档位表保证——四档均多模态）。
+            mmproj_name = model_info.get("mmproj_filename")
+            if mmproj_name:
+                mmproj_path = downloader.download(
+                    repo,
+                    mmproj_name,
+                    source=source,
+                    progress_cb=_progress,
+                    verify_size_gb=model_info.get("mmproj_size_gb"),
+                )
+                _log("INFO", f"视觉组件下载完成：{mmproj_path}")
         except _DownloadCanceled:
             self._mark_canceled(filename)
             return

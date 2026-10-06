@@ -13,7 +13,11 @@
 ``max_interval_s`` 是**最高频率对应的最短间隔**（剧变态）。
 
 事件产出：仅当变化率 >= high_threshold 时产出事件 dict
-``{timestamp, frame, change_ratio}``；其余采样（含首次基线采样）返回 None。
+``{timestamp, frame, change_ratio[, image_b64]}``；其余采样（含首次基线采样）
+返回 None。20261004 本地视觉：backend 具备 ``capture_image_b64`` 截图编码能力
+（如 WindowsGrayscaleScreenBackend）时，剧变事件附带 PNG base64 截图（供本地
+多模态模型真图理解；仅在事件时刻抓取，静止态零开销；编码失败为 None，理解侧
+回落灰度拓扑）。
 
 内存防线：内部记录的上一帧与事件携带的帧均为**立即降采样后的定长帧**
 （由 detector 归一化，默认 64x36），原始帧不保留（隐私红线：原始帧不外传）。
@@ -91,7 +95,9 @@ class AdaptiveSampler:
 
         Returns:
             dict | None: 变化达标时返回
-                ``{"timestamp": now, "frame": 降采样帧, "change_ratio": 变化率}``；
+                ``{"timestamp": now, "frame": 降采样帧, "change_ratio": 变化率[,
+                "image_b64": PNG 截图 base64]}``（image_b64 仅 backend 具备截图
+                编码能力时附带）；
                 静止 / 未到期 / 首次基线采样返回 None。
         """
         if now is None:
@@ -123,7 +129,13 @@ class AdaptiveSampler:
         self._update_interval(ratio)
 
         if ratio >= self._high_threshold:
-            return {"timestamp": now, "frame": norm_frame, "change_ratio": ratio}
+            event = {"timestamp": now, "frame": norm_frame, "change_ratio": ratio}
+            # 20261004 本地视觉：backend 具备截图编码能力时，剧变事件附带 PNG
+            # base64（仅事件时刻抓取，静止态零开销；失败为 None → 理解侧回落拓扑）
+            image_getter = getattr(self._backend, "capture_image_b64", None)
+            if callable(image_getter):
+                event["image_b64"] = image_getter()
+            return event
         return None
 
     def _update_interval(self, ratio: float) -> None:

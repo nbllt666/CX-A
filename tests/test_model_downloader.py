@@ -517,12 +517,12 @@ def test_download_urllib_fallback(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("source", ["modelscope", "huggingface"])
 def test_suggest_model_contains_source_and_size(source):
-    """suggest_model 返回含 source 与 approximate_size_gb，且为默认档（1.7B 档，实测约 1.13GB）。"""
+    """suggest_model 返回含 source 与 approximate_size_gb，且为默认档（E2B-Q4 档，实测约 2.89GB）。"""
     info = LlmDownloader.suggest_model(source=source)
     assert isinstance(info, dict)
     assert info["source"] == source
     assert "approximate_size_gb" in info
-    assert abs(float(info["approximate_size_gb"]) - 1.134) < 0.05  # 实测字节数折算
+    assert abs(float(info["approximate_size_gb"]) - 2.894) < 0.05  # 实测字节数折算
     assert "repo" in info and "filename" in info
     assert "disclaimer" in info
 
@@ -564,15 +564,23 @@ def test_get_local_llm_info_none_when_missing(tmp_path):
 from lite.config.download_sources import HF_OFFICIAL  # noqa: E402
 from lite.runtime.model_downloader import MODEL_TIERS  # noqa: E402
 
-ALL_TIERS = ["0.5B", "1.7B", "4B", "8B"]
+ALL_TIERS = ["E2B-Q4", "E2B-Q6", "E4B-Q4", "E4B-Q6"]
 
-#: 2026-09-19 联网实测（HF tree/main + 魔塔 repo/files + Range 试探）锁定的档位表口径。
+#: 2026-10-04 联网实测（HF tree/main + 魔塔 repo/files）锁定的档位表口径（全换 Gemma 4）。
 #: 改动 MODEL_TIERS 前必须重新核实，避免再次出现「文件名 404」或「体积校验失败」。
 VERIFIED_TIERS = {
-    "0.5B": ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q4_k_m.gguf", 0.458),
-    "1.7B": ("Qwen/Qwen1.5-1.8B-Chat-GGUF", "qwen1_5-1_8b-chat-q4_k_m.gguf", 1.134),
-    "4B": ("Qwen/Qwen3-4B-GGUF", "Qwen3-4B-Q4_K_M.gguf", 2.326),
-    "8B": ("Qwen/Qwen3-8B-GGUF", "Qwen3-8B-Q4_K_M.gguf", 4.682),
+    "E2B-Q4": ("unsloth/gemma-4-E2B-it-GGUF", "gemma-4-E2B-it-Q4_K_M.gguf", 2.894),
+    "E2B-Q6": ("unsloth/gemma-4-E2B-it-GGUF", "gemma-4-E2B-it-Q6_K.gguf", 4.193),
+    "E4B-Q4": ("unsloth/gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-Q4_K_M.gguf", 4.635),
+    "E4B-Q6": ("unsloth/gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-Q6_K.gguf", 6.589),
+}
+
+#: 各档位视觉投影文件（mmproj-BF16.gguf）实测体积：E2B 仓 0.919 / E4B 仓 0.923
+VERIFIED_MMPROJ = {
+    "E2B-Q4": ("unsloth/gemma-4-E2B-it-GGUF", "mmproj-BF16.gguf", 0.919),
+    "E2B-Q6": ("unsloth/gemma-4-E2B-it-GGUF", "mmproj-BF16.gguf", 0.919),
+    "E4B-Q4": ("unsloth/gemma-4-E4B-it-GGUF", "mmproj-BF16.gguf", 0.923),
+    "E4B-Q6": ("unsloth/gemma-4-E4B-it-GGUF", "mmproj-BF16.gguf", 0.923),
 }
 
 
@@ -584,6 +592,11 @@ def test_model_tiers_match_verified_entries():
         assert spec["repo"] == repo, f"{tier} 档 repo 与实测不符"
         assert spec["filename"] == filename, f"{tier} 档文件名与实测不符"
         assert abs(float(spec["approximate_size_gb"]) - size_gb) < 1e-6, f"{tier} 档体积与实测不符"
+    for tier, (repo, mmproj_name, mmproj_gb) in VERIFIED_MMPROJ.items():
+        spec = MODEL_TIERS[tier]
+        assert spec["repo"] == repo
+        assert spec["mmproj_filename"] == mmproj_name, f"{tier} 档视觉组件文件名与实测不符"
+        assert abs(float(spec["mmproj_size_gb"]) - mmproj_gb) < 1e-6, f"{tier} 档视觉组件体积与实测不符"
 
 
 def test_model_tiers_no_sharded_filenames():
@@ -593,12 +606,14 @@ def test_model_tiers_no_sharded_filenames():
 
 
 def test_model_tiers_has_four_frozen_tiers():
-    """MODEL_TIERS 冻结四档，且每档含 repo / filename / 体积 / 内存 / 显存 / 说明。"""
+    """MODEL_TIERS 冻结四档，且每档含 repo / filename / 视觉组件 / 体积 / 内存 / 显存 / 说明。"""
     assert set(MODEL_TIERS) == set(ALL_TIERS)
     for tier, spec in MODEL_TIERS.items():
         for key in (
             "repo",
             "filename",
+            "mmproj_filename",
+            "mmproj_size_gb",
             "approximate_size_gb",
             "ram_requirement_gb",
             "vram_requirement_gb",
@@ -610,11 +625,13 @@ def test_model_tiers_has_four_frozen_tiers():
 
 @pytest.mark.parametrize("tier", ALL_TIERS)
 def test_model_tiers_pass_repo_and_filename_validation(tier):
-    """四档 repo / filename 全部通过既有 _validate_repo / _validate_filename 校验。"""
+    """四档 repo / filename / 视觉组件文件名全部通过既有 _validate_repo / _validate_filename 校验。"""
     spec = MODEL_TIERS[tier]
     LlmDownloader._validate_repo(spec["repo"])
     LlmDownloader._validate_filename(spec["filename"])
+    LlmDownloader._validate_filename(spec["mmproj_filename"])
     assert spec["filename"].endswith(".gguf")
+    assert spec["mmproj_filename"].endswith(".gguf")
     assert spec["repo"].count("/") >= 1
 
 
@@ -633,15 +650,18 @@ def test_suggest_model_by_tier_returns_tier_spec(source, tier):
         assert key in info, f"档位 {tier} 缺少字段 {key}"
 
 
-def test_suggest_model_default_tier_keeps_1_7b_baseline():
-    """不传 tier → 回落既有 1.7B 基线档（repo 不变，文件名 / 体积为联网实测值）。"""
+def test_suggest_model_default_tier_keeps_e2b_q4_baseline():
+    """不传 tier → 回落默认档 E2B-Q4（Gemma 4 多模态，文件名 / 体积为联网实测值）。"""
     info = LlmDownloader.suggest_model("modelscope")
-    assert info["tier"] == "1.7B"
-    assert info["repo"] == "Qwen/Qwen1.5-1.8B-Chat-GGUF"
-    assert info["filename"] == "qwen1_5-1_8b-chat-q4_k_m.gguf"
-    assert abs(float(info["approximate_size_gb"]) - 1.134) < 1e-9
-    assert info["family"] == "Qwen1.5-1.8B-Chat"
+    assert info["tier"] == "E2B-Q4"
+    assert info["repo"] == "unsloth/gemma-4-E2B-it-GGUF"
+    assert info["filename"] == "gemma-4-E2B-it-Q4_K_M.gguf"
+    assert abs(float(info["approximate_size_gb"]) - 2.894) < 1e-9
+    assert info["family"] == "gemma-4-E2B-it"
     assert info["quant"] == "Q4_K_M"
+    # 多模态档位必须携带视觉投影文件信息（下载器据此双文件下载）
+    assert info["mmproj_filename"] == "mmproj-BF16.gguf"
+    assert abs(float(info["mmproj_size_gb"]) - 0.919) < 1e-9
 
 
 def test_suggest_model_unknown_tier_raises_chinese_error_with_available():
@@ -654,12 +674,12 @@ def test_suggest_model_unknown_tier_raises_chinese_error_with_available():
     assert "未知模型档位" in msg
 
 
-@pytest.mark.parametrize("raw", [" 1.7b ", "1.7B", "1.7b", " 1.7B "])
+@pytest.mark.parametrize("raw", [" e2b-q4 ", "E2B-Q4", "e2b-q4", " E2B-Q4 "])
 def test_suggest_model_tier_parsing_is_tolerant(raw):
-    """档位标识宽容解析：前后空格 + 大小写归一后仍命中 1.7B。"""
+    """档位标识宽容解析：前后空格 + 大小写归一后仍命中 E2B-Q4。"""
     info = LlmDownloader.suggest_model("modelscope", raw)
-    assert info["tier"] == "1.7B"
-    assert info["repo"] == "Qwen/Qwen1.5-1.8B-Chat-GGUF"
+    assert info["tier"] == "E2B-Q4"
+    assert info["repo"] == "unsloth/gemma-4-E2B-it-GGUF"
 
 
 # ------------------------------------------------------------------ #

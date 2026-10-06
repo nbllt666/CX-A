@@ -13,9 +13,12 @@
     → ``(r*299 + g*587 + b*114) // 1000`` 灰度 int 列表（长度 2304）
     → 逐级释放 SelectObject / DeleteObject / DeleteDC / ReleaseDC
 
-隐私红线：原始帧不出本机——GDI 抓屏结果仅在内存中立即降采样为 64x36 灰度
-一维序列，仅该降采样结果参与理解链路；不落盘、不编码外传原始位图
-（对齐 lite/vision 包级隐私声明）。
+隐私红线：灰度链路（``capture``）的原始帧不出本机——GDI 抓屏结果仅在内存中
+立即降采样为 64x36 灰度一维序列，仅该降采样结果参与理解链路；不落盘、不编码
+外传原始位图（对齐 lite/vision 包级隐私声明）。截图链路（``capture_image_b64``，
+20261004 Gemma 4 本地视觉）产出的 PNG base64 **仅供本地多模态模型理解**（经
+127.0.0.1 回环递交本机 llama-server，数据不出本机）；云端理解路径维持仅使用
+灰度拓扑、不传输截图的红线不变。
 
 容错契约（对 sampler 的失败帧语义）：``capture()`` 整体 try/except——
 非 Windows 平台、任何 GDI 调用失败、缓冲读取异常一律经 LOGGER.warning
@@ -26,10 +29,13 @@
 返回 None（sampler 首次采样仅建立基线，无事件产出，可接受）。
 """
 
+import base64
 import ctypes
 import logging
+import struct
 import sys
 import threading
+import zlib
 
 #: 原生日志记录器（告警统一携带 [ScreenBackend][WARN] 前缀）
 LOGGER = logging.getLogger(__name__)
@@ -37,6 +43,10 @@ LOGGER = logging.getLogger(__name__)
 #: 降采样网格尺寸（与 ChangeDetector 默认 64x36 对齐，长度 2304 定长帧）
 _GRID_WIDTH = 64
 _GRID_HEIGHT = 36
+
+#: 截图链路目标宽度上限（像素，20261004 本地视觉）：Gemma 4 mmproj 按该量级
+#: 消费图片——兼顾识别效果与 PNG base64 体积（数百 KB 量级，回环传输即可）。
+_IMAGE_MAX_WIDTH = 896
 
 #: BitBlt 光栅操作码：SRCCOPY（0x00CC0020）| CAPTUREBLT（0x40000000，
 #: 含分层窗口——否则 LayeredWindow 不入帧）
@@ -128,6 +138,17 @@ class WindowsGrayscaleScreenBackend:
         :raises OSError: 非 Windows 平台 / 虚拟屏尺寸探测失败。
         :raises ctypes.WinError: GDI 调用返回空句柄。
         """
+        buf, screen_w, screen_h = self._capture_bgra()
+        return self._grid_grayscale(buf, screen_w, screen_h)
+
+    def _capture_bgra(self):
+        """执行一次 GDI 抓屏，返回原始 BGRA 位图缓冲与尺寸（任何失败向上抛）。
+
+        :return: tuple ``(buf, screen_w, screen_h)``——buf 为 32bpp BGRA 字节缓冲
+            （每像素 4 字节，顶部朝下行序），w/h 为虚拟屏像素尺寸。
+        :raises OSError: 非 Windows 平台 / 虚拟屏尺寸探测失败。
+        :raises ctypes.WinError: GDI 调用返回空句柄。
+        """
         if sys.platform != "win32":
             raise OSError("非 Windows 平台不支持 GDI 抓屏")
         user32 = ctypes.windll.user32
@@ -182,7 +203,50 @@ class WindowsGrayscaleScreenBackend:
             gdi32.DeleteDC(h_mem)
             user32.ReleaseDC(None, h_screen)
 
-        return self._grid_grayscale(buf, screen_w, screen_h)
+        return buf, screen_w, screen_h
+
+    # ------------------------------------------------------------------ #
+    # 截图链路（20261004 Gemma 4 本地视觉）                                #
+    # ------------------------------------------------------------------ #
+
+    def capture_image_b64(self, max_width=_IMAGE_MAX_WIDTH):
+        """抓取一帧屏幕并编码为 PNG base64（本地多模态视觉理解用）。
+
+        与 :meth:`capture` 的灰度拓扑不同，本方法产出**真实截图**（BGRA → RGB
+        等比最近邻下采样到 max_width 内 → 纯标准库 PNG 编码）。数据全程留在本机：
+        仅经 127.0.0.1 回环递交本机 llama-server（``--mmproj`` 挂载后具备看图
+        能力）；云端理解路径不消费本方法产出（隐私红线不变）。
+
+        :param max_width: 目标宽度上限（像素），等比缩放；不超过则原尺寸。
+        :return: str PNG base64（不含 ``data:image/png;base64,`` 前缀，由调用方
+            拼接 data URL）；非 Windows / 任何失败返回 None（调用方回落灰度
+            拓扑描述，不阻断视觉链路）。
+        """
+        try:
+            return self._capture_image_b64_gdi(max_width)
+        except Exception as exc:  # noqa: BLE001 - 截图失败不阻断视觉链路
+            reason = f"{exc.__class__.__name__}: {exc}"
+            LOGGER.warning("[ScreenBackend][WARN] 截图编码失败，理解侧回落灰度拓扑：%s", reason)
+            return None
+
+    def _capture_image_b64_gdi(self, max_width):
+        """GDI 抓屏 → 等比下采样 RGB 行 → PNG base64（任何失败向上抛）。"""
+        buf, screen_w, screen_h = self._capture_bgra()
+        scale = min(1.0, float(max_width) / float(screen_w))
+        target_w = max(1, int(screen_w * scale))
+        target_h = max(1, int(screen_h * scale))
+        rows = []
+        for ty in range(target_h):
+            sy = min(screen_h - 1, int((ty + 0.5) * screen_h / target_h))
+            row_base = sy * screen_w
+            row = bytearray()
+            for tx in range(target_w):
+                sx = min(screen_w - 1, int((tx + 0.5) * screen_w / target_w))
+                offset = (row_base + sx) * 4
+                # BGRA → RGB 字节序
+                row += bytes((buf[offset + 2], buf[offset + 1], buf[offset]))
+            rows.append(bytes(row))
+        return _encode_png_base64(rows, target_w, target_h)
 
     @staticmethod
     def _grid_grayscale(bgra_buf, screen_w, screen_h):
@@ -207,3 +271,31 @@ class WindowsGrayscaleScreenBackend:
                 r = bgra_buf[offset + 2]
                 gray.append((r * 299 + g * 587 + b * 114) // 1000)
         return gray
+
+
+def _encode_png_base64(rgb_rows, width, height):
+    """RGB 行序列编码为 PNG base64（纯标准库 zlib/struct，零新依赖）。
+
+    :param rgb_rows: 每元素为一行 RGB 字节（长度 = width*3）的序列。
+    :param width: 图像宽（像素）。
+    :param height: 图像高（像素）。
+    :return: str PNG base64（不含 data URL 前缀）。
+    """
+
+    def _chunk(tag, data):
+        """PNG 块 = 长度 + 类型 + 数据 + CRC（类型与数据一并参与 CRC）。"""
+        return (
+            struct.pack(">I", len(data)) + tag + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    # 每行前置过滤字节 0（None 过滤）；真彩 8bit/通道，color type 2（RGB）
+    raw = b"".join(b"\x00" + row for row in rgb_rows)
+    ihdr = struct.pack(">IIBBBBB", int(width), int(height), 8, 2, 0, 0, 0)
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", zlib.compress(raw, 6))
+        + _chunk(b"IEND", b"")
+    )
+    return base64.b64encode(png).decode("ascii")

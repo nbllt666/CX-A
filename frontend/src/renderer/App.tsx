@@ -10,20 +10,22 @@ import PetPage from './pages/PetPage';
 import MemoriesPage from './pages/MemoriesPage';
 import SettingsPage from './pages/SettingsPage';
 import SetupWizard from './pages/SetupWizard';
+import FleetPage from './pages/FleetPage';
 import { usePetEnabled } from './hooks/usePetEnabled';
 
 /**
- * 伴侣面视图。
+ * 主界面视图。
  *
- * 管理面（Agents / Remote / Status）已按决策收敛为纯后端 API：
- * 前端不再路由管理页，管理能力经 /api/agents、/api/remote/*、/api/status 外露，
- * 供另一 Agent 或管理工具调用（见 .trae/documents/20260826_模块0_差异审查登记与处理计划.md）。
+ * 管理面（CX-A 管理 CX-O 实例群）按 20261004 决策补齐前端：`fleet` 视图存在，
+ * 但**无任何可见入口**——唯一进入方式为连点侧栏 logo 5 次（隐藏入口）或深链
+ * `#/fleet`；治理 API 仍经 /api/fleet/* 外露（spec add-fleet-frontend-hidden，
+ * 解除 20260826_模块0_差异审查登记与处理计划.md 中「前端不放管理页」旧边界）。
  *
  * `setup` = 首启向导（首次启动覆盖主界面，或从设置页 / `#/setup` 深链重入）。
  */
-export type View = 'chat' | 'pet' | 'memories' | 'settings' | 'setup';
+export type View = 'chat' | 'pet' | 'memories' | 'settings' | 'setup' | 'fleet';
 
-const VIEWS: View[] = ['chat', 'pet', 'memories', 'settings', 'setup'];
+const VIEWS: View[] = ['chat', 'pet', 'memories', 'settings', 'setup', 'fleet'];
 
 /**
  * 首启门控状态：
@@ -41,7 +43,7 @@ type SetupGate = 'checking' | 'wizard' | 'main';
 interface RouterValue {
   view: View;
   appInfo: AppInfo | null;
-  /** 在伴侣面内切换视图（hash 路由，不重启窗口） */
+  /** 在主界面内切换视图（hash 路由，不重启窗口） */
   navigate: (view: View) => void;
 }
 
@@ -64,7 +66,7 @@ export function useRouterOptional(): RouterValue | null {
   return useContext(RouterContext);
 }
 
-/** 从 hash 解析出伴侣面视图；非法回退到 /chat */
+/** 从 hash 解析出主界面视图；非法回退到 /chat */
 function parseHash(hash: string): View {
   const clean = hash.replace(/^#\/?/, '').split('.')[0] as View;
   return VIEWS.includes(clean) ? clean : 'chat';
@@ -146,7 +148,7 @@ export default function App() {
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
 
-  // 非法 hash 路由回落：非空但不在伴侣面路由的 hash 归一化写回 /chat
+  // 非法 hash 路由回落：非空但不在主界面路由的 hash 归一化写回 /chat
   useEffect(() => {
     const clean = window.location.hash.replace(/^#\/?/, '').split('.')[0];
     if (!clean) return;
@@ -239,6 +241,9 @@ function ViewRenderer({ view, onSetupDone }: { view: View; onSetupDone: () => vo
       return <MemoriesPage />;
     case 'settings':
       return <SettingsPage />;
+    case 'fleet':
+      // 管理面（隐藏入口：连点侧栏 logo 5 次或深链 #/fleet）
+      return <FleetPage />;
     case 'setup':
       return <SetupWizard onDone={onSetupDone} />;
     default:

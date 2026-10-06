@@ -145,7 +145,8 @@ def test_default_nullable_columns(table_info):
 
 
 def test_memory_types_enum():
-    assert set(MEMORY_TYPES) == {"long_term", "short_term", "permanent"}
+    # 20261005 记忆页对齐 CX-O：扩为四值域（diary 为日记类型，spec: align-wizard-settings-memory-pet）
+    assert set(MEMORY_TYPES) == {"long_term", "short_term", "permanent", "diary"}
 
 
 def test_columns_contract_matches_schema_module(table_info):

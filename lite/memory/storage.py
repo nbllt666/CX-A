@@ -13,6 +13,7 @@ import os
 import sqlite3
 from datetime import datetime
 
+from .decay import age_seconds_from_created as _age_seconds
 from .schema import COLUMNS, CREATE_INDEX_SQL, CREATE_TABLE_SQL, MEMORY_TYPES
 
 # 原生日志记录器（低-10：update 未知键告警留痕）
@@ -312,3 +313,178 @@ class MemoryStore:
         params.append(int(limit))
         rows = self._connect().execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ 衰减（20261005 记忆页对齐 CX-O，spec: align-wizard-settings-memory-pet）
+    #
+    # 衰减公式来源（CX-O 口径，已在 lite/memory/decay.py 移植为 DecayCalculator）：
+    #   - CX-O 出处：C:\\CX-O\\CX-O-SERVER\\server\\core\\memory\\decay.py
+    #     （DecayCalculator.calculate_time_score / calculate_importance_score）
+    #   - 艾宾浩斯优化版（默认 decay_type='ebbinghaus_opt'）：
+    #         T(t) = importance / (1 + (Δt / T50)^k)，T50=30 天、k=2.0
+    #   - 双阶段指数（decay_type='two_stage'）：
+    #         T(t) = importance·(α·e^(-λ1·Δt) + (1-α)·e^(-λ2·Δt))
+    #   - 再激活加成：enhanced = base·(1 + 0.2·count) + 0.1 + 0.05·|emotion|，上限 1.0
+    #   - permanent 豁免：permanent 记忆或 importance_score >= 0.95 恒 1.0，
+    #     不随时间衰减（对齐 CX-O zero/permanent 与 config.memory.permanent_threshold）。
+    # 统计结构对齐 CX-O mixins/advanced_mixin.py 的 get_decay_statistics
+    # （total/permanent_count/avg_time_score/importance_distribution/reactivation_stats），
+    # 另按 spec「即将遗忘/已衰减分布」要求扩展 decay_distribution 分桶。
+
+    #: 衰减后分数低于该值 → 视为「已衰减/已遗忘」，sync_decay 软删归档。
+    #: CX-O 侧无「低分自动软删」端点（仅 decay_batch 周期回写 importance_score），
+    #: 该阈值为 CX-A 按 spec「低分记忆自动软删归档」补齐的口径定义。
+    SYNC_DECAY_ARCHIVE_THRESHOLD = 0.1
+    #: 衰减后分数低于该值（尚未到归档线）→ 「即将遗忘」桶。
+    DECAY_FADING_THRESHOLD = 0.3
+
+    @staticmethod
+    def _decay_calculator():
+        """惰性构建 DecayCalculator（延迟导入，避免模块加载顺序耦合）。"""
+        from .decay import DecayCalculator
+
+        return DecayCalculator()
+
+    @staticmethod
+    def _decay_importance_of(mem):
+        """取记忆的重要性分数（0~1）。
+
+        口径对齐 CX-O DecayCalculator.calculate_importance_score：
+        importance_score 优先，缺省按 importance 等级 / 5.0 折算；脏值回退 0.6。
+        """
+        score = mem.get("importance_score")
+        if score is not None:
+            try:
+                return max(0.0, min(1.0, float(score)))
+            except (TypeError, ValueError):
+                return 0.6
+        try:
+            return max(0.0, min(1.0, int(mem.get("importance", 3)) / 5.0))
+        except (TypeError, ValueError):
+            return 0.6
+
+    @staticmethod
+    def _is_permanent(mem):
+        """判定一条记忆是否豁免衰减：permanent 标记或 type=='permanent'。"""
+        return bool(mem.get("permanent")) or mem.get("type") == "permanent"
+
+    def decay_stats(self, now=None, calculator=None) -> dict:
+        """衰减统计：全量未删除记忆按衰减公式计算分数并汇总分布。
+
+        Args:
+            now: 统计基准时间（datetime 或兼容字符串）；None 用当前时刻。
+            calculator: 测试注入用 DecayCalculator；缺省内部构建。
+        Returns:
+            dict: 对齐 CX-O get_decay_statistics + CX-A 扩展：
+                total_memories / permanent_count / non_permanent_count /
+                avg_time_score / avg_importance_score / importance_distribution /
+                decay_distribution {healthy, fading, faded} / reactivation_stats /
+                thresholds {archive, fading}
+        """
+        calc = calculator if calculator is not None else self._decay_calculator()
+        rows = self.list(include_deleted=False)
+        total = len(rows)
+        permanent_count = 0
+        avg_time = 0.0
+        avg_importance = 0.0
+        importance_distribution = {}
+        distribution = {"healthy": 0, "fading": 0, "faded": 0}
+        reactivated_count = 0
+        reactivation_sum = 0
+        for mem in rows:
+            importance = self._decay_importance_of(mem)
+            bucket = round(importance, 2)
+            importance_distribution[bucket] = importance_distribution.get(bucket, 0) + 1
+            avg_importance += importance
+            reac = int(mem.get("reactivation_count", 0) or 0)
+            if reac > 0:
+                reactivated_count += 1
+                reactivation_sum += reac
+            if self._is_permanent(mem):
+                # permanent 豁免：不参与时间衰减均值（对齐 CX-O 统计口径）
+                permanent_count += 1
+                distribution["healthy"] += 1
+                continue
+            time_score = calc.score(
+                importance=importance,
+                age_seconds=_age_seconds(mem.get("created_at"), now),
+                decay_type=mem.get("decay_type", "ebbinghaus_opt"),
+                params=mem.get("decay_params"),
+                reactivation_count=reac,
+                emotion_score=float(mem.get("emotion_score", 0.0) or 0.0),
+                permanent=False,
+            )
+            avg_time += time_score
+            if time_score < self.SYNC_DECAY_ARCHIVE_THRESHOLD:
+                distribution["faded"] += 1
+            elif time_score < self.DECAY_FADING_THRESHOLD:
+                distribution["fading"] += 1
+            else:
+                distribution["healthy"] += 1
+        non_permanent = total - permanent_count
+        if non_permanent > 0:
+            avg_time /= non_permanent
+        if total > 0:
+            avg_importance /= total
+        return {
+            "total_memories": total,
+            "permanent_count": permanent_count,
+            "non_permanent_count": non_permanent,
+            "avg_time_score": round(avg_time, 4),
+            "avg_importance_score": round(avg_importance, 4),
+            "importance_distribution": importance_distribution,
+            "decay_distribution": distribution,
+            "reactivation_stats": {
+                "reactivated_count": reactivated_count,
+                "avg_reactivation_count": round(reactivation_sum / reactivated_count, 2) if reactivated_count else 0.0,
+            },
+            "thresholds": {
+                "archive": self.SYNC_DECAY_ARCHIVE_THRESHOLD,
+                "fading": self.DECAY_FADING_THRESHOLD,
+            },
+        }
+
+    def sync_decay(self, archive_threshold=None, now=None, calculator=None, deleter=None) -> dict:
+        """执行衰减同步：衰减后分数低于阈值的非 permanent 记忆软删归档。
+
+        Args:
+            archive_threshold: 归档分数线（None 用 SYNC_DECAY_ARCHIVE_THRESHOLD）。
+            now: 计算基准时间；None 用当前时刻。
+            calculator: 测试注入用 DecayCalculator；缺省内部构建。
+            deleter: 可选软删回调 callable(memory_id) -> bool；注入时以回调执行
+                （api 层传 manager.soft_delete，可同步清理向量库孤儿向量），
+                缺省用本存储层 soft_delete。
+        Returns:
+            dict: {scanned, deleted_count, deleted_ids, skipped_permanent, archive_threshold}
+        """
+        calc = calculator if calculator is not None else self._decay_calculator()
+        threshold = (
+            float(archive_threshold)
+            if archive_threshold is not None
+            else self.SYNC_DECAY_ARCHIVE_THRESHOLD
+        )
+        delete_one = deleter if deleter is not None else self.soft_delete
+        rows = self.list(include_deleted=False)
+        deleted_ids, skipped_permanent = [], 0
+        for mem in rows:
+            if self._is_permanent(mem):
+                # permanent 豁免：永不因衰减被归档（spec 硬性要求）
+                skipped_permanent += 1
+                continue
+            score = calc.score(
+                importance=self._decay_importance_of(mem),
+                age_seconds=_age_seconds(mem.get("created_at"), now),
+                decay_type=mem.get("decay_type", "ebbinghaus_opt"),
+                params=mem.get("decay_params"),
+                reactivation_count=int(mem.get("reactivation_count", 0) or 0),
+                emotion_score=float(mem.get("emotion_score", 0.0) or 0.0),
+                permanent=False,
+            )
+            if score < threshold and delete_one(mem["id"]):
+                deleted_ids.append(mem["id"])
+        return {
+            "scanned": len(rows),
+            "deleted_count": len(deleted_ids),
+            "deleted_ids": deleted_ids,
+            "skipped_permanent": skipped_permanent,
+            "archive_threshold": threshold,
+        }

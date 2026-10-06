@@ -1,8 +1,8 @@
 {
   "name": "cx-a-companion",
-  "productName": "CX-A 赛博伴侣",
+  "productName": "CX-A",
   "version": "0.1.0",
-  "description": "CX-A 赛博伴侣桌面应用前端（Electron + React + Vite + Tailwind，Liquid Glass 玻璃拟态）",
+  "description": "CX-A 桌面应用前端（Electron + React + Vite + Tailwind，Liquid Glass 玻璃拟态）",
   "main": "src/main/main.js",
   "author": "CX-A",
   "license": "UNLICENSED",

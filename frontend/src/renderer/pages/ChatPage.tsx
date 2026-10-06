@@ -1,7 +1,15 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Bot, Mic, User, Volume2 } from 'lucide-react';
 import type { ChatMessage } from '../mock';
-import { sendChatMessage, synthesizeSpeechStream, transcribeAudio } from '../api';
+import {
+  CHAT_TICK_KEY,
+  fetchChatHistory,
+  publishChatTick,
+  sendChatMessage,
+  synthesizeSpeechStream,
+  transcribeAudio,
+} from '../api';
+import { normalizeBackendMood, publishPetMood } from '../petMood';
 import { startRecording, type RecordingSession } from '../audioRecorder';
 import Toggle from '../components/Toggle';
 
@@ -13,11 +21,11 @@ import Toggle from '../components/Toggle';
  * - 发送经 api.sendChatMessage 走真实 POST /api/chat/message（表情聊天端点）；
  *   后端组装云端流式回复并解析 [emotion:x] 标签，返回 {clean_text, mood, raw}；
  *   无 api_key / 云端不可达时后端返回固定友好文案 + mood=calm（offline:true），
- *   仍作为伴侣气泡真实展示（后端真实回传，非本地伪造）；
+ *   仍作为AI气泡真实展示（后端真实回传，非本地伪造）；
  * - 请求失败 / 占位响应 → 该条用户消息标「未送达」，提示条常显。
  *
  * 视觉口径（对齐设计参考项目）：
- * - 气泡头像是 **32px 圆角方形 + 淡色底 + lucide 图标**（用户 User / 伴侣 Bot），
+ * - 气泡头像是 **32px 圆角方形 + 淡色底 + lucide 图标**（用户 User / AI Bot），
  *   不使用 emoji 圆圈；页头不再挂卡通形象（桌宠由悬浮窗/桌宠页的真实 VRM 承载）。
  * - 文案不出现技术栈/实现细节（「后端」「通道」等字样），只说用户能感知的事实。
  */
@@ -42,7 +50,7 @@ export default function ChatPage() {
   const streamDoneRef = useRef(false);
 
   // F-7（第三轮体检批次6）：消息变化后自动滚动到底部——修复前 listRef 为
-  // 死引用，消息超一屏后新气泡（尤其伴侣回复）出现在视口外。
+  // 死引用，消息超一屏后新气泡（尤其AI回复）出现在视口外。
   // scrollTo 存在性防御：jsdom 测试环境未实现 Element.scrollTo
   useEffect(() => {
     const el = listRef.current;
@@ -51,11 +59,49 @@ export default function ChatPage() {
     }
   }, [messages.length]);
 
+  // 对话持久化（20261004 悬浮窗语音闭环）：挂载加载历史 + 监听聊天刷新总线。
+  // 悬浮窗「说话」链路的对话也落同一份历史——桌宠语音回复后 publishChatTick
+  // 写 localStorage，本页经 storage 事件（仅跨窗口触发）重载，两个窗口共享
+  // 同一份对话真相。历史加载失败静默降级：保持当前列表（空态或既有消息）。
+  // 竞态防护：本窗口发送后已有更新的本地状态，挂载期在途的历史快照作废不套用
+  //（否则会晚到清空刚发的气泡）；tick 触发的重载为 force——后端落盘真相为准。
+  const historyStaleRef = useRef(false);
+  const loadHistory = useCallback((force = false) => {
+    fetchChatHistory()
+      .then((entries) => {
+        if (!force && historyStaleRef.current) return;
+        setMessages(
+          entries.map((entry, index) => ({
+            id: `h-${index}-${entry.time ?? ''}`,
+            role: entry.role === 'user' ? ('me' as const) : ('companion' as const),
+            content: typeof entry.content === 'string' ? entry.content : '',
+            time: formatHistoryTime(entry.time),
+          })),
+        );
+      })
+      .catch((err) => {
+        console.error('[Chat] 历史加载失败:', err);
+      });
+  }, []);
+
+  useEffect(() => {
+    loadHistory();
+  }, [loadHistory]);
+
+  useEffect(() => {
+    const handler = (e: StorageEvent) => {
+      if (e.key === CHAT_TICK_KEY) loadHistory(true);
+    };
+    window.addEventListener('storage', handler);
+    return () => window.removeEventListener('storage', handler);
+  }, [loadHistory]);
+
   async function send() {
     const text = draft.trim();
     if (!text || sending) return;
     setDraft('');
     setSending(true);
+    historyStaleRef.current = true; // 本地已有更新：在途历史快照作废
 
     const now = new Date();
     const meId = `me-${now.getTime()}`;
@@ -69,6 +115,11 @@ export default function ChatPage() {
       const reply = extractReplyText(data);
       if (reply) {
         setChannel('connected');
+        // 表情总线：把 LLM 情绪发布给桌宠悬浮窗（后端 [emotion:x] 标签解析结果；
+        // angry 等前端无对应档在 normalize 内回落 calm）
+        publishPetMood(normalizeBackendMood(data.mood));
+        // 聊天刷新总线：其他窗口（如有）重载历史；本窗口已本地追加无需自刷
+        publishChatTick();
         const replyId = `c-${Date.now()}`;
         setMessages((prev) => [
           ...prev,
@@ -281,7 +332,7 @@ export default function ChatPage() {
             // F-6（第三轮体检批次6）：中文输入法组合期（选候选词）的 Enter 不触发发送
             if (e.key === 'Enter' && !e.nativeEvent.isComposing) void send();
           }}
-          placeholder="跟你的伴侣说点什么吧…"
+          placeholder="跟你的AI说点什么吧…"
           className="h-10 flex-1 rounded-xl border border-[var(--glass-border)] bg-[rgba(255,255,255,0.5)] px-3 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)]"
         />
         <button
@@ -305,7 +356,7 @@ export default function ChatPage() {
  *
  * 守卫端点会返回 200 + `{"ok":false,"error":"chat_service_disabled",...}` 这类失败说明：
  * ok === false 或存在非空 error 字段即判定为不可用返回 null，走「未送达」路径，
- * 绝不把故障说明文本（message/content 等）渲染成伴侣气泡。
+ * 绝不把故障说明文本（message/content 等）渲染成AI气泡。
  */
 function extractReplyText(data: unknown): string | null {
   if (!data || typeof data !== 'object') return null;
@@ -327,6 +378,12 @@ function formatTime(d: Date): string {
   return d.toTimeString().slice(0, 5);
 }
 
+/** 历史时间戳（YYYY-MM-DD HH:MM:SS）→ 气泡短时间（HH:MM）；缺失/非法回落 — */
+function formatHistoryTime(raw?: string): string {
+  const match = typeof raw === 'string' ? /\b(\d{2}:\d{2}):\d{2}\b/.exec(raw) : null;
+  return match ? match[1] : '—';
+}
+
 /** 气泡头像：32px 圆角方形 + 淡色底 + lucide 图标（对齐设计参考项目的写法）。 */
 function MessageBubble({
   msg,
@@ -336,7 +393,7 @@ function MessageBubble({
   msg: ChatMessage;
   /** 该条是否正在朗读（播放态显示为高亮呼吸） */
   speaking?: boolean;
-  /** 伴侣气泡的朗读回调；缺省不渲染朗读按钮 */
+  /** AI气泡的朗读回调；缺省不渲染朗读按钮 */
   onSpeak?: () => void;
 }) {
   const isMe = msg.role === 'me';

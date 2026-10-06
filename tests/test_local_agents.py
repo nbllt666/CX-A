@@ -26,13 +26,58 @@ def test_seed_init(tmp_path):
     # 首启自动建文件并注入默认种子
     assert path.exists()
     seeds = mgr.list()
-    assert len(seeds) == 1
+    # 20261005：内置种子为 default（软软）+ memory-agent（记忆管理助手）
+    assert len(seeds) == 2
     seed = seeds[0]
     assert seed.id == "default"
     assert seed.name == "软软"
-    assert "赛博伴侣" in seed.persona
+    assert "记在心上" in seed.persona
     assert seed.voice == "cx-open"
     assert seed.enabled is True
+    # 内置记忆管理助手随首启注入（persona 为 [memory:op] 指令协议）
+    mem_agent = mgr.get("memory-agent")
+    assert mem_agent.name == "记忆管理助手"
+    assert "[memory:" in mem_agent.persona
+    assert mem_agent.enabled is True
+
+
+# ---------------------------------------------------------------- 历史默认人设迁移
+def test_legacy_seed_persona_migrated(tmp_path):
+    """旧版默认人设（精确匹配）加载时迁移为新默认，并落盘持久化。"""
+    path = tmp_path / "agents.json"
+    legacy = {
+        "id": "default",
+        "name": "软软",
+        "persona": "温柔可靠的赛博伴侣，话少但事事记在心上",
+        "voice": "cx-open",
+        "enabled": True,
+        "created_at": "2026-09-24T23:07:33.538039",
+        "updated_at": "2026-09-24T23:07:33.538039",
+    }
+    path.write_text(json.dumps([legacy], ensure_ascii=False), encoding="utf-8")
+    mgr = AgentManager(path=str(path))
+    seed = mgr.get("default")
+    assert seed.persona == "话不多但事事记在心上，安静又可靠"
+    # 迁移结果落盘（重载仍为新文案）
+    reloaded = AgentManager(path=str(path))
+    assert reloaded.get("default").persona == "话不多但事事记在心上，安静又可靠"
+
+
+def test_legacy_seed_migration_leaves_custom_persona(tmp_path):
+    """用户自定义人设（非旧默认原文）：一律不动。"""
+    path = tmp_path / "agents.json"
+    custom = {
+        "id": "default",
+        "name": "软软",
+        "persona": "我自己写的人设，谁也别动",
+        "voice": "cx-open",
+        "enabled": True,
+        "created_at": "2026-09-24T23:07:33.538039",
+        "updated_at": "2026-09-24T23:07:33.538039",
+    }
+    path.write_text(json.dumps([custom], ensure_ascii=False), encoding="utf-8")
+    mgr = AgentManager(path=str(path))
+    assert mgr.get("default").persona == "我自己写的人设，谁也别动"
 
 
 # ---------------------------------------------------------------- CRUD
@@ -123,9 +168,9 @@ def test_update_enabled_non_bool_non_str_raises(manager, bad_type):
 
 def test_delete(manager):
     created = manager.create(name="小夜", persona="……")
-    assert len(manager.list()) == 2  # 种子 default + 新建
+    assert len(manager.list()) == 3  # 种子 default + memory-agent + 新建
     manager.delete(created.id)
-    assert len(manager.list()) == 1
+    assert len(manager.list()) == 2
     with pytest.raises(AgentNotFound):
         manager.get(created.id)
 
@@ -151,7 +196,7 @@ def test_list_enabled_filter(manager):
     disabled = manager.list(enabled=False)
     assert all(x.enabled for x in enabled)
     assert all(not x.enabled for x in disabled)
-    assert len(manager.list(enabled=True)) == 1  # 只有种子 default 启用
+    assert len(manager.list(enabled=True)) == 2  # 种子 default + memory-agent 启用
     assert manager.list(enabled=False) == [a]
 
 
@@ -161,10 +206,10 @@ def test_persistence_roundtrip(tmp_path):
     mgr1 = AgentManager(path=str(path))
     mgr1.create(name="小夜", persona="夜猫子", voice="miku")
 
-    # 重载新实例：应从盘上读到刚才的数据（种子 + 新建）
+    # 重载新实例：应从盘上读到刚才的数据（内置种子 + 新建）
     mgr2 = AgentManager(path=str(path))
     names = [a.name for a in mgr2.list()]
-    assert names == ["软软", "小夜"]
+    assert names == ["软软", "记忆管理助手", "小夜"]
     night = mgr2.get([a.id for a in mgr2.list() if a.name == "小夜"][0])
     assert night.persona == "夜猫子"
     assert night.voice == "miku"
@@ -245,7 +290,7 @@ def test_save_atomic_no_leftover_tmp_on_success(tmp_path):
     leftovers = [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
     assert leftovers == []
     parsed = json.loads(path.read_text("utf-8"))
-    assert [a["name"] for a in parsed] == ["软软", "小夜"]
+    assert [a["name"] for a in parsed] == ["软软", "记忆管理助手", "小夜"]
 
 
 # ---------------------------------------------------------------- 第四轮体检批次C：损坏隔离
@@ -281,5 +326,60 @@ def test_non_list_top_level_isolated(tmp_path):
     isolated = list(tmp_path.glob("agents.json.corrupt-*"))
     assert len(isolated) == 1
     assert json.loads(isolated[0].read_text("utf-8")) == {"id": "default"}
-    # 正式位重建为种子列表
-    assert [a.id for a in mgr.list()] == ["default"]
+    # 正式位重建为种子列表（default + 内置 memory-agent）
+    assert [a.id for a in mgr.list()] == ["default", "memory-agent"]
+
+
+# ---------------------------------------------------------------- 内置记忆管理助手（20261005，spec: align-wizard-settings-memory-pet）
+def test_memory_agent_persona_contains_protocol_and_ops(tmp_path):
+    """memory-agent persona 完整覆盖 [memory:op {...}] 指令协议与五类操作集。"""
+    mgr = AgentManager(path=str(tmp_path / "agents.json"))
+    agent = mgr.get("memory-agent")
+    # 协议格式与五个操作（search/read/write/update/delete）逐个登记在 persona
+    for token in (
+        "[memory:op {json参数}]",
+        "[memory:search",
+        "[memory:read",
+        "[memory:write",
+        "[memory:update",
+        "[memory:delete",
+    ):
+        assert token in agent.persona, f"persona 缺少协议说明：{token}"
+    # 类型值域四类在 persona 中说明
+    for t in ("long_term", "short_term", "permanent", "diary"):
+        assert t in agent.persona
+
+
+def test_memory_agent_reseeded_after_delete_and_reload(tmp_path):
+    """用户删除 memory-agent 后重载自动补种（管理通道内置 agent 不随删除消失）。"""
+    path = tmp_path / "agents.json"
+    mgr1 = AgentManager(path=str(path))
+    mgr1.delete("memory-agent")
+    assert "memory-agent" not in {a.id for a in mgr1.list()}
+    # 重载：幂等补种
+    mgr2 = AgentManager(path=str(path))
+    agent = mgr2.get("memory-agent")
+    assert agent.name == "记忆管理助手"
+    # 落盘持久化（重载读盘仍存在）
+    parsed = json.loads(path.read_text("utf-8"))
+    assert "memory-agent" in {a["id"] for a in parsed}
+
+
+def test_memory_agent_upgrades_legacy_file_without_it(tmp_path):
+    """既有 agents.json（无 memory-agent）升级路径：加载即补种，用户数据不动。"""
+    path = tmp_path / "agents.json"
+    legacy = {
+        "id": "default",
+        "name": "软软",
+        "persona": "我自己定义的人设不动",
+        "voice": "cx-open",
+        "enabled": True,
+        "created_at": "2026-09-24T00:00:00",
+        "updated_at": "2026-09-24T00:00:00",
+    }
+    path.write_text(json.dumps([legacy], ensure_ascii=False), encoding="utf-8")
+    mgr = AgentManager(path=str(path))
+    ids = [a.id for a in mgr.list()]
+    assert ids == ["default", "memory-agent"]
+    # 用户自定义人设不被迁移逻辑改动
+    assert mgr.get("default").persona == "我自己定义的人设不动"

@@ -1,9 +1,11 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { PawPrint } from 'lucide-react';
 import { GlassCard } from '../components/GlassCard';
 import Toggle from '../components/Toggle';
 import VrmAvatar from '../components/VrmAvatar';
+import PetModelControls from '../components/PetModelControls';
 import { type PetMood } from '../petMood';
+import { onPetModelReload, readPetModelReloadTick } from '../api';
 import { usePetEnabled } from '../hooks/usePetEnabled';
 
 /**
@@ -20,6 +22,16 @@ export default function PetPage() {
   // 默认「平静」：与悬浮窗一致，睁眼常态作为首眼观感
   const [mood, setMood] = useState<PetMood>('calm');
   const [talking, setTalking] = useState(false);
+  // 模型代际（petModelReload 总线）：挂载时对齐当前 tick（本窗口在设置页导入后
+  // 首次进本页也能拿到新模型）；跨窗口导入经 storage 事件跟进。
+  const [modelTick, setModelTick] = useState<number>(() => readPetModelReloadTick());
+  useEffect(
+    () =>
+      onPetModelReload(() => {
+        setModelTick(readPetModelReloadTick());
+      }),
+    [],
+  );
 
   return (
     <div className="flex h-full flex-col overflow-y-auto p-5">
@@ -32,7 +44,7 @@ export default function PetPage() {
         {enabled ? (
           /* ---------- 开启态：页内渲染 VRM 桌宠（失败给中文提示，不回落卡通） ---------- */
           <div className="animate-bubble-in flex w-full flex-col items-center gap-6">
-            <VrmAvatar mood={mood} talking={talking} size={330} />
+            <VrmAvatar mood={mood} talking={talking} size={330} reloadKey={modelTick} />
 
             {/* 口型 / 表情演示控制（占位交互） */}
             <div className="flex flex-wrap items-center justify-center gap-3">
@@ -74,6 +86,17 @@ export default function PetPage() {
             </p>
           </div>
         )}
+
+        {/* 桌宠模型：更换自定义 VRM / 恢复默认（导入成功后页内桌宠立即重载） */}
+        <GlassCard className="w-full max-w-md">
+          <div className="flex flex-col gap-2 p-4">
+            <p className="font-medium">桌宠模型</p>
+            <p className="text-xs text-[var(--text-tertiary)]">
+              挑一个你喜欢的 VRM 模型换上；不满意随时一键恢复默认（原模型会自动备份）
+            </p>
+            <PetModelControls onReloaded={() => setModelTick(readPetModelReloadTick())} />
+          </div>
+        </GlassCard>
 
         {/* 开关（两种状态均可见） */}
         <GlassCard className="w-full max-w-md">
