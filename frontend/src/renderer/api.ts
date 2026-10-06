@@ -987,6 +987,35 @@ export async function fetchComputerStatus(): Promise<ComputerStatus> {
   return requestJson<ComputerStatus>(API_ENDPOINTS.computer.status);
 }
 
+/** 角色人设条目（本地多 Agent 体系；data/agents.json，默认角色 id="default" 软软）。 */
+export interface AgentInfo {
+  id: string;
+  name: string;
+  persona: string;
+  voice?: string | null;
+  enabled: boolean;
+}
+
+/** 拉取角色（Agent）列表（GET /api/agents）。 */
+export async function listAgents(): Promise<AgentInfo[]> {
+  return requestJson<AgentInfo[]>(`${API_BASE}/api/agents`);
+}
+
+/**
+ * 更新角色人设等字段（PUT /api/agents/{id}；后端白名单 name/persona/voice/enabled）。
+ * 修改默认角色（id="default"）的 persona 即调整桌宠对话的 system 人设。
+ */
+export async function updateAgent(
+  id: string,
+  patch: { persona?: string; name?: string; voice?: string | null; enabled?: boolean },
+): Promise<AgentInfo> {
+  return requestJson<AgentInfo>(`${API_BASE}/api/agents/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+}
+
 /** 开启 / 撤销电脑控制授权（POST /api/computer/authorize），返回最新状态。 */
 export async function setComputerAuthorized(enabled: boolean): Promise<ComputerStatus> {
   // N1：统一走 requestJson（自动附带 X-Client-Token）

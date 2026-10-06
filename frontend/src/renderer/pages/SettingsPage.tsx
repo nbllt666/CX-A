@@ -12,8 +12,10 @@ import {
   fetchVoices,
   hasVoiceFolderPicker,
   importVoice,
+  listAgents,
   pickVoiceFolder,
   setComputerAuthorized,
+  updateAgent,
   updateSettings,
 } from '../api';
 import type {
@@ -315,6 +317,11 @@ export default function SettingsPage() {
   // 语音交互模式（voice.interaction_mode，20261006 全双工降级版）：vad 传统 / duplex 全双工
   const [interactionMode, setInteractionMode] = useState<'vad' | 'duplex'>('vad');
   const [voiceModeHint, setVoiceModeHint] = useState<string | null>(null);
+  // 角色人设（agents.json 的 default 角色，20261006）：编辑即调整桌宠对话的 system 人设
+  const [personaAgentId, setPersonaAgentId] = useState<string | null>(null);
+  const [personaDraft, setPersonaDraft] = useState('');
+  const [personaSaving, setPersonaSaving] = useState(false);
+  const [personaHint, setPersonaHint] = useState<string | null>(null);
 
   // 挂载初始化：拉后端配置视图 + 音色包列表 + 电脑控制状态；失败回退默认值（与 config 默认一致）
   useEffect(() => {
@@ -328,6 +335,19 @@ export default function SettingsPage() {
           })
           .catch(() => {
             /* 探测失败 → hwProfile 保持 null → 显示全部选项（与旧行为一致） */
+          });
+        // 角色人设：读默认角色（id=default，缺失回落第一个启用的角色）
+        void listAgents()
+          .then((agents) => {
+            if (!alive || !Array.isArray(agents) || agents.length === 0) return;
+            const target = agents.find((a) => a.id === 'default') ?? agents.find((a) => a.enabled);
+            if (target) {
+              setPersonaAgentId(target.id);
+              setPersonaDraft(String(target.persona ?? ''));
+            }
+          })
+          .catch(() => {
+            /* 读取失败静默：编辑卡置灰（personaAgentId 保持 null） */
           });
         // 音色列表与配置视图并行拉取，互不阻塞；各自失败独立降级
         const voicesTask = fetchVoices().catch(() => null);
@@ -687,6 +707,26 @@ export default function SettingsPage() {
       .catch(() => {
         if (seq !== settingsSeqRef.current) return;
         setSaveError('语音模式没保存上…待会儿再选一次就好啦');
+      });
+  };
+
+  /** 保存角色人设（PUT /api/agents/{id} {persona}）：下一次对话生效。 */
+  const handleSavePersona = () => {
+    if (!personaAgentId) return;
+    const text = personaDraft.trim();
+    if (!text) return;
+    setPersonaSaving(true);
+    setPersonaHint(null);
+    void updateAgent(personaAgentId, { persona: text })
+      .then((agent) => {
+        setPersonaDraft(String(agent?.persona ?? text));
+        setPersonaHint('人设已保存，下一次对话生效');
+      })
+      .catch(() => {
+        setPersonaHint('人设没保存上…待会儿再试一次');
+      })
+      .finally(() => {
+        setPersonaSaving(false);
       });
   };
 
@@ -1169,6 +1209,43 @@ export default function SettingsPage() {
             {voiceModeHint && (
               <p className="text-xs text-[var(--text-secondary)]">{voiceModeHint}</p>
             )}
+          </div>
+        </GlassCard>
+
+        {/* 角色人设（20261006）：编辑 default 角色的 persona，即桌宠对话的 system 人设；
+            读取失败（personaAgentId=null）时输入框禁用而非隐藏——用户知道有这个功能 */}
+        <GlassCard>
+          <div className="flex flex-col gap-2 p-4">
+            <p className="font-medium">角色人设</p>
+            <p className="text-xs text-[var(--text-tertiary)]">
+              描述 TA 的性格和说话方式（400 字以内），保存后下一次对话生效
+            </p>
+            <textarea
+              id="settings-persona"
+              aria-label="角色人设"
+              value={personaDraft}
+              maxLength={400}
+              rows={3}
+              onChange={(e) => {
+                setPersonaDraft(e.target.value);
+                setPersonaHint(null);
+              }}
+              disabled={!personaAgentId}
+              placeholder={personaAgentId ? '例如：话不多但事事记在心上，安静又可靠' : '角色人设加载中…'}
+              className="mt-1 w-full resize-none rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-3 py-2 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)] disabled:opacity-50"
+            />
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs text-[var(--text-tertiary)]">{personaDraft.length}/400</span>
+              <button
+                type="button"
+                onClick={handleSavePersona}
+                disabled={!personaAgentId || personaSaving || personaDraft.trim() === ''}
+                className="rounded-full border border-[var(--glass-border)] px-4 py-1.5 text-sm text-[var(--text-secondary)] transition hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {personaSaving ? '保存中…' : '保存人设'}
+              </button>
+            </div>
+            {personaHint && <p className="text-xs text-[var(--text-secondary)]">{personaHint}</p>}
           </div>
         </GlassCard>
 

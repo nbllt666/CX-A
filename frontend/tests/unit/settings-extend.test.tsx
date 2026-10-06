@@ -153,6 +153,16 @@ function makeRouteFetch(opts?: RouteFetchOptions) {
     if (url.includes('/api/computer/status')) {
       return ok({ authorized: false, confirm_dangerous: true });
     }
+    if (url.includes('/api/agents/default') && method === 'PUT') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      putBodies.push(body);
+      return ok({ id: 'default', name: '软软', persona: body.persona ?? '', enabled: true });
+    }
+    if (url.includes('/api/agents')) {
+      return ok([
+        { id: 'default', name: '软软', persona: '话不多但事事记在心上，安静又可靠', enabled: true },
+      ]);
+    }
     return ok({});
   });
   return { fetchMock, putBodies, downloadBodies, getCancelCalls: () => cancelCalled };
@@ -515,5 +525,21 @@ describe('设备画像裁剪：渲染条件（20261006）', () => {
     render(<SettingsPage />);
     const duplexBtn = await screen.findByRole('button', { name: /全双工 · 边说边聊/ });
     await vi.waitFor(() => expect(duplexBtn).toHaveAttribute('aria-pressed', 'true'));
+  });
+
+  it('角色人设（20261006）：回显默认角色 persona，保存 PUT /api/agents/default {persona}', async () => {
+    const { fetchMock, putBodies } = makeRouteFetch();
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsPage />);
+    const textarea = await screen.findByLabelText('角色人设');
+    expect(textarea).toHaveValue('话不多但事事记在心上，安静又可靠');
+
+    fireEvent.change(textarea, { target: { value: '活泼开朗，爱开玩笑' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存人设' }));
+
+    await vi.waitFor(() => expect(putBodies.length).toBe(1));
+    expect(putBodies[0]).toEqual({ persona: '活泼开朗，爱开玩笑' });
+    expect(await screen.findByText('人设已保存，下一次对话生效')).toBeInTheDocument();
   });
 });
