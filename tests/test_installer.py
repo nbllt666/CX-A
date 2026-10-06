@@ -1212,7 +1212,7 @@ def test_t5_first_run_default_mode_from_profile_and_zero_jargon(tmp_path, monkey
     assert result["accel_mode"] == "performance"
     assert driver.cm.get("accel", "mode") == "performance"
     assert driver.cm.get("tts", "accel") == "cuda"
-    assert driver.cm.get("asr", "device") == "gpu"
+    assert driver.cm.get("asr", "device") == "cpu"  # 20261006 裁决：ASR 恒 CPU
     assert driver.cm.get("local_llm", "device") == "gpu"
     assert driver.cm.get("embedding", "device") == "gpu"
 
@@ -1488,8 +1488,9 @@ def test_apply_accel_plan_writes_missing_keys(tmp_path):
     on_disk = json.loads(open(config_path, encoding="utf-8").read())
     assert on_disk["accel"]["mode"] == "performance"
     assert on_disk["tts"]["accel"] == "dml"
-    assert on_disk["tts"]["accel_device"] == "dgpu"
-    assert on_disk["asr"]["device"] == "gpu"
+    # 20261006 裁决：TTS 有核显跨模式恒核显（原 dgpu → igpu）
+    assert on_disk["tts"]["accel_device"] == "igpu"
+    assert on_disk["asr"]["device"] == "cpu"  # 20261006 裁决：ASR 恒 CPU
     # N 卡显存满足阈值 → backend=cuda（批 A 新键落盘值）
     assert on_disk["local_llm"]["device"] == "gpu"
     assert on_disk["local_llm"]["backend"] == "cuda"

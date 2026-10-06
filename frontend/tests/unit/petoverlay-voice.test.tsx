@@ -3,21 +3,39 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 import PetOverlay from '../../src/renderer/components/PetOverlay';
 
 /**
- * 悬浮窗语音闭环组件级单测（20261004 悬浮窗语音/视觉/授权闭环）：
+ * 悬浮窗语音会话组件级单测（20261006 全双工降级版：麦克风按钮 = 会话总开关）：
  *
- * 「说话」= 语音输入开关的确定性行为验证（真实录音依赖物理麦克风，e2e 不断言）：
- *   开启录音（聆听，aria-pressed=true）→ 再点停止 → 识别 → 直发 /api/chat/message
- *   → 表情 pushMood（总线 + 本窗口）→ 聊天刷新总线 tick → 流式合成朗读（口型）。
+ * 「麦克风」= 语音会话开关（voice.interaction_mode 决定内部机制，默认 vad）：
+ * 点按开启持续采集（能量 VAD 自动断句）→ 断句产出自动识别 → 直发 /api/chat/message
+ * → 表情 pushMood（总线 + 本窗口）→ 聊天刷新总线 tick → 流式合成朗读（口型）。
+ * 会话编排在 voiceSession.ts（其纯逻辑由 voicesession.test 覆盖）；本套件验证
+ * 「组件 ↔ 会话 ↔ 接口」接线：按钮名/态、断句触发链路、关闭清理。
  *
- * VrmAvatar / bridge / API / 录音全部替身化：本套件只验证「页面 ↔ 模块 ↔ 接口」
- * 契约；VRM 渲染由 e2e pet-vrm 覆盖，录音采集逻辑由 audiorecorder.test 覆盖。
+ * VrmAvatar / 持续采集 / bridge / API 全部替身化：VRM 渲染由 e2e pet-vrm 覆盖。
  */
 
-const recorderMocks = vi.hoisted(() => ({
-  start: vi.fn(),
-  stop: vi.fn(),
-  cancel: vi.fn(),
-}));
+const continuousMocks = vi.hoisted(() => {
+  type Handlers = {
+    onUtterance: (audio: { audioBase64: string; sampleRate: number; durationSec: number }) => void;
+    onLevel?: (rms: number) => void;
+    onError?: (err: Error) => void;
+  };
+  const captured: Handlers[] = [];
+  return {
+    captured,
+    /** 开始持续采集：捕获 handlers 供测试直断句；返回可控会话句柄 */
+    start: vi.fn(async (handlers: Handlers) => {
+      captured.push(handlers);
+      return {
+        get active() {
+          return true;
+        },
+        stop: vi.fn(),
+        clearBuffer: vi.fn(),
+      };
+    }),
+  };
+});
 
 const bridgeMocks = vi.hoisted(() => ({
   close: vi.fn(async () => undefined),
@@ -36,7 +54,7 @@ vi.mock('../../src/renderer/components/VrmAvatar', () => ({
 
 vi.mock('../../src/renderer/audioRecorder', () => ({
   TARGET_SAMPLE_RATE: 16000,
-  startRecording: recorderMocks.start,
+  startContinuousRecording: continuousMocks.start,
 }));
 
 vi.mock('../../src/renderer/bridge', () => ({
@@ -100,19 +118,8 @@ describe('PetOverlay：悬浮窗语音闭环', () => {
     playMock = vi.fn(async () => undefined);
     vi.spyOn(console, 'error').mockImplementation(() => {});
     window.localStorage.clear();
-
-    recorderMocks.start.mockResolvedValue({
-      stop: recorderMocks.stop,
-      cancel: recorderMocks.cancel,
-      active: true,
-    });
-    recorderMocks.stop.mockResolvedValue({
-      pcm: new Int16Array(1600),
-      audioBase64: 'AAA=',
-      sampleRate: 16000,
-      durationSec: 1,
-      sampleCount: 1600,
-    });
+    continuousMocks.captured.length = 0;
+    continuousMocks.start.mockClear();
     bridgeMocks.bounds.mockResolvedValue({ min: 160, max: 640 });
   });
 
@@ -124,7 +131,7 @@ describe('PetOverlay：悬浮窗语音闭环', () => {
     window.localStorage.clear();
   });
 
-  it('六项菜单齐全：打开主窗口/说话/屏幕共享/操作授权/大小/关闭', async () => {
+  it('六项菜单齐全：打开主窗口/麦克风/屏幕共享/操作授权/大小/关闭', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/settings')) {
@@ -143,12 +150,54 @@ describe('PetOverlay：悬浮窗语音闭环', () => {
     render(<PetOverlay />);
     openMenu();
 
-    for (const name of ['打开主窗口', '说话', '屏幕共享', '操作授权', '大小', '关闭']) {
+    for (const name of ['打开主窗口', '麦克风', '屏幕共享', '操作授权', '大小', '关闭']) {
       expect(await screen.findByRole('button', { name })).toBeInTheDocument();
     }
   });
 
-  it('说话闭环：录音 → 识别 → 发送 → 表情/刷新总线 → 流式朗读（口型开）', async () => {
+  it('大小滑块定位在按钮坐标系内：窗口合成位置不越界（20261006 越界修复回归锁）', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/settings')) {
+        return jsonResponse({ config: { vision: { enabled: false } } });
+      }
+      if (url.includes('/computer/status')) {
+        return jsonResponse({ authorized: false, confirm_dangerous: true });
+      }
+      if (url.includes('/chat/history')) {
+        return jsonResponse({ ok: true, messages: [] });
+      }
+      throw new Error(`unexpected url: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<PetOverlay />);
+    openMenu();
+
+    const sizeBtn = await screen.findByRole('button', { name: '大小' });
+    // aria-label 在 range input 上，定位 style 在其父级胶囊 span（.pet-overlay-slider）
+    const sliderHost = (await screen.findByLabelText('大小滑块')).parentElement as HTMLElement;
+    const btnLeft = parseFloat(sizeBtn.style.left);
+    const btnTop = parseFloat(sizeBtn.style.top);
+    const btnSize = parseFloat(sizeBtn.style.height);
+    const sliderLeft = parseFloat(sliderHost.style.left);
+    const sliderTop = parseFloat(sliderHost.style.top);
+
+    // 相对按钮系断言：垂直 = 按钮高 + 6（正下方）；水平为 clamp 换算后的有限偏移
+    // （回归锁：修复前 left/top 用的是窗口坐标值，叠加按钮位置后飞出窗口）
+    expect(sliderTop).toBeCloseTo(btnSize + 6, 5);
+    expect(Math.abs(sliderLeft)).toBeLessThan(220);
+
+    // 窗口合成位置（按钮位置 + 相对偏移）完整落在窗口内
+    const sliderWinLeft = btnLeft + sliderLeft;
+    const sliderWinTop = btnTop + sliderTop;
+    expect(sliderWinLeft).toBeGreaterThanOrEqual(0);
+    expect(sliderWinLeft + 176).toBeLessThanOrEqual(window.innerWidth);
+    expect(sliderWinTop).toBeGreaterThanOrEqual(0);
+    expect(sliderWinTop).toBeLessThanOrEqual(window.innerHeight);
+  });
+
+  it('麦克风会话闭环（VAD 模式）：断句→识别→发送→表情/刷新总线→流式朗读；再点关闭', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/settings')) {
@@ -181,21 +230,24 @@ describe('PetOverlay：悬浮窗语音闭环', () => {
     render(<PetOverlay />);
     openMenu();
 
-    // ① 开启录音：aria-pressed=true（聆听中），data-talking 仍 false（非朗读）
-    fireEvent.click(await screen.findByRole('button', { name: '说话' }));
+    // ① 点麦克风：会话开启（持续采集拉起，aria-pressed=true），data-talking 仍 false
+    fireEvent.click(await screen.findByRole('button', { name: '麦克风' }));
     await waitFor(() => {
-      expect(recorderMocks.start).toHaveBeenCalledTimes(1);
-      expect(screen.getByRole('button', { name: '说话' })).toHaveAttribute(
+      expect(continuousMocks.start).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole('button', { name: '麦克风' })).toHaveAttribute(
         'aria-pressed',
         'true',
       );
     });
     expect(screen.getByTestId('pet-overlay-root')).toHaveAttribute('data-talking', 'false');
 
-    // ② 再点停止：识别 → 直发对话 → 表情 + 刷新总线 + 朗读
-    fireEvent.click(screen.getByRole('button', { name: '说话' }));
+    // ② VAD 断句产出一段语音 → 自动识别 → 发送 → 表情 + 刷新总线 + 朗读
+    continuousMocks.captured[0].onUtterance({
+      audioBase64: 'aGk=',
+      sampleRate: 16000,
+      durationSec: 1,
+    });
     await waitFor(() => {
-      expect(recorderMocks.stop).toHaveBeenCalledTimes(1);
       expect(fetchMock).toHaveBeenCalledWith(
         expect.stringContaining('/voice/transcribe'),
         expect.objectContaining({ method: 'POST' }),
@@ -220,9 +272,18 @@ describe('PetOverlay：悬浮窗语音闭环', () => {
       expect(playMock).toHaveBeenCalledTimes(1);
     });
     expect(screen.getByTestId('pet-overlay-root')).toHaveAttribute('data-talking', 'true');
+
+    // ③ 再点麦克风：关闭会话（aria-pressed=false）
+    fireEvent.click(screen.getByRole('button', { name: '麦克风' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '麦克风' })).toHaveAttribute(
+        'aria-pressed',
+        'false',
+      );
+    });
   });
 
-  it('识别为空/失败：不伪造对话，状态回到空闲', async () => {
+  it('识别为空：会话保持聆听（不关闭）、不伪造对话', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/settings')) {
@@ -243,24 +304,30 @@ describe('PetOverlay：悬浮窗语音闭环', () => {
 
     render(<PetOverlay />);
     openMenu();
-    fireEvent.click(await screen.findByRole('button', { name: '说话' }));
-    // 等聆听态就位（state 异步更新）再点停止，避免第二击落入空闲分支
+    fireEvent.click(await screen.findByRole('button', { name: '麦克风' }));
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: '说话' })).toHaveAttribute(
+      expect(screen.getByRole('button', { name: '麦克风' })).toHaveAttribute(
         'aria-pressed',
         'true',
       );
     });
-    fireEvent.click(screen.getByRole('button', { name: '说话' }));
 
-    await waitFor(() => {
-      expect(recorderMocks.stop).toHaveBeenCalledTimes(1);
+    // VAD 断句产出 → 识别为空 → 回聆听（会话仍开），不发送对话、不写刷新总线
+    continuousMocks.captured[0].onUtterance({
+      audioBase64: 'aGk=',
+      sampleRate: 16000,
+      durationSec: 1,
     });
-    // 识别为空 → 不发送对话、不写刷新总线、不朗读
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: '说话' })).toHaveAttribute(
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/voice/transcribe'),
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '麦克风' })).toHaveAttribute(
         'aria-pressed',
-        'false',
+        'true',
       );
     });
     expect(fetchMock).not.toHaveBeenCalledWith(

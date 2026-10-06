@@ -181,20 +181,35 @@ def _vendor_from_name(name_upper: str) -> str:
 def _gpu_type_from_name(vendor: str, name_upper: str) -> str:
     """由厂商 + 名称启发式判定适配器类型（``igpu`` / ``dgpu`` / ``unknown``）。
 
-    口径（spec「硬件加速画像」）：
-    - NVIDIA → 独显；
-    - Intel → 核显（名称含 UHD / Iris / Graphics）；
-    - AMD：含 ``RX`` / ``Radeon Pro`` → 独显；含 ``Graphics`` / ``Vega``（无 RX）→ 核显；
-    - 无法判定 → ``unknown``（标注不确定，不猜测）。
+    AMD 口径（20261006 用户裁决「Radeon 也可能是核显」，按命名家族系统判定，
+    顺序敏感——独显信号优先、裸名 Radeon 默认核显）：
+
+    1. ``RX``（词边界）或 ``RADEON PRO`` → **dgpu**（Radeon 独显命名必带 RX/Pro）；
+    2. ``R9``/``R7``/``R5``（词边界）或 ``HD``+4 位数字 → **dgpu**（2015 前老独显）；
+    3. ``GRAPHICS`` / ``VEGA`` / 3 位数字 ``M`` 结尾（680M/780M/890M）→ **igpu**
+       （APU 核显三命名家族：Graphics 裸名 / Vega / RDNA M 系列）；
+    4. 含 ``RADEON`` 但无上述信号 → **igpu**（默认核显——现代 Ryzen APU 全覆盖，
+       老独显已被第 2 层截住，误判对象跑不动本工作负载且 Vulkan 落点仍可运行）；
+    5. 不含 ``RADEON``（FirePro / ATI 老卡）→ **unknown**（保守不计入结论）。
+
+    其余厂商：NVIDIA → 独显；Intel → 核显；未知厂商含核显关键词 → igpu。
     """
     if vendor == "nvidia":
         return "dgpu"
     if vendor == "intel":
         return "igpu"
     if vendor == "amd":
-        if "RX" in name_upper or "RADEON PRO" in name_upper:
+        if re.search(r"\bRX\b", name_upper) or "RADEON PRO" in name_upper:
             return "dgpu"
-        if "GRAPHICS" in name_upper or "VEGA" in name_upper:
+        if re.search(r"\bR[579]\b", name_upper) or re.search(r"\bHD \d{4}\b", name_upper):
+            return "dgpu"
+        if (
+            "GRAPHICS" in name_upper
+            or "VEGA" in name_upper
+            or re.search(r"\b\d{3}M\b", name_upper)
+        ):
+            return "igpu"
+        if "RADEON" in name_upper:
             return "igpu"
         return "unknown"
     if "GRAPHICS" in name_upper or "UHD" in name_upper or "IRIS" in name_upper:
@@ -560,31 +575,33 @@ def _llm_gpu_available(hardware, recommend) -> bool:
     return vendor == "nvidia" and vram_ok
 
 
-def accel_plan(hardware, mode, platform=None) -> dict:
+def accel_plan(
+    hardware, mode, platform=None, llm_gpu_preference=""
+) -> dict:
     """加速方案决策（纯函数、唯一真相源）——产出各组件落点。
 
-    映射遵循 spec What Changes §3 表（20261002 批 A 扩展 backend / ROCm 面；
-    同日用户裁决：**AMD 核显优先**——TTS 目标核显（Linux ROCm / Windows DML-igpu，
-    跨模式一致），独显留给游戏与显示；清单缺失或非 AMD 核显保守回退既有分支）：
+    20261006 用户裁决重写（LLM 显卡可切换 + 全核显省电 + ASR 恒 CPU）：
 
-    - ``tts.accel`` / ``tts.accel_device``：性能模式先判核显（有核显 → ``dml`` +
-      ``dgpu``，双模式前提）；无核显 N 卡 → ``cuda``；无核显 A/Intel → ``dml``；
-      无 GPU → ``cpu``。节能模式：有核显 → ``dml`` + ``igpu``；无核显 → ``cpu``。
-      **Linux 例外**：Linux + 性能 + AMD 独显 → ``rocm``（DirectML 为 Windows
-      专有技术，Linux 走 onnxruntime-rocm）。
-    - ``asr.device``：性能且 N 卡 → ``gpu``；否则 ``cpu``。**Linux 例外**：
-      Linux + 性能 + AMD 独显 → ``gpu``（torch ROCm 路径）。
-    - ``local_llm.device`` / ``embedding.device``：性能且 NVIDIA 显存 ≥4 GB →
-      ``gpu``；性能 + AMD/Intel 独显或仅核显 → ``gpu``（llama.cpp Vulkan 路径；
-      核显无显存数据不设显存门槛）；否则 ``cpu``（节能模式 / 无 GPU 保真既有行为）。
-      **Linux 例外**：Linux + 性能 + AMD/Intel 独显维持 ``cpu``（llama.cpp
-      ROCm/HIP 构建未纳入，登记为已闭合项外的平台差异）。
-    - ``local_llm.backend`` / ``embedding.backend``：``"cuda"``（N 卡路径）/
-      ``"vulkan"``（AMD/Intel 独显与核显路径）/ ``""``（CPU 路径），与 device
-      同步产出，仅 device=gpu 时非空。
+    - ``tts.accel`` / ``tts.accel_device``：**有核显跨模式恒核显**（AMD 核显
+      Linux → ``rocm``；其余核显 Windows → ``dml`` + ``igpu``——性能模式不再落
+      独显，独显留给游戏与显示）；无核显：性能 N 卡 → ``cuda``、性能 A/Intel
+      独显 → ``dml``（Linux + AMD 独显 → ``rocm``）；节能无核显 → ``cpu``。
+    - ``asr.device``：**恒 ``cpu``**（GPU 留给显示与本地大脑；语音识别 CPU 性能
+      已满足，不再启用 torch CUDA / ROCm GPU 路径）。
+    - ``local_llm.device`` / ``embedding.device``（+ backend 同步）：按
+      ``llm_gpu_preference``（``""`` 自动 / ``"igpu"`` 强制核显 / ``"dgpu"``
+      强制独显）决策——
 
-    非法 ``mode`` 归一 ``"performance"``；探测字段缺失 / 异常一律保守降级为
-    ``cpu``，绝不抛错。
+      * 强制 ``"igpu"``：有核显 → ``gpu`` + Vulkan；无核显回落自动；
+      * 强制 ``"dgpu"``：NVIDIA → ``gpu`` + CUDA（不设显存门槛，用户主动选择）；
+        AMD/Intel 独显且非 Linux → ``gpu`` + Vulkan；Linux 维持 ``cpu``
+        （llama.cpp ROCm/HIP 构建未纳入）；无独显回落自动；
+      * 自动：**性能** = 独显优先（NVIDIA 显存 ≥4 GB → CUDA；AMD/Intel 独显
+        → Vulkan；仅核显 → Vulkan）；**节能** = 有核显 → Vulkan（全核显）、
+        无核显 → CPU（省电语义：不让独显参与）。
+
+    非法 ``mode`` 归一 ``"performance"``、非法 preference 归一 ``""``；探测字段
+    缺失 / 异常一律保守降级为 ``cpu``，绝不抛错。
 
     :param hardware: 画像 dict（``recommend`` / ``has_igpu`` / ``dgpu_vendor`` /
         ``gpu_vendor`` / ``vram_gb`` 等）。
@@ -592,6 +609,8 @@ def accel_plan(hardware, mode, platform=None) -> dict:
     :param platform: 平台标识（``sys.platform`` 同构串，如 ``"win32"`` /
         ``"linux"``）；None 缺省取当前 ``sys.platform``。测试可注入以驱动
         Linux ROCm 分支（Linux 真机未验证，代码路径 + 单测覆盖口径）。
+    :param llm_gpu_preference: LLM 显卡偏好（``""`` 自动 / ``"igpu"`` 强制核显 /
+        ``"dgpu"`` 强制独显；大小写与首尾空白不敏感，非法归一 ``""``）。
     :return: 落点 dict，键：``accel.mode`` / ``tts.accel`` / ``tts.accel_device`` /
         ``asr.device`` / ``local_llm.device`` / ``local_llm.backend`` /
         ``embedding.device`` / ``embedding.backend`` / ``reasons``（中文理由列表）。
@@ -601,17 +620,17 @@ def accel_plan(hardware, mode, platform=None) -> dict:
     reasons: list[str] = []
     sys_platform = sys.platform if platform is None else str(platform)
     is_linux = sys_platform.startswith("linux")
+    pref_raw = str(llm_gpu_preference or "").strip().lower()
+    pref = pref_raw if pref_raw in ("igpu", "dgpu") else ""
 
     recommend = _resolve_recommend(hardware)
     has_igpu = bool(hardware.get("has_igpu"))
     dgpu_vendor = _resolve_dgpu_vendor(hardware, recommend)
     igpu_vendor = _resolve_igpu_vendor(hardware)
 
-    # ---- TTS（ORT）：AMD 核显优先（20261002 用户裁决：防独显被游戏占用）----
-    # 有 AMD 核显 → TTS 目标核显（跨模式一致）：Linux 走 ROCm（无 DML）；
-    # Windows 走 DML 并指向核显设备。清单缺失 / 非 AMD 核显 → 保守回退既有分支。
-    # Linux 例外（20261002 批 A）：Linux + 性能 + AMD 独显 → rocm（DirectML 为
-    # Windows 专有技术；ROCm EP 缺失时由 bridge 既有回退链兜底）
+    # ---- TTS（ORT）：有核显跨模式恒核显（20261006 裁决：性能模式不再落独显）----
+    # AMD 核显 Linux → ROCm（无 DML）；其余核显 Windows → DML + igpu。
+    # 清单缺失 / 无核显 → 按模式与独显厂商回退（与既有口径一致）。
     if igpu_vendor == "amd":
         if is_linux:
             tts_accel, tts_device = "rocm", ""
@@ -619,14 +638,15 @@ def accel_plan(hardware, mode, platform=None) -> dict:
         else:
             tts_accel, tts_device = "dml", "igpu"
             reasons.append("检测到 AMD 核显，TTS 优先指向核显（DirectML），独显留给游戏与显示")
+    elif has_igpu:
+        # 20261006 裁决：有核显时性能模式同样指向核显（原「性能 → dml+dgpu」废除）
+        tts_accel, tts_device = "dml", "igpu"
+        reasons.append("检测到核显，TTS 跨模式恒指向核显（DirectML），独显留给游戏与显示")
     elif is_linux and normalized == "performance" and dgpu_vendor == "amd":
         tts_accel, tts_device = "rocm", ""
         reasons.append("性能模式：Linux 平台 AMD 独显，TTS 走 ROCm 路径（onnxruntime-rocm）")
     elif normalized == "performance":
-        if has_igpu:
-            tts_accel, tts_device = "dml", "dgpu"
-            reasons.append("性能模式：检测到核显，统一装 DirectML 运行时并以独显设备建会话（双模式前提）")
-        elif dgpu_vendor == "nvidia":
+        if dgpu_vendor == "nvidia":
             tts_accel, tts_device = "cuda", ""
             reasons.append("性能模式：无核显的 NVIDIA 独显，走 CUDA 满速路径")
         elif dgpu_vendor in ("amd", "intel"):
@@ -636,47 +656,65 @@ def accel_plan(hardware, mode, platform=None) -> dict:
             tts_accel, tts_device = "cpu", ""
             reasons.append("性能模式：未检测到可用 GPU，回退 CPU 推理")
     else:
-        if has_igpu:
-            tts_accel, tts_device = "dml", "igpu"
-            reasons.append("节能模式：检测到核显，走 DirectML 并指向核显设备")
-        else:
-            tts_accel, tts_device = "cpu", ""
-            reasons.append("节能模式：无核显可用，回退 CPU 推理")
+        tts_accel, tts_device = "cpu", ""
+        reasons.append("节能模式：无核显可用，回退 CPU 推理")
 
-    # ---- ASR（torch）：仅 N 卡有 GPU 路径；Linux + AMD 独显走 ROCm GPU ----
-    if is_linux and normalized == "performance" and dgpu_vendor == "amd":
-        asr_device = "gpu"
-        reasons.append("ASR：性能模式 Linux 平台 AMD 独显走 GPU（torch ROCm 路径）")
-    elif normalized == "performance" and dgpu_vendor == "nvidia":
-        asr_device = "gpu"
-        reasons.append("ASR：性能模式 NVIDIA 独显走 GPU（torch CUDA）")
-    else:
-        asr_device = "cpu"
-        reasons.append("ASR：按 CPU 推理（节能模式，或非 NVIDIA 后端无 GPU 路径）")
+    # ---- ASR（torch）：恒 CPU（20261006 裁决：GPU 留给显示与本地大脑）----
+    asr_device = "cpu"
+    reasons.append("ASR：恒定按 CPU 推理（GPU 留给显示与本地大脑）")
 
-    # ---- 本地 LLM / 嵌入（llama.cpp）：device 与 backend 同步决策 ----
-    # （20261002 批 A：N 卡 → cuda；AMD/Intel 独显或仅核显 → vulkan；Linux AMD
-    # 独显例外维持 cpu——llama.cpp ROCm/HIP 构建不纳入；其余保真既有行为）
-    if normalized == "performance" and _llm_gpu_available(hardware, recommend):
-        llm_device, llm_backend = "gpu", "cuda"
-        reasons.append("本地 LLM / 嵌入：性能模式 NVIDIA 显存满足阈值（≥4 GB），走 GPU（llama.cpp CUDA）")
-    elif normalized == "performance" and is_linux and dgpu_vendor in ("amd", "intel"):
-        llm_device, llm_backend = "cpu", ""
-        reasons.append(
-            "本地 LLM / 嵌入：Linux 平台 AMD/Intel 独显维持 CPU"
-            "（llama.cpp ROCm/HIP 构建未纳入，Vulkan 为替代路径）"
-        )
-    elif normalized == "performance" and (
-        dgpu_vendor in ("amd", "intel") or (not dgpu_vendor and has_igpu)
-    ):
+    # ---- 本地 LLM / 嵌入（llama.cpp）：preference 覆盖 → 自动口径 ----
+    # （20261006 裁决：LLM 可在核显/独显间切换——preference 优先；自动口径
+    #   性能=独显优先（NVIDIA→CUDA、A/I→Vulkan、仅核显→Vulkan），节能=全核显
+    #   （有核显 → Vulkan），无核显节能 → CPU。Linux AMD/Intel 独显维持 cpu——
+    #   llama.cpp ROCm/HIP 构建未纳入。）
+
+    def _llm_auto() -> tuple[str, str]:
+        """自动口径（preference 为空或强制目标不可用时回落）。"""
+        if normalized == "performance" and _llm_gpu_available(hardware, recommend):
+            return "gpu", "cuda"
+        if normalized == "performance" and (
+            dgpu_vendor in ("amd", "intel") and not is_linux
+        ):
+            return "gpu", "vulkan"
+        if normalized == "performance" and not dgpu_vendor and has_igpu:
+            return "gpu", "vulkan"
+        if normalized != "performance" and has_igpu:
+            return "gpu", "vulkan"
+        return "cpu", ""
+
+    if pref == "igpu" and has_igpu:
         llm_device, llm_backend = "gpu", "vulkan"
+        reasons.append("本地 LLM / 嵌入：按偏好强制核显（llama.cpp Vulkan 路径）")
+    elif pref == "dgpu" and dgpu_vendor == "nvidia":
+        llm_device, llm_backend = "gpu", "cuda"
+        reasons.append("本地 LLM / 嵌入：按偏好强制 NVIDIA 独显（llama.cpp CUDA，不设显存门槛）")
+    elif pref == "dgpu" and dgpu_vendor in ("amd", "intel") and not is_linux:
+        llm_device, llm_backend = "gpu", "vulkan"
+        reasons.append("本地 LLM / 嵌入：按偏好强制独显（llama.cpp Vulkan 路径）")
+    elif pref == "dgpu" and dgpu_vendor in ("amd", "intel") and is_linux:
+        llm_device, llm_backend = "cpu", ""
         reasons.append(
-            "本地 LLM / 嵌入：性能模式 AMD/Intel 独显或核显，走 GPU"
-            "（llama.cpp Vulkan 路径；核显无显存数据不设显存门槛）"
+            "本地 LLM / 嵌入：Linux 平台独显维持 CPU"
+            "（llama.cpp ROCm/HIP 构建未纳入，强制独显不可用）"
         )
     else:
-        llm_device, llm_backend = "cpu", ""
-        reasons.append("本地 LLM / 嵌入：按 CPU 推理（节能模式、显存不足或无可用 GPU 后端）")
+        llm_device, llm_backend = _llm_auto()
+        if pref and pref == "igpu":
+            reasons.append("偏好为核显但设备无核显，回落自动口径")
+        elif pref and pref == "dgpu":
+            reasons.append("偏好为独显但设备无可用独显，回落自动口径")
+        elif llm_device == "gpu" and llm_backend == "cuda":
+            reasons.append("本地 LLM / 嵌入：性能模式 NVIDIA 显存满足阈值（≥4 GB），走 GPU（llama.cpp CUDA）")
+        elif llm_device == "gpu" and llm_backend == "vulkan":
+            if dgpu_vendor in ("amd", "intel"):
+                reasons.append("本地 LLM / 嵌入：性能模式 AMD/Intel 独显，走 GPU（llama.cpp Vulkan 路径）")
+            else:
+                reasons.append(
+                    "本地 LLM / 嵌入：走 GPU（llama.cpp Vulkan 路径；核显无显存数据不设显存门槛）"
+                )
+        else:
+            reasons.append("本地 LLM / 嵌入：按 CPU 推理（节能无核显、无可用 GPU 后端或显存不足）")
 
     return {
         "accel.mode": normalized,

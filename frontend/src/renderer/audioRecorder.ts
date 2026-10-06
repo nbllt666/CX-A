@@ -223,3 +223,220 @@ export async function startRecording(): Promise<RecordingSession> {
     },
   };
 }
+
+// ------------------------------------------------------------------ //
+// 持续采集 + 能量 VAD（20261006 全双工语音降级版）                      //
+// ------------------------------------------------------------------ //
+
+/** 计算一段波形的 RMS 能量（0~1 口径，与浮点样本幅度一致）。 */
+export function computeRms(samples: Float32Array): number {
+  if (samples.length === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    sum += samples[i] * samples[i];
+  }
+  return Math.sqrt(sum / samples.length);
+}
+
+/** 能量 VAD 选项 */
+export interface EnergyVadOptions {
+  /** 有声门限（RMS 0~1）：超过视为语音开始。默认 0.02 */
+  speechThreshold?: number;
+  /** 静音断句时长（秒）：连续静音超过该值视为一句话结束。默认 0.7 */
+  silenceTimeoutSec?: number;
+  /** 采集块时长（秒）：feed 的每块对应时长（用于把静音时长折算成块数）。默认 0.256 */
+  chunkDurationSec?: number;
+}
+
+export type VadEvent = 'speech-start' | 'speech-end' | null;
+
+/**
+ * 能量 VAD 状态机（纯逻辑，可单测）：silent ↔ speech 两态 + 滞回。
+ *
+ * - silent 态：RMS 超门限 → speech-start（进入 speech 态）；
+ * - speech 态：连续静音块数折算时长超过 silenceTimeoutSec → speech-end（回 silent）；
+ *   期间任何超门限块重置静音计数（滞回：短停顿不断句）。
+ * 门限/超时的具体数值由调用方按场景给定（普通聆听与 AI 播放期防自触发用不同门限，
+ * 见 voiceSession）。
+ */
+export class EnergyVad {
+  private readonly threshold: number;
+  private readonly silenceChunksLimit: number;
+  private silentChunks = 0;
+  private speaking = false;
+
+  constructor(options?: EnergyVadOptions) {
+    this.threshold = options?.speechThreshold ?? 0.02;
+    const silenceSec = options?.silenceTimeoutSec ?? 0.7;
+    const chunkSec = options?.chunkDurationSec ?? 0.256;
+    this.silenceChunksLimit = Math.max(1, Math.round(silenceSec / chunkSec));
+  }
+
+  /** 是否处于语音态。 */
+  get inSpeech(): boolean {
+    return this.speaking;
+  }
+
+  /**
+   * 喂入一块音频的能量。
+   *
+   * @param rms 该块 RMS（0~1）
+   * @returns 状态跃迁事件（speech-start / speech-end / null）
+   */
+  feed(rms: number): VadEvent {
+    if (rms >= this.threshold) {
+      this.silentChunks = 0;
+      if (!this.speaking) {
+        this.speaking = true;
+        return 'speech-start';
+      }
+      return null;
+    }
+    if (!this.speaking) return null;
+    this.silentChunks += 1;
+    if (this.silentChunks >= this.silenceChunksLimit) {
+      this.speaking = false;
+      this.silentChunks = 0;
+      return 'speech-end';
+    }
+    return null;
+  }
+
+  /** 重置状态（打断后丢弃缓冲复用）。 */
+  reset(): void {
+    this.silentChunks = 0;
+    this.speaking = false;
+  }
+}
+
+/** 持续采集会话句柄。 */
+export interface ContinuousRecordingSession {
+  /** 停止采集并释放资源（幂等）。 */
+  stop(): void;
+  /** 是否仍在采集。 */
+  readonly active: boolean;
+  /**
+   * 丢弃进行中的语音缓冲并重置 VAD（打断场景专用）：AI 播放残留混入的
+   * 音频不得进入识别链路，打断后调用方用本方法清缓冲再重新聆听。
+   */
+  clearBuffer(): void;
+}
+
+/** 持续采集事件回调集。 */
+export interface ContinuousRecordingHandlers {
+  /** 一句话采集完成（能量 VAD 断句产出）。 */
+  onUtterance: (audio: { audioBase64: string; sampleRate: number; durationSec: number }) => void;
+  /** 每块能量回调（RMS 0~1；打断检测/可视化用）。 */
+  onLevel?: (rms: number) => void;
+  /** 采集错误（权限被拒等）。 */
+  onError?: (err: Error) => void;
+}
+
+/** 持续采集选项 */
+export interface ContinuousRecordingOptions {
+  /** 有声门限（RMS）。默认 0.02 */
+  speechThreshold?: number;
+  /** 静音断句时长（秒）。默认 0.7 */
+  silenceTimeoutSec?: number;
+}
+
+/**
+ * 持续采集麦克风并按能量 VAD 自动断句（全双工/传统 VAD 会话的采集层）。
+ *
+ * 与 :func:`startRecording` 的一次性录音不同：本函数持续运行，逐块计算 RMS
+ * 交给内部 EnergyVad，语音段结束（静音断句）时把整段波形编码回调 onUtterance。
+ * 调用方经 session.stop() 停止。
+ *
+ * @throws Error 麦克风权限被拒 / 环境不支持 Web Audio 时
+ */
+export async function startContinuousRecording(
+  handlers: ContinuousRecordingHandlers,
+  options?: ContinuousRecordingOptions,
+): Promise<ContinuousRecordingSession> {
+  const Ctor = resolveAudioContextCtor();
+  if (!Ctor) {
+    throw new Error('当前环境不支持麦克风录音');
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+  });
+  const context = new Ctor({ sampleRate: TARGET_SAMPLE_RATE });
+  const source = context.createMediaStreamSource(stream);
+  const processor = context.createScriptProcessor(PROCESSOR_BUFFER_SIZE, 1, 1);
+  const mute = context.createGain();
+  mute.gain.value = 0;
+  const vad = new EnergyVad({
+    speechThreshold: options?.speechThreshold,
+    silenceTimeoutSec: options?.silenceTimeoutSec,
+    chunkDurationSec: PROCESSOR_BUFFER_SIZE / context.sampleRate,
+  });
+  let speechChunks: Float32Array[] = [];
+  let active = true;
+
+  processor.onaudioprocess = (event: AudioProcessingEvent) => {
+    if (!active) return;
+    const chunk = new Float32Array(event.inputBuffer.getChannelData(0));
+    const rms = computeRms(chunk);
+    handlers.onLevel?.(rms);
+    const event0 = vad.feed(rms);
+    if (event0 === 'speech-start') {
+      speechChunks = [chunk];
+      return;
+    }
+    if (vad.inSpeech) {
+      speechChunks.push(chunk);
+    }
+    if (event0 === 'speech-end') {
+      const merged = concatFloat32(speechChunks);
+      speechChunks = [];
+      const resampled = downsample(merged, context.sampleRate, TARGET_SAMPLE_RATE);
+      const durationSec = resampled.length / TARGET_SAMPLE_RATE;
+      if (durationSec < MIN_DURATION_SEC) return; // 误触（关门声等瞬态）丢弃
+      const pcm = toPcm16(resampled);
+      handlers.onUtterance({
+        audioBase64: pcm16ToBase64(pcm),
+        sampleRate: TARGET_SAMPLE_RATE,
+        durationSec,
+      });
+    }
+  };
+  source.connect(processor);
+  processor.connect(mute);
+  mute.connect(context.destination);
+
+  /** 释放采集资源（幂等）。 */
+  function teardown(): void {
+    active = false;
+    try {
+      processor.onaudioprocess = null;
+    } catch {
+      /* 忽略 */
+    }
+    for (const node of [processor, mute, source]) {
+      try {
+        node.disconnect();
+      } catch {
+        /* 忽略重复断开 */
+      }
+    }
+    for (const track of stream.getTracks()) {
+      track.stop();
+    }
+    void context.close().catch(() => undefined);
+  }
+
+  return {
+    get active() {
+      return active;
+    },
+    stop(): void {
+      teardown();
+      speechChunks = [];
+    },
+    clearBuffer(): void {
+      // 丢弃进行中的语音缓冲 + 重置 VAD 状态（含 speech 态归零：打断后重新聆听）
+      speechChunks = [];
+      vad.reset();
+    },
+  };
+}

@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, cleanup } from '@testing-library/react';
-import SettingsPage from '../../src/renderer/pages/SettingsPage';
+import SettingsPage, {
+  hardwareKnown,
+  filterTtsAccelOptions,
+  filterTtsAccelDeviceOptions,
+  shouldShowAccelModeCard,
+  filterLlmGpuOptions,
+} from '../../src/renderer/pages/SettingsPage';
+import type { HardwareProfile } from '../../src/renderer/api';
 
 /**
  * 设置页补齐向导选项（Task 9）。
@@ -76,12 +83,15 @@ interface RouteFetchOptions {
   settings?: Record<string, unknown>;
   /** 下载进度状态（测试中可直接改写该对象字段驱动轮询） */
   progress?: { state: string; downloaded: number; total: number; percent: number; error: string | null };
+  /** 覆盖 /api/setup/recommend 响应（设备画像裁剪用例注入 has_igpu / dgpu_vendor） */
+  recommend?: Record<string, unknown>;
 }
 
 /** 路由式 fetch stub：返回 fetchMock（断言调用）与捕获到的请求体列表 */
 function makeRouteFetch(opts?: RouteFetchOptions) {
   const settings = opts?.settings ?? makeSettingsView();
   const progress = opts?.progress ?? null;
+  const recommend = opts?.recommend ?? RECOMMEND_VIEW;
   const putBodies: Array<Record<string, unknown>> = [];
   const downloadBodies: Array<Record<string, unknown>> = [];
   let cancelCalled = 0;
@@ -112,7 +122,7 @@ function makeRouteFetch(opts?: RouteFetchOptions) {
       return ok({ ok: true, applied: Object.keys(body), ignored: [], config: merged });
     }
     if (url.includes('/api/settings')) return ok(settings);
-    if (url.includes('/api/setup/recommend')) return ok(RECOMMEND_VIEW);
+    if (url.includes('/api/setup/recommend')) return ok(recommend);
     if (url.includes('/api/setup/model/download') && method === 'POST') {
       downloadBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>);
       return ok({ ok: true, state: 'downloading', already_running: false, model: null });
@@ -324,5 +334,186 @@ describe('设置页补齐向导选项（Task 9）', () => {
     render(<SettingsPage />);
     expect(await screen.findByRole('button', { name: '更换桌宠模型' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '恢复默认' })).toBeInTheDocument();
+  });
+});
+
+/**
+ * 20261006 设置页按设备与模式裁剪显示：
+ * 无核显不显示核显选项、纯 CPU 隐藏运行偏好、本地模式隐藏云端配置、视觉文案不再说「要联网」。
+ */
+
+/** 画像桩：字段齐备（hardwareKnown=true）的最小构造 */
+function makeProfile(overrides?: Partial<HardwareProfile>): HardwareProfile {
+  return {
+    cpu_cores: 8,
+    ram_gb: 16,
+    gpu_vendor: null,
+    vram_gb: null,
+    cuda_version: null,
+    disk_free_gb: 120,
+    probe_notes: [],
+    has_igpu: false,
+    dgpu_vendor: null,
+    ...overrides,
+  };
+}
+
+describe('设备画像裁剪：纯函数分支（20261006）', () => {
+  it('hardwareKnown：字段齐备才 true；null / 探测失败降级画像（字段缺失）→ false', () => {
+    expect(hardwareKnown(null)).toBe(false);
+    expect(hardwareKnown({ cpu_cores: 8, ram_gb: null, gpu_vendor: 'cpu', vram_gb: null, cuda_version: null, disk_free_gb: null, probe_notes: [] })).toBe(false);
+    expect(hardwareKnown(makeProfile())).toBe(true);
+    // dgpu_vendor 键存在（值为 null）也算齐备——「明确无独显」是有效结论
+    expect(hardwareKnown(makeProfile({ dgpu_vendor: null }))).toBe(true);
+  });
+
+  it('纯 CPU（无核显无独显）：cuda/rocm/dml 与核显/独显全隐藏，运行偏好卡隐藏', () => {
+    const p = makeProfile();
+    const accel = filterTtsAccelOptions(p).map((o) => o.value);
+    expect(accel).toEqual(['auto', 'cpu', 'off']);
+    const device = filterTtsAccelDeviceOptions(p).map((o) => o.value);
+    expect(device).toEqual(['']);
+    expect(shouldShowAccelModeCard(p)).toBe(false);
+  });
+
+  it('仅核显：igpu 显示、dgpu 隐藏；cuda/rocm 隐藏、dml 显示；运行偏好卡显示', () => {
+    const p = makeProfile({ has_igpu: true });
+    expect(filterTtsAccelOptions(p).map((o) => o.value)).toEqual(['auto', 'cpu', 'dml', 'off']);
+    expect(filterTtsAccelDeviceOptions(p).map((o) => o.value)).toEqual(['', 'igpu']);
+    expect(shouldShowAccelModeCard(p)).toBe(true);
+  });
+
+  it('仅 N 卡独显：cuda/dgpu/dml 显示、igpu/rocm 隐藏；gpu_vendor=nvidia 亦命中 cuda', () => {
+    const p = makeProfile({ dgpu_vendor: 'nvidia' });
+    expect(filterTtsAccelOptions(p).map((o) => o.value)).toEqual(['auto', 'cpu', 'cuda', 'dml', 'off']);
+    expect(filterTtsAccelDeviceOptions(p).map((o) => o.value)).toEqual(['', 'dgpu']);
+    expect(shouldShowAccelModeCard(p)).toBe(true);
+    // gpu_vendor 兜底口径（nvidia-smi 探测成功但清单枚举未归类）
+    const p2 = makeProfile({ gpu_vendor: 'nvidia', dgpu_vendor: null });
+    expect(filterTtsAccelOptions(p2).map((o) => o.value)).toContain('cuda');
+  });
+
+  it('AMD 独显：rocm 显示；核显+N 卡齐全时设备选项全量（rocm 仍仅限 AMD）', () => {
+    const p = makeProfile({ dgpu_vendor: 'amd' });
+    expect(filterTtsAccelOptions(p).map((o) => o.value)).toContain('rocm');
+    expect(filterTtsAccelOptions(p).map((o) => o.value)).not.toContain('cuda');
+    // 现实机器不会同时插 N 卡与 A 卡：核显 + N 卡 → rocm 仍不显示
+    const both = makeProfile({ has_igpu: true, dgpu_vendor: 'nvidia' });
+    expect(filterTtsAccelOptions(both).map((o) => o.value)).toEqual([
+      'auto', 'cpu', 'cuda', 'dml', 'off',
+    ]);
+    expect(filterTtsAccelDeviceOptions(both).map((o) => o.value)).toEqual(['', 'igpu', 'dgpu']);
+  });
+
+  it('画像未知（null / 降级）：全部选项与运行偏好卡保守显示（一次失败不藏功能）', () => {
+    expect(filterTtsAccelOptions(null)).toHaveLength(6);
+    expect(filterTtsAccelDeviceOptions(null)).toHaveLength(3);
+    expect(shouldShowAccelModeCard(null)).toBe(true);
+  });
+
+  it('LLM 显卡选项（20261006）：核显+独显齐全 → 全量；仅核显 / 仅 N 卡 → 按需裁剪', () => {
+    // 核显 + N 卡：自动 + NVIDIA 独显 + 核显（无 AMD/Intel 独显选项）
+    const both = filterLlmGpuOptions(makeProfile({ has_igpu: true, dgpu_vendor: 'nvidia' })).map((o) => o.label);
+    expect(both).toEqual(['自动（推荐）', 'NVIDIA 独显', '核显']);
+    // 仅 AMD 独显：自动 + AMD/Intel 独显（无 NVIDIA、无核显）
+    const amdOnly = filterLlmGpuOptions(makeProfile({ has_igpu: false, dgpu_vendor: 'amd' })).map((o) => o.label);
+    expect(amdOnly).toEqual(['自动（推荐）', '独立显卡（AMD/Intel）']);
+    // 仅核显：自动 + 核显
+    const igpuOnly = filterLlmGpuOptions(makeProfile({ has_igpu: true, dgpu_vendor: null })).map((o) => o.label);
+    expect(igpuOnly).toEqual(['自动（推荐）', '核显']);
+    // 纯 CPU：只剩自动（卡片本身也不渲染，但选项函数仍返回自动兜底）
+    const none = filterLlmGpuOptions(makeProfile()).map((o) => o.label);
+    expect(none).toEqual(['自动（推荐）']);
+    // 画像未知：全量（保守显示）
+    expect(filterLlmGpuOptions(null)).toHaveLength(4);
+  });
+});
+
+describe('设备画像裁剪：渲染条件（20261006）', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    window.localStorage.clear();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('无核显无独显设备：核显/独显选项与「省电优先」运行偏好卡不出现', async () => {
+    const { fetchMock } = makeRouteFetch({
+      recommend: {
+        ...RECOMMEND_VIEW,
+        profile: makeProfile(),
+      },
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsPage />);
+    await screen.findByLabelText('加速方式');
+    // 画像请求异步落定 → 裁剪生效
+    await vi.waitFor(() => {
+      expect(screen.queryByRole('button', { name: /省电优先/ })).not.toBeInTheDocument();
+    });
+    const deviceSelect = screen.getByLabelText('加速设备');
+    expect(deviceSelect).toContainHTML('自动选设备');
+    expect(deviceSelect).not.toContainHTML('核显（更省电）');
+    expect(deviceSelect).not.toContainHTML('独立显卡（更快）');
+    expect(screen.getByLabelText('加速方式')).not.toContainHTML('NVIDIA 显卡加速');
+  });
+
+  it('本地模式开启：云端提供商/API Key 配置隐藏，原位渲染「先关掉本地模式」指引', async () => {
+    const { fetchMock } = makeRouteFetch({
+      settings: makeSettingsView({ local_llm: { enabled: true, ready: true } }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsPage />);
+    expect(await screen.findByText(/本地模式开着，聊天都在这台电脑上完成/)).toBeInTheDocument();
+    expect(screen.queryByLabelText('云端钥匙（API Key）')).not.toBeInTheDocument();
+    expect(screen.queryByText('云端提供商')).not.toBeInTheDocument();
+    // 本地模式开关与就绪徽标仍在
+    expect(screen.getByRole('switch', { name: '本地模式' })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('主动视觉文案如实描述本地理解（不再声称「需要联网」）', async () => {
+    const { fetchMock } = makeRouteFetch();
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsPage />);
+    expect(await screen.findByText(/画面只在这台电脑上理解、不会上传/)).toBeInTheDocument();
+    expect(screen.queryByText(/理解画面时需要联网/)).not.toBeInTheDocument();
+  });
+
+  it('语音交互模式（20261006）：渲染默认传统，切换全双工 PUT {voice:{interaction_mode}}', async () => {
+    const { fetchMock, putBodies } = makeRouteFetch();
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsPage />);
+    // 默认传统选中
+    const vadBtn = await screen.findByRole('button', { name: /传统 · 自动断句/ });
+    expect(vadBtn).toHaveAttribute('aria-pressed', 'true');
+    const duplexBtn = screen.getByRole('button', { name: /全双工 · 边说边聊/ });
+    expect(duplexBtn).toHaveAttribute('aria-pressed', 'false');
+
+    // 切全双工 → PUT 请求体 {voice:{interaction_mode:'duplex'}} + 成功提示
+    fireEvent.click(duplexBtn);
+    await vi.waitFor(() => expect(putBodies.length).toBe(1));
+    expect(putBodies[0]).toEqual({ voice: { interaction_mode: 'duplex' } });
+    expect(await screen.findByText(/全双工模式建议戴耳机/)).toBeInTheDocument();
+    expect(duplexBtn).toHaveAttribute('aria-pressed', 'true');
+    expect(vadBtn).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('语音交互模式回显：GET 返回 duplex 时全双工选中', async () => {
+    const { fetchMock } = makeRouteFetch({
+      settings: makeSettingsView({ voice: { interaction_mode: 'duplex' } }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<SettingsPage />);
+    const duplexBtn = await screen.findByRole('button', { name: /全双工 · 边说边聊/ });
+    await vi.waitFor(() => expect(duplexBtn).toHaveAttribute('aria-pressed', 'true'));
   });
 });

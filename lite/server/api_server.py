@@ -796,6 +796,12 @@ def _memory_tool_result_message(op, raw_tag, outcome):
 _ACCEL_MODES = ("performance", "eco")
 _TTS_ACCEL_VALUES = ("auto", "cpu", "cuda", "dml", "rocm", "off")
 _TTS_ACCEL_DEVICE_VALUES = ("", "igpu", "dgpu")
+# local_llm.gpu_preference 白名单（20261006 LLM 显卡切换）：""=按运行模式自动 /
+# igpu=强制核显 / dgpu=强制独显；非法入 ignored。
+_LLM_GPU_PREFERENCE_VALUES = ("", "igpu", "dgpu")
+# voice.interaction_mode 白名单（20261006 全双工降级版）：vad=传统自动断句 /
+# duplex=全双工（按标点切句逐句轮询 LLM）；非法入 ignored。
+_VOICE_INTERACTION_MODES = ("vad", "duplex")
 
 
 def _accel_profile_from_plan(plan):
@@ -1630,6 +1636,16 @@ def make_handler(
                     # 20261005 设置页档位管理卡「当前模型」展示数据源（缺失为空串，
                     # 前端按「不可得即隐藏」降级）
                     "model_path": str(self._config.get("local_llm", "model_path", "") or ""),
+                    # 20261006 LLM 显卡切换：用户偏好回显（""/igpu/dgpu）
+                    "gpu_preference": str(
+                        self._config.get("local_llm", "gpu_preference", "") or ""
+                    ),
+                },
+                # 语音交互模式（20261006 全双工降级版）：vad=传统自动断句 / duplex=全双工
+                "voice": {
+                    "interaction_mode": str(
+                        self._config.get("voice", "interaction_mode", "vad") or "vad"
+                    ),
                 },
                 "acp": {"enabled": bool(self._config.get("acp", "enabled", False))},
                 "remote": {"enabled": bool(self._config.get("remote", "enabled", False))},
@@ -1690,7 +1706,7 @@ def make_handler(
                 return
             # 先做段类型校验——段存在但非 dict 一律 400，不做 .get() 取值
             invalid_sections = [
-                name for name in ("cloud", "tts", "local_llm", "accel", "vision", "download")
+                name for name in ("cloud", "tts", "local_llm", "accel", "vision", "download", "voice", "memory")
                 if name in body and not isinstance(body[name], dict)
             ]
             if invalid_sections:
@@ -1802,6 +1818,44 @@ def make_handler(
                 else:
                     ignored.append("local_llm.enabled（必须为布尔）")
 
+            # LLM 显卡切换（20261006）：gpu_preference 白名单校验（""/igpu/dgpu）。
+            # 保存后经唯一真相源 accel_plan 重算全部落点（backend 等随动），且
+            # local_llm.enabled 开启时释放并重新拉起运行时——backend 变化必须
+            # 换构建目录重启 llama-server（CUDA 构建 ↔ Vulkan 构建不可热切）。
+            gpu_pref = body.get("local_llm", {}).get("gpu_preference")
+            if gpu_pref is not None:
+                pref_norm = (
+                    gpu_pref.strip().lower() if isinstance(gpu_pref, str) else None
+                )
+                if pref_norm is not None and pref_norm in _LLM_GPU_PREFERENCE_VALUES:
+                    self._config.set("local_llm", "gpu_preference", pref_norm)
+                    applied.append("local_llm.gpu_preference")
+                    try:
+                        profile = detect_profile()
+                    except Exception as exc:  # noqa: BLE001 - 探测失败保守空画像
+                        LOGGER.warning("切换 LLM 显卡时硬件探测失败，按空画像推导：%s", exc)
+                        profile = {}
+                    plan = accel_plan(
+                        profile,
+                        self._config.get("accel", "mode", "performance"),
+                        llm_gpu_preference=pref_norm,
+                    )
+                    _apply_accel_plan_to_config(self._config, plan)
+                    # 热重建：enabled 开启时旧运行时释放（close 幂等）→ 新偏好
+                    # 后台重新加载；关闭时不加载（下次开启自然按新偏好拉起）。
+                    if bool(self._config.get("local_llm", "enabled", False)):
+                        _local_holder.release()
+                        _local_holder.ensure_started(self._config)
+                        applied.append(
+                            "local_llm.reload_hint（本地大脑正在按新显卡重新加载；"
+                            "嵌入服务将在重启应用后同步切换）"
+                        )
+                else:
+                    ignored.append(
+                        f"local_llm.gpu_preference={gpu_pref!r}"
+                        f"（不在白名单 {list(_LLM_GPU_PREFERENCE_VALUES)}）"
+                    )
+
             # 主动视觉开关（Task C）：布尔校验，非法入 ignored 显式回显。
             # ConfigManager 内存写即时生效——vision tick 线程的 run_once 每拍
             # 现读 vision.enabled（热更新段），开启后下一拍即开始采样，无需重启。
@@ -1823,6 +1877,23 @@ def make_handler(
                 else:
                     ignored.append("memory.context_inject（必须为布尔）")
 
+            # 语音交互模式（20261006 全双工降级版）：vad/duplex 白名单校验，
+            # 非法入 ignored。会话开启时逐次读取（voiceSession 每次会话启动现读）。
+            interaction_mode = body.get("voice", {}).get("interaction_mode")
+            if interaction_mode is not None:
+                mode_norm = (
+                    interaction_mode.strip().lower()
+                    if isinstance(interaction_mode, str) else ""
+                )
+                if mode_norm in _VOICE_INTERACTION_MODES:
+                    self._config.set("voice", "interaction_mode", mode_norm)
+                    applied.append("voice.interaction_mode")
+                else:
+                    ignored.append(
+                        f"voice.interaction_mode={interaction_mode!r}"
+                        f"（不在白名单 {list(_VOICE_INTERACTION_MODES)}）"
+                    )
+
             # 运行偏好（性能/节能双模式）：保存 accel.mode 时经唯一真相源 accel_plan
             # 展开全部组件落点（tts.accel / tts.accel_device / asr / local_llm /
             # embedding），与安装链、向导共用同一决策函数（禁止本处另写判断）。
@@ -1838,7 +1909,13 @@ def make_handler(
                     except Exception as exc:  # noqa: BLE001 - 探测失败保守空画像推导
                         LOGGER.warning("保存运行偏好时硬件探测失败，已按空画像保守推导：%s", exc)
                         profile = {}
-                    plan = accel_plan(profile, normalized_mode)
+                    plan = accel_plan(
+                        profile,
+                        normalized_mode,
+                        llm_gpu_preference=str(
+                            self._config.get("local_llm", "gpu_preference", "") or ""
+                        ),
+                    )
                     _apply_accel_plan_to_config(self._config, plan)
                     applied.append("accel.mode")
                     for key in ("tts.accel", "tts.accel_device", "asr.device",

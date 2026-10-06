@@ -647,7 +647,11 @@ def _chat_client(files, popen, http, **kwargs):
 
 
 def test_chat_cold_start_argv_exact(files):
-    """chat 服务冷启动 argv 严格为规定形状（无 ``--embeddings`` 等嵌入专用开关）；幂等。"""
+    """chat 服务冷启动 argv 严格为规定形状（无 ``--embeddings`` 等嵌入专用开关）；幂等。
+
+    20261006 前缀缓存复用（全双工语音降级版依赖）：argv 追加
+    ``--cache-prompt`` 与 ``--cache-reuse 256``（嵌入服务不加——无对话前缀复用场景）。
+    """
     popen = _PopenRecorder()
     client = _chat_client(files, popen, _FakeHttp())
 
@@ -658,8 +662,11 @@ def test_chat_cold_start_argv_exact(files):
     exe, model = files
     assert argv[:6] == [exe, "-m", model, "--host", "127.0.0.1", "--port"]
     assert argv[6].isdigit() and 1 <= int(argv[6]) <= 65535
-    assert argv[7:] == ["-c", "2048", "-ngl", "0", "--no-webui"]
-    assert len(argv) == 12
+    assert argv[7:] == [
+        "-c", "2048", "-ngl", "0", "--no-webui",
+        "--cache-prompt", "--cache-reuse", "256",
+    ]
+    assert len(argv) == 15
     assert "--embeddings" not in argv
 
     # 幂等：进程存活时不重复拉起

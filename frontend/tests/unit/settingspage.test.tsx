@@ -75,10 +75,9 @@ describe('SettingsPage：PUT 失败 → 内联错误提示', () => {
     await screen.findByText(LOCAL_MODE_ERROR);
 
     // 第二次操作：切音色 → handleVoiceChange 开头同步 setSaveError(null)
-    // （页面 label 未与 select 做 htmlFor 关联，故按 DOM 顺序取第二个 combobox：音色）
-    const combos = screen.getAllByRole('combobox');
-    expect(combos.length).toBeGreaterThanOrEqual(2); // [0]=云端提供商, [1]=音色
-    fireEvent.change(combos[1], { target: { value: 'ling' } });
+    // （音色 select 经 htmlFor=settings-voice 关联；不得按 combobox 位置索引——
+    //   20261006 起本地模式开启会条件隐藏云端提供商下拉，位置序不再稳定）
+    fireEvent.change(screen.getByLabelText('音色'), { target: { value: 'ling' } });
 
     // 旧的「本地模式」提示已被清除（同步阶段）
     expect(screen.queryByText(LOCAL_MODE_ERROR)).not.toBeInTheDocument();
@@ -109,9 +108,8 @@ describe('SettingsPage：PUT 失败 → 内联错误提示', () => {
     // 操作1：本地模式开关 → PUT 挂起（序号1）
     fireEvent.click(screen.getByRole('switch', { name: '本地模式' }));
     // 操作2：切音色 → 同步清错 + PUT 挂起（序号2，成为最新）
-    // （Task 9 后新增语音加速两个下拉，音色不再是最后一个 combobox；固定取第 2 个 = 音色）
-    const combos = screen.getAllByRole('combobox');
-    fireEvent.change(combos[1], { target: { value: 'ling' } });
+    // （音色 select 语义定位：本地模式开启后云端下拉会被条件隐藏，位置序不稳定）
+    fireEvent.change(screen.getByLabelText('音色'), { target: { value: 'ling' } });
     // requestJson 内部有 await，PUT 实际发出在微任务中：先冲刷再断言挂起数量
     await act(async () => {});
     expect(pending.length).toBe(2);

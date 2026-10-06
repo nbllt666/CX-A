@@ -55,12 +55,14 @@ def test_defaults_values():
     # device 为 GPU 开关键（cpu 默认 / gpu），打通 llama.cpp CPU/GPU 推理切换
     # backend 为 llama.cpp 后端构建键（20261002 批 A："" 默认 / cuda / vulkan，
     # 既有断言变更留痕：local_llm 段精确比较追加 backend 键）
+    # gpu_preference 为 LLM 显卡偏好键（20261006："" 自动 / igpu / dgpu）
     assert DEFAULTS["local_llm"] == {
         "enabled": False,
         "model_path": "",
         "source": "modelscope",
         "device": "cpu",
         "backend": "",
+        "gpu_preference": "",
     }
     # embedding/vector（20260926_模块0_真实嵌入与向量持久化）：新增 model_path
     # 覆盖键（空串＝按约定目录解析）；向量后端默认由 lancedb 改为 sqlite（持久

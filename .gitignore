@@ -36,6 +36,9 @@ build/
 .coverage
 htmlcov/
 
+# ===== 工具下载缓存（scripts/update_llama_bundled.py 等，本地重建即可） =====
+.cache/
+
 # ===== 内置组件源（本地填充，二进制不入 git；保留目录占位） =====
 # installer/bundled/ 下的真实组件（如 pet_model 桌宠 VRM ~15MB）体积大，
 # 与其它内置组件同为「本地填充」口径：不入 git，但打包链路照常包含。

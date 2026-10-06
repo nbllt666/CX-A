@@ -2816,6 +2816,49 @@ def test_settings_put_vision_section_non_dict_400(api_server):
     assert body["error"] == "invalid section type: vision"
 
 
+# ---------------------------------------------------------------- 语音交互模式（20261006 全双工降级版）
+
+def test_settings_view_contains_voice_interaction_mode_default(api_server):
+    """GET /api/settings：voice.interaction_mode 默认 "vad" 出现在视图中。"""
+    _store, _pipeline, base = api_server
+    status, body, _raw = http_get(f"{base}/api/settings")
+    assert status == 200
+    assert body["voice"] == {"interaction_mode": "vad"}
+
+
+def test_settings_put_voice_interaction_mode_duplex_echoed(api_server):
+    """PUT voice.interaction_mode=duplex → applied + GET 视图翻转 + 落盘生效。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/settings", {"voice": {"interaction_mode": "duplex"}}, method="PUT"
+    )
+    assert status == 200
+    assert "voice.interaction_mode" in body["applied"]
+    assert body["config"]["voice"]["interaction_mode"] == "duplex"
+    status, body, _raw = http_get(f"{base}/api/settings")
+    assert body["voice"]["interaction_mode"] == "duplex"
+
+
+def test_settings_put_voice_interaction_mode_invalid_ignored(api_server):
+    """PUT voice.interaction_mode="push"（不在白名单）→ ignored 显式回显，config 不变。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/settings", {"voice": {"interaction_mode": "push"}}, method="PUT"
+    )
+    assert status == 200
+    assert not body["applied"]
+    assert any("voice.interaction_mode" in item for item in body["ignored"])
+    assert body["config"]["voice"]["interaction_mode"] == "vad"
+
+
+def test_settings_put_voice_section_non_dict_400(api_server):
+    """PUT {"voice": "abc"}（段非 dict）→ 400 invalid section type。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/settings", {"voice": "abc"}, method="PUT")
+    assert status == 400
+    assert body["error"] == "invalid section type: voice"
+
+
 # ---------------------------------------------------------------- settings 白名单扩展（Task 5：向导选项入设置）
 def test_settings_put_api_key_applied_and_get_masked(api_server):
     """PUT cloud.api_key：applied 登记；GET 脱敏回显 sk-****尾4位，明文不外泄。"""

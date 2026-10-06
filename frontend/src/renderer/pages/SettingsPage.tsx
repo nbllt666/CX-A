@@ -8,6 +8,7 @@ import {
   IS_BACKEND_READY,
   fetchComputerStatus,
   fetchSettings,
+  fetchSetupRecommend,
   fetchVoices,
   hasVoiceFolderPicker,
   importVoice,
@@ -15,7 +16,14 @@ import {
   setComputerAuthorized,
   updateSettings,
 } from '../api';
-import type { AccelMode, DownloadChannel, TtsAccel, TtsAccelDevice, VoiceInfo } from '../api';
+import type {
+  AccelMode,
+  DownloadChannel,
+  HardwareProfile,
+  TtsAccel,
+  TtsAccelDevice,
+  VoiceInfo,
+} from '../api';
 
 /**
  * 设置页（/settings）：
@@ -92,6 +100,108 @@ const TTS_ACCEL_DEVICE_OPTIONS: Array<{ value: TtsAccelDevice; label: string }> 
 const TTS_ACCEL_VALUES: readonly string[] = TTS_ACCEL_OPTIONS.map((o) => o.value);
 /** tts.accel_device 合法值域（白名单外的值回落 ''） */
 const TTS_ACCEL_DEVICE_VALUES: readonly string[] = TTS_ACCEL_DEVICE_OPTIONS.map((o) => o.value);
+
+/**
+ * 设备画像是否「明确已知」：仅当 recommend 探测成功且返回了核显/独显结论
+ * （has_igpu 为布尔、dgpu_vendor 键存在）时才参与选项过滤。
+ *
+ * 为什么需要这个闸门：探测失败的后端降级画像（_degraded_profile）不带这两个字段
+ * （undefined），一次探测失败不应把功能选项永久藏没——字段缺失时保守显示全部
+ * （与改动前行为一致）；只有「明确探测到」才裁剪。
+ */
+export function hardwareKnown(profile: HardwareProfile | null): boolean {
+  return (
+    profile != null &&
+    typeof profile.has_igpu === 'boolean' &&
+    profile.dgpu_vendor !== undefined
+  );
+}
+
+/** 该设备是否有任一可用于加速的 GPU（核显或已知独显；N 卡经 gpu_vendor 兜底） */
+function hasAnyGpu(profile: HardwareProfile): boolean {
+  return profile.has_igpu === true || !!profile.dgpu_vendor || profile.gpu_vendor === 'nvidia';
+}
+
+/**
+ * 按设备画像过滤「加速方式」选项（tts.accel）：
+ * cuda 仅 N 卡显示、rocm 仅 AMD 独显显示、dml（通用显卡加速）仅在任一真 GPU 时显示；
+ * auto / cpu / off 恒显示。画像未知（hardwareKnown=false）时原样返回全部。
+ */
+export function filterTtsAccelOptions(profile: HardwareProfile | null): Array<{
+  value: TtsAccel;
+  label: string;
+}> {
+  if (!hardwareKnown(profile)) return TTS_ACCEL_OPTIONS;
+  const p = profile as HardwareProfile;
+  return TTS_ACCEL_OPTIONS.filter((opt) => {
+    if (opt.value === 'cuda') return p.dgpu_vendor === 'nvidia' || p.gpu_vendor === 'nvidia';
+    if (opt.value === 'rocm') return p.dgpu_vendor === 'amd';
+    if (opt.value === 'dml') return hasAnyGpu(p);
+    return true;
+  });
+}
+
+/**
+ * 按设备画像过滤「加速设备」选项（tts.accel_device）：
+ * 「核显」仅 has_igpu 时显示、「独立显卡」仅有已知独显时显示；
+ * 「自动选设备」恒显示。画像未知时原样返回全部。
+ */
+export function filterTtsAccelDeviceOptions(profile: HardwareProfile | null): Array<{
+  value: TtsAccelDevice;
+  label: string;
+}> {
+  if (!hardwareKnown(profile)) return TTS_ACCEL_DEVICE_OPTIONS;
+  const p = profile as HardwareProfile;
+  return TTS_ACCEL_DEVICE_OPTIONS.filter((opt) => {
+    if (opt.value === 'igpu') return p.has_igpu === true;
+    if (opt.value === 'dgpu') return !!p.dgpu_vendor;
+    return true;
+  });
+}
+
+/**
+ * 「运行偏好（省电/性能）」卡片是否显示：无任何真 GPU 时隐藏——
+ * accel_plan 语义下无核显节能模式 TTS 落点为 cpu、无 GPU 性能模式同为 cpu，
+ * 双模式完全等价，展示两选项只会让用户困惑（同一问题的另一半：有核显/独显时
+ * 双模式分别对应不同加速落点，仍保留）。
+ */
+export function shouldShowAccelModeCard(profile: HardwareProfile | null): boolean {
+  if (!hardwareKnown(profile)) return true;
+  return hasAnyGpu(profile as HardwareProfile);
+}
+
+/** LLM 显卡偏好选项（value 对应 local_llm.gpu_preference 白名单） */
+const LLM_GPU_OPTIONS: Array<{ value: string; label: string; match: (p: HardwareProfile) => boolean }> = [
+  { value: '', label: '自动（推荐）', match: () => true },
+  {
+    value: 'dgpu',
+    label: 'NVIDIA 独显',
+    match: (p) => p.dgpu_vendor === 'nvidia' || p.gpu_vendor === 'nvidia',
+  },
+  {
+    value: 'dgpu',
+    label: '独立显卡（AMD/Intel）',
+    match: (p) => p.dgpu_vendor === 'amd' || p.dgpu_vendor === 'intel',
+  },
+  { value: 'igpu', label: '核显', match: (p) => p.has_igpu === true },
+];
+
+/**
+ * 按设备画像过滤「本地大脑跑哪块卡」选项：自动恒显示；独显/核显选项仅在
+ * 设备实际具备时显示。画像未知（hardwareKnown=false）时原样返回全部。
+ * 注意 value 可重复（dgpu 按厂商拆两个 label），key 消费方须用 label 区分。
+ */
+export function filterLlmGpuOptions(profile: HardwareProfile | null): Array<{
+  value: string;
+  label: string;
+}> {
+  if (!hardwareKnown(profile)) return LLM_GPU_OPTIONS.map(({ value, label }) => ({ value, label }));
+  const p = profile as HardwareProfile;
+  return LLM_GPU_OPTIONS.filter((opt) => opt.match(p)).map(({ value, label }) => ({ value, label }));
+}
+
+/** LLM 显卡偏好合法值域（与后端 _LLM_GPU_PREFERENCE_VALUES 一致） */
+const LLM_GPU_VALUES: readonly string[] = ['', 'igpu', 'dgpu'];
 
 /**
  * 读取 localStorage 布尔值；新键缺失时回落旧版键并顺手写入新键（静默迁移，
@@ -196,12 +306,29 @@ export default function SettingsPage() {
   const [saveError, setSaveError] = useState<string | null>(null);
   // 自定义 provider / voice 选中时的非阻断提示（不支持在线修改，显式告知而非静默跳过，D8）
   const [customHint, setCustomHint] = useState<string | null>(null);
+  // 设备画像（GET /api/setup/recommend 的 profile）：驱动 TTS 选项 / 运行偏好按
+  // 实际硬件裁剪显示；拉取失败保持 null（保守显示全部，一次失败不藏功能）
+  const [hwProfile, setHwProfile] = useState<HardwareProfile | null>(null);
+  // LLM 显卡偏好（local_llm.gpu_preference，20261006）："" 自动 / igpu 核显 / dgpu 独显
+  const [llmGpuPref, setLlmGpuPref] = useState<string>('');
+  const [llmGpuHint, setLlmGpuHint] = useState<string | null>(null);
+  // 语音交互模式（voice.interaction_mode，20261006 全双工降级版）：vad 传统 / duplex 全双工
+  const [interactionMode, setInteractionMode] = useState<'vad' | 'duplex'>('vad');
+  const [voiceModeHint, setVoiceModeHint] = useState<string | null>(null);
 
   // 挂载初始化：拉后端配置视图 + 音色包列表 + 电脑控制状态；失败回退默认值（与 config 默认一致）
   useEffect(() => {
     let alive = true;
     (async () => {
       if (IS_BACKEND_READY) {
+        // 设备画像：独立拉取、失败静默（选项过滤保守退化为全部显示）
+        void fetchSetupRecommend()
+          .then((res) => {
+            if (alive) setHwProfile(res?.profile ?? null);
+          })
+          .catch(() => {
+            /* 探测失败 → hwProfile 保持 null → 显示全部选项（与旧行为一致） */
+          });
         // 音色列表与配置视图并行拉取，互不阻塞；各自失败独立降级
         const voicesTask = fetchVoices().catch(() => null);
         // 首帧读到的当前音色（供列表装载后判定 extraVoice 附加项）
@@ -239,6 +366,12 @@ export default function SettingsPage() {
           );
           // 当前本地模型路径：可得才展示（档位卡据此显示/隐藏该行）
           setModelPath(typeof st?.local_llm?.model_path === 'string' ? st.local_llm.model_path : '');
+          // LLM 显卡偏好：白名单外 / 缺失回落自动（""）
+          const gp = st?.local_llm?.gpu_preference;
+          setLlmGpuPref(typeof gp === 'string' && LLM_GPU_VALUES.includes(gp) ? gp : '');
+          // 语音交互模式：白名单外 / 缺失回落传统（vad）
+          const vMode = st?.voice?.interaction_mode;
+          setInteractionMode(vMode === 'duplex' ? 'duplex' : 'vad');
         } catch {
           if (!alive) return;
           setProvider(FALLBACK_PROVIDER);
@@ -518,6 +651,45 @@ export default function SettingsPage() {
       });
   };
 
+  /**
+   * 切换 LLM 显卡（local_llm.gpu_preference，20261006）：保存后后端经
+   * accel_plan 重算落点并热重建本地大脑——提示语说明重新加载与嵌入需重启。
+   */
+  const handleLlmGpuPrefChange = (next: string) => {
+    setLlmGpuPref(next);
+    const seq = ++settingsSeqRef.current;
+    setSaveError(null);
+    setLlmGpuHint(null);
+    void updateSettings({ local_llm: { gpu_preference: next } })
+      .then(() => {
+        if (seq !== settingsSeqRef.current) return;
+        setLlmGpuHint('已保存——本地大脑正在按新显卡重新加载，稍后就绪');
+      })
+      .catch(() => {
+        if (seq !== settingsSeqRef.current) return;
+        setSaveError('显卡选择没保存上…待会儿再选一次就好啦');
+      });
+  };
+
+  /** 切换语音交互模式（voice.interaction_mode）：保存后下一次语音会话按新模式运行。 */
+  const handleInteractionModeChange = (next: 'vad' | 'duplex') => {
+    setInteractionMode(next);
+    const seq = ++settingsSeqRef.current;
+    setSaveError(null);
+    setVoiceModeHint(null);
+    void updateSettings({ voice: { interaction_mode: next } })
+      .then(() => {
+        if (seq !== settingsSeqRef.current) return;
+        setVoiceModeHint(
+          next === 'duplex' ? '已切换——全双工模式建议戴耳机（无回声消除）' : '已切换',
+        );
+      })
+      .catch(() => {
+        if (seq !== settingsSeqRef.current) return;
+        setSaveError('语音模式没保存上…待会儿再选一次就好啦');
+      });
+  };
+
   // 切换授权：在线走 POST authorize；离线/失败则本地记忆。
   // F-8（第三轮体检批次6）：补序号守卫（F3 修复未覆盖此处）——快速连点时
   // 并发 POST 响应可乱序，迟到的旧响应不得把 UI 拉回与后端真相背离的状态。
@@ -588,7 +760,18 @@ export default function SettingsPage() {
       {ttsHint && <p className="-mt-1 mb-2 text-xs text-[var(--text-secondary)]">{ttsHint}</p>}
 
       <div className="flex max-w-2xl flex-col gap-4">
-        {/* 云端提供商 */}
+        {/* 云端提供商：本地模式开启时聊天完全不碰云端，配置项隐藏并说明入口
+            （不静默消失——原位一行字告诉用户想配云端该怎么做） */}
+        {localMode ? (
+          <GlassCard>
+            <div className="flex flex-col gap-1 p-4">
+              <p className="text-sm font-medium">云端大脑</p>
+              <p className="text-xs text-[var(--text-tertiary)]">
+                本地模式开着，聊天都在这台电脑上完成，用不上云端；想配云端大脑的话，先关掉上面的「本地模式」
+              </p>
+            </div>
+          </GlassCard>
+        ) : (
         <GlassCard>
           <div className="flex flex-col gap-1.5 p-4">
             <label className="text-sm font-medium">云端提供商</label>
@@ -639,8 +822,11 @@ export default function SettingsPage() {
             </div>
           </div>
         </GlassCard>
+        )}
 
-        {/* 运行偏好（省电优先 / 性能优先）：保存后按新配置重建语音桥生效 */}
+        {/* 运行偏好（省电优先 / 性能优先）：保存后按新配置重建语音桥生效；
+            无任何 GPU 的设备上双模式加速落点完全等价（accel_plan 均为 cpu），整卡隐藏 */}
+        {shouldShowAccelModeCard(hwProfile) && (
         <GlassCard>
           <div className="flex flex-col gap-1.5 p-4">
             <label className="text-sm font-medium">运行偏好</label>
@@ -671,6 +857,7 @@ export default function SettingsPage() {
             </div>
           </div>
         </GlassCard>
+        )}
 
         {/* 本地模式：开关 + 就绪徽标（SettingRow 装不下徽标，改用自定义 GlassCard） */}
         <GlassCard>
@@ -699,6 +886,34 @@ export default function SettingsPage() {
             </div>
           )}
         </GlassCard>
+
+        {/* 本地大脑跑哪块卡（20261006 LLM 显卡切换）：localMode 且设备有可用 GPU
+            时才渲染（无显卡设备不显示相关配置项）；选项按设备画像过滤 */}
+        {localMode && shouldShowAccelModeCard(hwProfile) && (
+          <GlassCard>
+            <div className="flex flex-col gap-2 p-4">
+              <p className="font-medium">本地大脑跑哪块卡</p>
+              <p className="text-xs text-[var(--text-tertiary)]">
+                玩游戏时可以让大脑用核显跑；想更快就用独显；不确定选自动
+              </p>
+              <select
+                id="settings-llm-gpu"
+                value={llmGpuPref}
+                onChange={(e) => handleLlmGpuPrefChange(e.target.value)}
+                className="mt-1 h-9 rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-2 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)]"
+              >
+                {filterLlmGpuOptions(hwProfile).map((opt) => (
+                  <option key={opt.label} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+              {llmGpuHint && (
+                <p className="text-xs text-[var(--text-secondary)]">{llmGpuHint}</p>
+              )}
+            </div>
+          </GlassCard>
+        )}
 
         {/* 本地模型档位管理（Task 9.3）：当前模型 + 四档下载 + 进度 + 取消；
             「设为本地默认大脑」沿用既有 local_llm.enabled 保存链路 */}
@@ -743,7 +958,7 @@ export default function SettingsPage() {
         {/* 主动视觉 */}
         <SettingRow
           title="主动视觉"
-          desc="开启后它会看看屏幕、记住你正在忙什么，越陪你越懂你；画面不会离开这台电脑，理解画面时需要联网"
+          desc="开启后它会看看屏幕、记住你正在忙什么，越陪你越懂你；画面只在这台电脑上理解、不会上传（本地大脑没就绪时才会用云端补位）"
         >
           <Toggle checked={visionEnabled} onChange={handleVisionChange} label="主动视觉" />
         </SettingRow>
@@ -798,9 +1013,12 @@ export default function SettingsPage() {
         {/* 音色选择：选项来自 GET /api/voices（失败回退演示项），支持导入自定义音色包 */}
         <GlassCard>
           <div className="flex flex-col gap-1.5 p-4">
-            <label className="text-sm font-medium">音色</label>
+            <label className="text-sm font-medium" htmlFor="settings-voice">
+              音色
+            </label>
             <p className="text-xs text-[var(--text-tertiary)]">挑一个舒服的声音陪你说话</p>
             <select
+              id="settings-voice"
               value={voice}
               onChange={(e) => handleVoiceChange(e.target.value)}
               className="mt-1 h-9 rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-2 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)]"
@@ -862,11 +1080,17 @@ export default function SettingsPage() {
                   onChange={(e) => handleTtsAccelChange(e.target.value as TtsAccel)}
                   className="h-9 rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-2 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)]"
                 >
-                  {TTS_ACCEL_OPTIONS.map((opt) => (
+                  {/* 按设备画像过滤后的选项；当前已存值若被过滤掉（如换卡后），附加展示防空白 */}
+                  {filterTtsAccelOptions(hwProfile).map((opt) => (
                     <option key={opt.value} value={opt.value}>
                       {opt.label}
                     </option>
                   ))}
+                  {!filterTtsAccelOptions(hwProfile).some((opt) => opt.value === ttsAccel) && (
+                    <option value={ttsAccel}>
+                      {TTS_ACCEL_OPTIONS.find((opt) => opt.value === ttsAccel)?.label ?? ttsAccel}（当前值）
+                    </option>
+                  )}
                 </select>
               </div>
               <div className="flex flex-1 flex-col gap-1">
@@ -879,14 +1103,72 @@ export default function SettingsPage() {
                   onChange={(e) => handleTtsAccelDeviceChange(e.target.value as TtsAccelDevice)}
                   className="h-9 rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-2 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)]"
                 >
-                  {TTS_ACCEL_DEVICE_OPTIONS.map((opt) => (
+                  {/* 按设备画像过滤：无核显不显示核显、无独显不显示独显（自动选设备恒在） */}
+                  {filterTtsAccelDeviceOptions(hwProfile).map((opt) => (
                     <option key={opt.value} value={opt.value}>
                       {opt.label}
                     </option>
                   ))}
+                  {!filterTtsAccelDeviceOptions(hwProfile).some(
+                    (opt) => opt.value === ttsAccelDevice,
+                  ) && (
+                    <option value={ttsAccelDevice}>
+                      {
+                        TTS_ACCEL_DEVICE_OPTIONS.find((opt) => opt.value === ttsAccelDevice)?.label ??
+                        ttsAccelDevice
+                      }
+                      （当前值）
+                    </option>
+                  )}
                 </select>
               </div>
             </div>
+          </div>
+        </GlassCard>
+
+        {/* 语音交互模式（20261006 全双工降级版）：vad=传统自动断句 / duplex=全双工；
+            切换保存后下一次语音会话按新模式运行（voice 段热更新，无需重启） */}
+        <GlassCard>
+          <div className="flex flex-col gap-1.5 p-4">
+            <p className="font-medium">语音交互模式</p>
+            <p className="text-xs text-[var(--text-tertiary)]">
+              传统：说一句话停一下，它自动接话；全双工：边说边聊，说话时能打断它
+            </p>
+            <div className="mt-1 grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <button
+                type="button"
+                aria-pressed={interactionMode === 'vad'}
+                onClick={() => handleInteractionModeChange('vad')}
+                className={[
+                  'flex flex-col gap-0.5 rounded-xl border px-3 py-2 text-left text-sm transition',
+                  interactionMode === 'vad'
+                    ? 'border-[var(--color-primary)] bg-[rgba(255,183,225,0.12)]'
+                    : 'border-[var(--glass-border)] hover:border-[var(--color-accent)]',
+                ].join(' ')}
+              >
+                <span>传统 · 自动断句</span>
+                <span className="text-xs text-[var(--text-tertiary)]">说一句停一下，稳一些</span>
+              </button>
+              <button
+                type="button"
+                aria-pressed={interactionMode === 'duplex'}
+                onClick={() => handleInteractionModeChange('duplex')}
+                className={[
+                  'flex flex-col gap-0.5 rounded-xl border px-3 py-2 text-left text-sm transition',
+                  interactionMode === 'duplex'
+                    ? 'border-[var(--color-primary)] bg-[rgba(255,183,225,0.12)]'
+                    : 'border-[var(--glass-border)] hover:border-[var(--color-accent)]',
+                ].join(' ')}
+              >
+                <span>全双工 · 边说边聊</span>
+                <span className="text-xs text-[var(--text-tertiary)]">
+                  可以连着说，还能随时打断它
+                </span>
+              </button>
+            </div>
+            {voiceModeHint && (
+              <p className="text-xs text-[var(--text-secondary)]">{voiceModeHint}</p>
+            )}
           </div>
         </GlassCard>
 

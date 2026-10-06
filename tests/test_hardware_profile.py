@@ -451,7 +451,7 @@ def test_probe_gpu_inventory_runner_exception_degrades():
 # ------------------------------------------------------------------ #
 
 def test_accel_plan_performance_nvidia_no_igpu():
-    """性能 · 无核显 N 卡 → tts=cuda/""；asr/llm/embedding=gpu。"""
+    """性能 · 无核显 N 卡 → tts=cuda/""；LLM/嵌入=gpu+CUDA；ASR 恒 cpu（20261006）。"""
     hw = {"gpu_vendor": "nvidia", "vram_gb": 8.0, "has_igpu": False,
           "dgpu_vendor": "nvidia", "recommend": "cuda"}
 
@@ -460,37 +460,37 @@ def test_accel_plan_performance_nvidia_no_igpu():
     assert plan["accel.mode"] == "performance"
     assert plan["tts.accel"] == "cuda"
     assert plan["tts.accel_device"] == ""
-    assert plan["asr.device"] == "gpu"
+    assert plan["asr.device"] == "cpu"  # 20261006 裁决：ASR 恒 CPU
     assert plan["local_llm.device"] == "gpu"
     assert plan["embedding.device"] == "gpu"
 
 
-def test_accel_plan_performance_with_igpu_prefers_dml_dgpu():
-    """性能 · 有核显（裁决①）→ tts=dml + dgpu；N 卡其余组件仍 gpu。"""
+def test_accel_plan_performance_with_igpu_prefers_dml_igpu():
+    """性能 · 有核显（20261006 裁决：TTS 跨模式恒核显）→ tts=dml + igpu；
+    LLM 按自动口径走 N 卡（CUDA）；ASR 恒 cpu。"""
     hw = {"gpu_vendor": "nvidia", "vram_gb": 8.0, "has_igpu": True,
           "dgpu_vendor": "nvidia", "recommend": "cuda"}
 
     plan = hp.accel_plan(hw, "performance")
 
     assert plan["tts.accel"] == "dml"
-    assert plan["tts.accel_device"] == "dgpu"
-    assert plan["asr.device"] == "gpu"
+    assert plan["tts.accel_device"] == "igpu"
+    assert plan["asr.device"] == "cpu"
     assert plan["local_llm.device"] == "gpu"
 
 
 def test_accel_plan_performance_with_igpu_non_nvidia_dgpu_others_cpu():
-    """性能 · 有核显 + AMD 独显 → tts=dml/dgpu；LLM/嵌入走 Vulkan GPU（批 A 扩展）。
+    """性能 · 有核显 + AMD 独显 → tts=dml/igpu（跨模式恒核显）；LLM/嵌入走 Vulkan GPU。
 
-    既有断言变更留痕（20261002 批 A）：原口径「ASR/LLM 无 GPU 路径 → cpu」中
-    LLM/嵌入部分已变——Windows 平台 AMD 独显现走 llama.cpp Vulkan（gpu + vulkan）；
-    ASR 维持 cpu（torch 无 Windows ROCm 路径，批 A 未扩展）。
+    既有断言变更留痕（20261006）：TTS 落点由 dgpu 改 igpu（用户裁决：性能模式
+    TTS 仍用核显，独显留给游戏与显示）。
     """
     hw = {"gpu_vendor": "amd", "vram_gb": 8.0, "has_igpu": True,
           "dgpu_vendor": "amd", "recommend": "rocm"}
 
     plan = hp.accel_plan(hw, "performance")
 
-    assert plan["tts.accel"] == "dml" and plan["tts.accel_device"] == "dgpu"
+    assert plan["tts.accel"] == "dml" and plan["tts.accel_device"] == "igpu"
     assert plan["asr.device"] == "cpu"
     assert plan["local_llm.device"] == "gpu"
     assert plan["local_llm.backend"] == "vulkan"
@@ -509,7 +509,7 @@ def test_accel_plan_performance_amd_no_igpu_dml_auto_device():
 
 
 def test_accel_plan_eco_with_igpu():
-    """节能 · 有核显 → tts=dml + igpu；其余组件 cpu。"""
+    """节能 · 有核显（20261006 裁决：全核显）→ tts=dml+igpu；LLM/嵌入=vulkan GPU。"""
     hw = {"gpu_vendor": "nvidia", "vram_gb": 8.0, "has_igpu": True,
           "dgpu_vendor": "nvidia", "recommend": "cuda"}
 
@@ -519,8 +519,10 @@ def test_accel_plan_eco_with_igpu():
     assert plan["tts.accel"] == "dml"
     assert plan["tts.accel_device"] == "igpu"
     assert plan["asr.device"] == "cpu"
-    assert plan["local_llm.device"] == "cpu"
-    assert plan["embedding.device"] == "cpu"
+    assert plan["local_llm.device"] == "gpu"
+    assert plan["local_llm.backend"] == "vulkan"
+    assert plan["embedding.device"] == "gpu"
+    assert plan["embedding.backend"] == "vulkan"
 
 
 def test_accel_plan_eco_without_igpu():
@@ -586,8 +588,8 @@ def test_accel_plan_backend_vulkan_for_igpu_only():
     assert plan["local_llm.device"] == "gpu"
     assert plan["local_llm.backend"] == "vulkan"
     assert plan["embedding.backend"] == "vulkan"
-    # TTS 仍走核显 dml（既有双模式前提不变）
-    assert plan["tts.accel"] == "dml" and plan["tts.accel_device"] == "dgpu"
+    # 20261006 裁决：TTS 跨模式恒指向核显
+    assert plan["tts.accel"] == "dml" and plan["tts.accel_device"] == "igpu"
 
 
 def test_accel_plan_backend_empty_for_eco_and_no_gpu():
@@ -606,21 +608,21 @@ def test_accel_plan_backend_empty_for_eco_and_no_gpu():
 
 
 def test_accel_plan_linux_amd_dgpu_rocm_face():
-    """Linux · 性能 + AMD 独显 → tts=rocm、asr=gpu；LLM/嵌入维持 cpu（ROCm/HIP 未纳入）。"""
+    """Linux · 性能 + AMD 独显 → tts=rocm；ASR 恒 cpu；LLM/嵌入维持 cpu（ROCm/HIP 未纳入）。"""
     hw = {"gpu_vendor": "amd", "has_igpu": False, "dgpu_vendor": "amd",
           "recommend": "rocm"}
     plan = hp.accel_plan(hw, "performance", platform="linux")
 
     assert plan["tts.accel"] == "rocm"
     assert plan["tts.accel_device"] == ""
-    assert plan["asr.device"] == "gpu"
+    assert plan["asr.device"] == "cpu"  # 20261006 裁决：ASR 恒 CPU
     assert plan["local_llm.device"] == "cpu"
     assert plan["local_llm.backend"] == ""
     assert plan["embedding.device"] == "cpu"
     assert plan["embedding.backend"] == ""
     # 仅 linux（startswith）前缀命中，"linux515" 等变体同口径
     plan2 = hp.accel_plan(hw, "performance", platform="linux515")
-    assert plan2["tts.accel"] == "rocm" and plan2["asr.device"] == "gpu"
+    assert plan2["tts.accel"] == "rocm" and plan2["asr.device"] == "cpu"
 
 
 def test_accel_plan_linux_intel_dgpu_keeps_cpu_for_llm():
@@ -646,8 +648,8 @@ def test_accel_plan_windows_explicit_platform_matches_default():
 
 
 def test_accel_plan_amd_igpu_prefers_igpu_on_windows_even_performance():
-    """Windows · 性能 + N 卡独显 + AMD 核显 → TTS 指向核显（dml+igpu）；
-    ASR / LLM 仍按 N 卡（CUDA）不受影响；节能模式同口径（原本就是 igpu）。"""
+    """Windows · 性能 + N 卡独显 + AMD 核显 → TTS 指向核显（dml+igpu，跨模式一致）；
+    ASR 恒 cpu；LLM 按自动口径仍走 N 卡（CUDA）；节能同 TTS 口径。"""
     hw = {
         "gpu_vendor": "nvidia", "vram_gb": 8.0, "has_igpu": True,
         "dgpu_vendor": "nvidia", "recommend": "cuda",
@@ -659,7 +661,7 @@ def test_accel_plan_amd_igpu_prefers_igpu_on_windows_even_performance():
     perf = hp.accel_plan(hw, "performance")
     assert perf["tts.accel"] == "dml"
     assert perf["tts.accel_device"] == "igpu"
-    assert perf["asr.device"] == "gpu"
+    assert perf["asr.device"] == "cpu"
     assert perf["local_llm.device"] == "gpu"
     assert perf["local_llm.backend"] == "cuda"
 
@@ -695,7 +697,7 @@ def test_accel_plan_amd_igpu_linux_rocm():
 
 
 def test_accel_plan_intel_igpu_keeps_existing_branch():
-    """Intel 核显 / 清单缺失（legacy hw dict）→ 保守回退既有分支（性能=dml+dgpu）。"""
+    """Intel 核显 / 清单缺失（legacy hw dict）→ 20261006 起 TTS 跨模式恒核显（dml+igpu）。"""
     hw_intel = {
         "gpu_vendor": "nvidia", "vram_gb": 8.0, "has_igpu": True,
         "dgpu_vendor": "nvidia", "recommend": "cuda",
@@ -703,12 +705,12 @@ def test_accel_plan_intel_igpu_keeps_existing_branch():
                  {"vendor": "nvidia", "type": "dgpu"}],
     }
     plan = hp.accel_plan(hw_intel, "performance")
-    assert plan["tts.accel"] == "dml" and plan["tts.accel_device"] == "dgpu"
+    assert plan["tts.accel"] == "dml" and plan["tts.accel_device"] == "igpu"
 
     hw_legacy = {"gpu_vendor": "nvidia", "vram_gb": 8.0, "has_igpu": True,
                  "dgpu_vendor": "nvidia", "recommend": "cuda"}  # 无 gpus 清单
     plan_legacy = hp.accel_plan(hw_legacy, "performance")
-    assert plan_legacy["tts.accel"] == "dml" and plan_legacy["tts.accel_device"] == "dgpu"
+    assert plan_legacy["tts.accel"] == "dml" and plan_legacy["tts.accel_device"] == "igpu"
 
 
 def test_build_config_patch_backend_semantics():
@@ -771,14 +773,15 @@ def test_recommend_for_delegates_device_to_accel_plan(monkeypatch):
     assert result["config_patch"]["accel"]["mode"] == "performance"
     assert result["config_patch"]["tts"]["accel"] == plan["tts.accel"] == "cuda"
     assert result["config_patch"]["tts"]["accel_device"] == ""
-    assert result["config_patch"]["asr"]["device"] == plan["asr.device"] == "gpu"
+    # 20261006 裁决：ASR 恒 CPU（原口径性能+N卡 → gpu 已废除）
+    assert result["config_patch"]["asr"]["device"] == plan["asr.device"] == "cpu"
     # 20261002 批 A：embedding patch 并入 backend=cuda（既有断言变更留痕）
     assert result["config_patch"]["embedding"] == {"device": "gpu", "backend": "cuda"}
     assert result["accel"]["reasons"]  # 中文理由非空
 
 
 def test_recommend_for_eco_mode_when_igpu_only(monkeypatch):
-    """仅核显画像 → 默认 eco；tts=dml/igpu；本地 LLM 仍 cpu。"""
+    """仅核显画像 → 默认 eco；tts=dml/igpu；LLM 走核显 Vulkan（20261006 全核显裁决）。"""
     _inject_tiers(monkeypatch)
     profile = _profile(ram_gb=16.0, gpu_vendor="cpu", has_igpu=True, dgpu_vendor=None)
 
@@ -787,5 +790,126 @@ def test_recommend_for_eco_mode_when_igpu_only(monkeypatch):
     assert result["accel"]["mode"] == "eco"
     assert result["config_patch"]["tts"]["accel"] == "dml"
     assert result["config_patch"]["tts"]["accel_device"] == "igpu"
-    assert result["device"] == "cpu"
-    assert "embedding" not in result["config_patch"]
+    assert result["device"] == "gpu"
+    assert result["config_patch"]["embedding"] == {"device": "gpu", "backend": "vulkan"}
+
+
+# ------------------------------------------------------------------ #
+# AMD 识别口径五层判定（20261006 用户裁决「Radeon 也可能是核显」）      #
+# ------------------------------------------------------------------ #
+
+def test_gpu_type_amd_rdna_apu_igpu_names():
+    """AMD 第 3 层：RDNA APU 核显命名（680M/780M/890M）→ igpu（修复原 unknown 缺陷）。"""
+    for name in ("AMD Radeon(TM) 680M", "AMD Radeon 780M", "AMD Radeon(TM) 890M"):
+        assert hp._gpu_type_from_name("amd", name.upper()) == "igpu", name
+
+
+def test_gpu_type_amd_graphics_vega_igpu_names():
+    """AMD 第 3 层（既有）：Graphics 裸名 / Vega → igpu。"""
+    assert hp._gpu_type_from_name("amd", "AMD RADEON GRAPHICS") == "igpu"
+    assert hp._gpu_type_from_name("amd", "AMD RADEON(TM) VEGA 8 GRAPHICS") == "igpu"
+
+
+def test_gpu_type_amd_bare_radeon_defaults_igpu():
+    """AMD 第 4 层：含 Radeon 但无任何系列信号 → 默认 igpu（现代 APU 全覆盖）。"""
+    assert hp._gpu_type_from_name("amd", "AMD RADEON") == "igpu"
+
+
+def test_gpu_type_amd_dgpu_signals():
+    """AMD 第 1/2 层：RX / Radeon Pro / R9 / HD+4位 → dgpu（独显信号优先）。"""
+    for name in ("AMD RADEON RX 7900 XTX", "RADEON RX 5500M",
+                 "AMD RADEON PRO W7800", "RADEON R9 280X", "RADEON HD 7970"):
+        assert hp._gpu_type_from_name("amd", name.upper()) == "dgpu", name
+
+
+def test_gpu_type_amd_non_radeon_unknown():
+    """AMD 第 5 层：完全不含 Radeon（FirePro / ATI 老名）→ unknown 保守。"""
+    assert hp._gpu_type_from_name("amd", "AMD FIREPRO W9100") == "unknown"
+    assert hp._gpu_type_from_name("amd", "ATI MOBILITY RADEON".replace("RADEON", "X1600")) == "unknown"
+
+
+def test_gpu_type_amd_rx_word_boundary():
+    """RX 词边界：'RADEN' 类干扰不误判；RX 命中优先于核显信号。"""
+    assert hp._gpu_type_from_name("amd", "AMD RADEON RX 6600M") == "dgpu"
+
+
+# ------------------------------------------------------------------ #
+# accel_plan：llm_gpu_preference 覆盖（20261006 LLM 显卡切换）         #
+# ------------------------------------------------------------------ #
+
+_HW_NVIDIA_IGPU = {
+    "gpu_vendor": "nvidia", "vram_gb": 8.0, "has_igpu": True,
+    "dgpu_vendor": "nvidia", "recommend": "cuda",
+}
+
+
+def test_accel_plan_preference_igpu_forces_vulkan():
+    """preference=igpu → LLM/嵌入强制核显 Vulkan（即便 N 卡在场）。"""
+    plan = hp.accel_plan(_HW_NVIDIA_IGPU, "performance", llm_gpu_preference="igpu")
+    assert plan["local_llm.device"] == "gpu"
+    assert plan["local_llm.backend"] == "vulkan"
+    assert plan["embedding.backend"] == "vulkan"
+
+
+def test_accel_plan_preference_igpu_without_igpu_falls_back():
+    """preference=igpu 但无核显 → 回落自动口径（N 卡性能 → cuda）。"""
+    hw = {"gpu_vendor": "nvidia", "vram_gb": 8.0, "has_igpu": False,
+          "dgpu_vendor": "nvidia", "recommend": "cuda"}
+    plan = hp.accel_plan(hw, "performance", llm_gpu_preference="igpu")
+    assert plan["local_llm.device"] == "gpu"
+    assert plan["local_llm.backend"] == "cuda"
+
+
+def test_accel_plan_preference_dgpu_forces_cuda_no_vram_gate():
+    """preference=dgpu + N 卡 → 强制 CUDA 且不受显存门槛限制（显存不足也走 GPU）。"""
+    hw = {"gpu_vendor": "nvidia", "vram_gb": 2.0, "has_igpu": False,
+          "dgpu_vendor": "nvidia", "recommend": "cuda"}
+    plan = hp.accel_plan(hw, "performance", llm_gpu_preference="dgpu")
+    assert plan["local_llm.device"] == "gpu"
+    assert plan["local_llm.backend"] == "cuda"
+
+
+def test_accel_plan_preference_dgpu_amd_windows_vulkan():
+    """preference=dgpu + AMD 独显（Windows）→ 强制 Vulkan。"""
+    hw = {"gpu_vendor": "amd", "has_igpu": False, "dgpu_vendor": "amd",
+          "recommend": "rocm"}
+    plan = hp.accel_plan(hw, "performance", llm_gpu_preference="dgpu")
+    assert plan["local_llm.device"] == "gpu"
+    assert plan["local_llm.backend"] == "vulkan"
+
+
+def test_accel_plan_preference_dgpu_linux_amd_keeps_cpu():
+    """preference=dgpu + Linux AMD 独显 → 维持 cpu（ROCm/HIP 构建未纳入）。"""
+    hw = {"gpu_vendor": "amd", "has_igpu": False, "dgpu_vendor": "amd",
+          "recommend": "rocm"}
+    plan = hp.accel_plan(hw, "performance", platform="linux", llm_gpu_preference="dgpu")
+    assert plan["local_llm.device"] == "cpu"
+    assert plan["local_llm.backend"] == ""
+
+
+def test_accel_plan_preference_invalid_normalizes_to_auto():
+    """preference 非法值归一 ""（自动口径生效）。"""
+    plan = hp.accel_plan(_HW_NVIDIA_IGPU, "performance", llm_gpu_preference="tpu")
+    assert plan["local_llm.device"] == "gpu"
+    assert plan["local_llm.backend"] == "cuda"
+
+
+def test_accel_plan_auto_eco_igpu_vulkan_and_eco_no_igpu_cpu():
+    """自动口径收口：节能+核显 → vulkan（全核显）；节能+无核显 → cpu。"""
+    plan = hp.accel_plan(_HW_NVIDIA_IGPU, "eco")
+    assert plan["local_llm.backend"] == "vulkan"
+
+    hw = {"gpu_vendor": "nvidia", "vram_gb": 8.0, "has_igpu": False,
+          "dgpu_vendor": "nvidia", "recommend": "cuda"}
+    plan2 = hp.accel_plan(hw, "eco")
+    assert plan2["local_llm.device"] == "cpu"
+    assert plan2["local_llm.backend"] == ""
+
+
+def test_accel_plan_auto_performance_amd_dgpu_windows_vulkan():
+    """自动口径：性能 + Windows AMD 独显（无核显）→ Vulkan（既有语义回归）。"""
+    hw = {"gpu_vendor": "amd", "has_igpu": False, "dgpu_vendor": "amd",
+          "recommend": "rocm"}
+    plan = hp.accel_plan(hw, "performance")
+    assert plan["local_llm.device"] == "gpu"
+    assert plan["local_llm.backend"] == "vulkan"

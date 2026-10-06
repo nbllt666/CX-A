@@ -820,11 +820,18 @@ class LlamaServerChat(_LlamaServerProcess):
         20261004 Gemma 4 多模态：模型同目录存在 mmproj*.gguf 时自动追加
         ``--mmproj``——挂载视觉投影后 /v1/chat/completions 可直接接收
         image_url（base64 data URL）多模态消息；纯文本模型无该文件则不挂载。
+
+        20261006 前缀缓存复用（全双工语音降级版依赖）：``--cache-prompt`` 使
+        system prompt + 会话历史的共同前缀 KV cache 跨请求保留；``--cache-reuse
+        256`` 允许按 256 token 块跳过历史中已被缓存的片段——逐句轮询场景
+        （每句请求仅追加新内容）大幅降低 prefill 延迟。嵌入服务无需该参数
+        （无对话前缀复用场景）。
         """
         argv = [
             self._exe_path, "-m", self._model_path,
             "--host", self._host, "--port", str(port),
             "-c", str(self._n_ctx), "-ngl", str(self._n_gpu_layers), "--no-webui",
+            "--cache-prompt", "--cache-reuse", "256",
         ]
         mmproj = find_mmproj_path(self._model_path)
         if mmproj:

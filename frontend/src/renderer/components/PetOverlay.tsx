@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { AudioLines, Eye, Maximize2, Monitor, ShieldCheck, X } from 'lucide-react';
+import { Eye, Maximize2, Mic, Monitor, ShieldCheck, X } from 'lucide-react';
 import VrmAvatar from './VrmAvatar';
 import { normalizeBackendMood, type PetMood } from '../petMood';
 import { usePetMoodFeed } from '../hooks/usePetMoodFeed';
@@ -16,7 +16,7 @@ import {
   transcribeAudio,
   updateSettings,
 } from '../api';
-import { startRecording, type RecordingSession } from '../audioRecorder';
+import { VoiceSession, type VoiceInteractionMode } from '../voiceSession';
 import {
   closePetOverlay,
   dragPetOverlayEnd,
@@ -147,9 +147,11 @@ export default function PetOverlay() {
   const menuRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<DragGestureState | null>(null);
-  /** 语音链路句柄：录音会话 / 朗读中断控制器 */
-  const recordingRef = useRef<RecordingSession | null>(null);
+  /** 语音链路句柄：朗读中断控制器 + 语音会话（20261006 全双工降级版） */
   const speakAbortRef = useRef<AbortController | null>(null);
+  const voiceSessionRef = useRef<VoiceSession | null>(null);
+  /** 语音交互模式（voice.interaction_mode；挂载探测，设置页可切） */
+  const [interactionMode, setInteractionMode] = useState<VoiceInteractionMode>('vad');
 
   // 挂载即校准窗口尺寸（幂等）：主进程建窗固定为默认档，若记忆尺寸非默认，
   // 这里立即把窗口对齐到记忆尺寸，保证「初始 size 与窗口大小一致」
@@ -189,7 +191,12 @@ export default function PetOverlay() {
   // 开关态探测（一次即可；失败静默——按钮按关闭/未授权渲染，点击时再实时取真值）
   useEffect(() => {
     fetchSettings()
-      .then((settings) => setScreenShare(settings?.vision?.enabled ?? false))
+      .then((settings) => {
+        setScreenShare(settings?.vision?.enabled ?? false);
+        // 语音交互模式（voice.interaction_mode；非法/缺失回落 vad）
+        const vMode = settings?.voice?.interaction_mode;
+        if (vMode === 'duplex' || vMode === 'vad') setInteractionMode(vMode);
+      })
       .catch(() => {
         /* 后端不可达：按钮仍可点，点击时按当前本地值取反 */
       });
@@ -200,11 +207,11 @@ export default function PetOverlay() {
       });
   }, []);
 
-  // 卸载收尾：停录音、停朗读（悬浮窗关闭/热重载不留悬挂会话）
+  // 卸载收尾：停语音会话、停朗读（悬浮窗关闭/热重载不留悬挂会话）
   useEffect(() => {
     return () => {
       try {
-        recordingRef.current?.cancel();
+        voiceSessionRef.current?.stop();
       } catch {
         /* no-op */
       }
@@ -256,12 +263,12 @@ export default function PetOverlay() {
     });
   };
 
-  // ---- 语音链路（20261004 悬浮窗语音闭环）：录音 → 识别 → 对话 → 朗读回复 ----
-  // 「说话」是语音输入开关（不是口型动画）：开启录音（聆听），再点停止并把
-  // 识别文本直发 /api/chat/message；回复经流式合成在悬浮窗内朗读（口型由
-  // data-talking 驱动），表情经 pushMood 即时驱动，历史经聊天刷新总线同步主窗口。
+  // ---- 语音链路（20261006 全双工降级版）：麦克风按钮 = 语音会话总开关 ----
+  // 会话内部机制由 voice.interaction_mode 决定（vad=传统自动断句 / duplex=全双工
+  // 按标点切句逐句轮询 LLM，见 voiceSession.ts）；识别/对话/切句/打断编排在
+  // VoiceSession，本组件只提供 speak 句柄（流式合成 + Audio 队列播放）与 UI 接线。
 
-  /** 停止当前朗读（中断流式请求 + 复位状态；录音会话由调用方单独管理）。 */
+  /** 停止当前朗读（中断流式请求 + 复位状态；会话由 VoiceSession 管理）。 */
   const stopSpeaking = useCallback(() => {
     const abort = speakAbortRef.current;
     speakAbortRef.current = null;
@@ -272,26 +279,30 @@ export default function PetOverlay() {
     }
   }, []);
 
-  /** 停掉整段语音会话（朗读 + 录音；关闭悬浮窗 / 开始新一轮前调用）。 */
+  /** 停掉整段语音会话（关闭会话 + 朗读；悬浮窗卸载 / 按钮再点关闭时调用）。 */
   const stopVoiceSession = useCallback(() => {
+    voiceSessionRef.current?.stop();
+    voiceSessionRef.current = null;
     stopSpeaking();
-    const session = recordingRef.current;
-    recordingRef.current = null;
-    try {
-      session?.cancel();
-    } catch {
-      /* no-op */
-    }
     setVoiceState('idle');
   }, [stopSpeaking]);
 
-  /** 朗读回复（流式合成简化版，参考 ChatPage speak/playNext）：播放中驱动口型。 */
-  const speakReply = useCallback(
-    (text: string) => {
+  /**
+   * 播放一段回复（流式合成 + Audio 队列），返回**可打断句柄**：
+   * abort() 停合成 + 停播放（VoiceSession 打断用）、done 播放自然结束后 resolve。
+   * 播放中驱动口型（speaking 态）。
+   */
+  const speakHandle = useCallback(
+    (text: string): { abort: () => void; done: Promise<void> } => {
       stopSpeaking();
+      let resolveDone!: () => void;
+      const done = new Promise<void>((resolve) => {
+        resolveDone = resolve;
+      });
       if (!text.trim()) {
         setVoiceState('idle');
-        return;
+        resolveDone();
+        return { abort: () => {}, done };
       }
       setVoiceState('speaking');
       const controller = new AbortController();
@@ -299,15 +310,21 @@ export default function PetOverlay() {
       const queue: string[] = [];
       let playing = false;
       let finished = false;
+      let current: Audio | null = null;
 
       const playNext = () => {
         const next = queue.shift();
         if (!next) {
           playing = false;
-          if (finished) setVoiceState('idle');
+          current = null;
+          if (finished) {
+            setVoiceState('idle');
+            resolveDone();
+          }
           return;
         }
         const player = new Audio(`data:audio/wav;base64,${next}`);
+        current = player;
         player.onended = () => playNext();
         player.onerror = () => playNext();
         void player.play().catch(() => playNext());
@@ -327,62 +344,68 @@ export default function PetOverlay() {
         },
         () => {
           finished = true;
-          if (!playing && queue.length === 0) setVoiceState('idle');
+          if (!playing && queue.length === 0) {
+            setVoiceState('idle');
+            resolveDone();
+          }
         },
         controller.signal,
       ).catch((err) => {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted) {
+          resolveDone();
+          return;
+        }
         console.error('[Pet] 朗读失败:', err);
         setVoiceState('idle');
+        resolveDone();
       });
+
+      return {
+        abort: () => {
+          controller.abort();
+          try {
+            current?.pause();
+          } catch {
+            /* 播放器未启动时忽略 */
+          }
+          queue.length = 0;
+          setVoiceState('idle');
+          resolveDone();
+        },
+        done,
+      };
     },
     [stopSpeaking],
   );
 
-  /** 「说话」开关：开启录音（聆听）→ 再点停止 → 识别 → 直发对话 → 朗读回复。 */
+  /** 「麦克风」开关（会话总开关）：开启 VoiceSession（按当前模式），再点关闭。 */
   const toggleVoice = useCallback(async () => {
-    if (voiceState === 'listening') {
-      const session = recordingRef.current;
-      recordingRef.current = null;
-      setVoiceState('thinking');
-      try {
-        const audio = await session?.stop();
-        if (!audio) {
-          setVoiceState('idle');
-          return;
-        }
-        const result = await transcribeAudio(audio.audioBase64, audio.sampleRate);
-        const text = result?.ok === true ? (result.text ?? '').trim() : '';
-        if (!text) {
-          setVoiceState('idle');
-          return;
-        }
-        const data = await sendChatMessage({ message: text });
-        const reply = typeof data?.clean_text === 'string' ? data.clean_text.trim() : '';
-        // 表情即时驱动（发布总线 + 本窗口立即生效）；主窗口聊天页经 tick 重载历史
-        pushMood(normalizeBackendMood(data?.mood));
-        publishChatTick();
-        if (reply) {
-          speakReply(reply);
-        } else {
-          setVoiceState('idle');
-        }
-      } catch (err) {
-        console.error('[Pet] 语音对话失败:', err);
-        setVoiceState('idle');
-      }
+    if (voiceSessionRef.current) {
+      stopVoiceSession();
       return;
     }
-    // 其余状态 → 开始新一轮录音（朗读中先停朗读）
-    stopSpeaking();
-    try {
-      recordingRef.current = await startRecording();
-      setVoiceState('listening');
-    } catch (err) {
-      console.error('[Pet] 麦克风不可用:', err);
+    const session = new VoiceSession({
+      mode: interactionMode,
+      transcribe: (base64, sampleRate) => transcribeAudio(base64, sampleRate),
+      chat: async (message) => {
+        const data = await sendChatMessage({ message });
+        return data;
+      },
+      speak: speakHandle,
+      onReplyMeta: (mood) => {
+        // 表情即时驱动（发布总线 + 本窗口立即生效）；主窗口聊天页经 tick 重载历史
+        pushMood(normalizeBackendMood(mood));
+        publishChatTick();
+      },
+      onStateChange: (s) => setVoiceState(s === 'processing' ? 'thinking' : s),
+    });
+    voiceSessionRef.current = session;
+    const ok = await session.start();
+    if (!ok) {
+      voiceSessionRef.current = null;
       setVoiceState('idle');
     }
-  }, [voiceState, pushMood, speakReply, stopSpeaking]);
+  }, [interactionMode, pushMood, speakHandle, stopVoiceSession]);
 
   /** 屏幕共享开关：乐观翻转 + 热更新 vision.enabled；失败回退并留痕。 */
   const toggleScreenShare = useCallback(() => {
@@ -469,7 +492,8 @@ export default function PetOverlay() {
 
   // ---- 弧形菜单项（顺序即弧上顺序：左→上→右，共六项） ----
   // 对齐 CX-O 应用控制语义（20261004_模块0_悬浮窗语音/视觉/授权闭环）：
-  // 打开主窗口 / 说话（语音输入开关）/ 屏幕共享 / 操作授权 / 大小 / 关闭。
+  // 打开主窗口 / 麦克风（语音会话总开关，20261006 由「说话」改名）/ 屏幕共享 /
+  // 操作授权 / 大小 / 关闭。
   const menuItems: PetMenuItem[] = [
     {
       key: 'open-main',
@@ -483,9 +507,9 @@ export default function PetOverlay() {
     },
     {
       key: 'talk',
-      name: '说话',
-      icon: <AudioLines className="pet-overlay-menu-ico" aria-hidden="true" />,
-      checked: voiceState === 'listening',
+      name: '麦克风',
+      icon: <Mic className="pet-overlay-menu-ico" aria-hidden="true" />,
+      checked: voiceState !== 'idle',
       onSelect: () => {
         void toggleVoice();
       },
@@ -592,10 +616,14 @@ export default function PetOverlay() {
                   </span>
                 )}
                 {item.slider && (() => {
-                  // 滑块胶囊挂在圆钮正下方（左挂会压住弧上相邻按钮），JS 计算位置并 clamp 到窗口内
+                  // 滑块胶囊挂在圆钮正下方。注意：按钮自身是 absolute 定位上下文，
+                  // left/top 必须用**相对按钮**的坐标——水平约束先按窗口系 clamp
+                  // （保证胶囊完整可见）再换算回按钮系；垂直固定挂按钮正下方 6px
+                  // （左挂会压住弧上相邻按钮）。
                   const pillW = Math.round(176 * scale);
-                  const pillLeft = Math.max(6, Math.min(x - pillW / 2, vw - pillW - 6));
-                  const pillTop = y + half + 6;
+                  const pillLeftWin = Math.max(6, Math.min(x - pillW / 2, vw - pillW - 6));
+                  const pillLeft = pillLeftWin - (x - half);
+                  const pillTop = btn + 6;
                   return (
                     <span
                       className="pet-overlay-slider"

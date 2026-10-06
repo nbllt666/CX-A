@@ -51,12 +51,16 @@ DEFAULTS = {
     # backend：llama.cpp 后端构建选择（""(默认=CUDA/CPU 构建)/"cuda"/"vulkan"），
     # 由 accel_plan 产出（20261002 批 A）：vulkan 时 llama-server 取
     # runtime/llama_vulkan 目录（缺失回退默认目录），非法值归一 ""。
+    # gpu_preference（20261006 LLM 显卡切换）：""（默认，按运行模式自动——
+    # 性能=独显优先、省电=核显）/"igpu" 强制核显/"dgpu" 强制独显；
+    # accel_plan 覆盖入口（唯一真相源消费），非法值归一 ""。
     "local_llm": {
         "enabled": False,
         "model_path": "",
         "source": "modelscope",
         "device": "cpu",
         "backend": "",
+        "gpu_preference": "",
     },
     #: 统一下载源（首启向导 spec「统一下载源配置」）：channel 为镜像 / 官方通道的
     #: 单一真相源，同时决定 pip 依赖索引与 HuggingFace 端点；派生规则集中在
@@ -99,6 +103,10 @@ DEFAULTS = {
     },
     "asr": {"engine": "sensevoice", "device": "cpu"},
     "vad": {"mode": "webrtc"},
+    # 语音交互模式（20261006 全双工降级版迁移）：vad=传统自动断句（能量 VAD
+    # 说话自动录、静音自动发）；duplex=全双工降级（持续采集 + 按标点切句逐句
+    # 轮询 LLM + 打断）。非法值归一 "vad"。
+    "voice": {"interaction_mode": "vad"},
     "memory": {
         "max_memories": 30,
         "dedup": 0.85,
@@ -160,6 +168,9 @@ HOT_RELOAD_SECTIONS = (
     "tts",
     "asr",
     "vad",
+    #: voice 段（语音交互模式，20261006 全双工降级版）纳入热更新——切换后
+    #: 下一次语音会话开启即按新模式运行，无需重启。
+    "voice",
     "memory",
     "computer_control",
     "sync",

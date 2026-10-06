@@ -912,15 +912,21 @@ export interface SettingsView {
   download?: { channel: DownloadChannel };
   /**
    * ready = 本地小模型是否已下载就绪（设置页据此展示「本地大脑已就绪」徽标）；
-   * model_path = 当前模型文件路径（设置页档位卡展示用；后端未给时前端隐藏该行）
+   * model_path = 当前模型文件路径（设置页档位卡展示用；后端未给时前端隐藏该行）；
+   * gpu_preference = LLM 显卡偏好（"" 自动 / igpu 核显 / dgpu 独显；20261006，旧后端缺失时前端按自动处理）
    */
-  local_llm: { enabled: boolean; ready?: boolean; model_path?: string };
+  local_llm: { enabled: boolean; ready?: boolean; model_path?: string; gpu_preference?: string };
   acp: { enabled: boolean };
   remote: { enabled: boolean };
   /** 主动视觉开关（视图新增字段；旧后端缺失时前端按关闭处理） */
   vision?: { enabled: boolean };
   /** 聊天记忆注入开关（RAG 闭环，20261005；旧后端缺失时前端按开启处理） */
   memory?: { context_inject: boolean };
+  /**
+   * 语音交互模式（20261006 全双工降级版）：vad=传统自动断句 / duplex=全双工
+   * （按标点切句逐句轮询 LLM）；旧后端缺失时前端按 vad 处理
+   */
+  voice?: { interaction_mode: 'vad' | 'duplex' };
 }
 
 /** PUT /api/settings 响应（配置视图 + 可选语音桥重建结果）。 */
@@ -1035,6 +1041,12 @@ export interface HardwareProfile {
   cuda_version: string | null;
   disk_free_gb: number | null;
   probe_notes: string[];
+  /** 是否含核显（GPU 清单枚举结论；探测失败/旧后端缺失 → undefined，前端保守显示全部选项） */
+  has_igpu?: boolean;
+  /** 首个已知独显厂商（nvidia/amd/intel；无独显 → null，字段缺失 → undefined） */
+  dgpu_vendor?: string | null;
+  /** GPU 清单（vendor/name/type/vram_hint）；探测失败降级时缺失 */
+  gpus?: Array<{ vendor: string; name: string; type: string; vram_hint: string }>;
 }
 
 /** 一个候选模型档位（含体积与适用条件，用于「我自己挑」） */
