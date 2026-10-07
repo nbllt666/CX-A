@@ -326,7 +326,7 @@ def test_backend_entry_dev_root_and_args(tmp_path, monkeypatch):
         "--host", "127.0.0.1",
         "--port", "8600",
         "--data-dir", os.path.join(str(tmp_path), "data"),
-        # H-3（第三轮体检批次4）：--config 指向便携根顶层（与安装链统一真相源）
+        # H-3（第三轮体检批次4）：--config 指向应用根顶层（与安装链统一真相源）
         "--config", os.path.join(str(tmp_path), "config.json"),
     ]
 
@@ -424,7 +424,7 @@ def test_check_port_bindable_probe_real_port():
 
 
 def test_api_server_config_path_unifies_install_and_runtime(tmp_path):
-    """H-3：config_path 指向便携根顶层 config.json 时，服务读写同一真相源。
+    """H-3：config_path 指向应用根顶层 config.json 时，服务读写同一真相源。
 
     模拟安装链先写根 config.json（bootstrap.init_workplace 同口径），再以
     create_app(data_dir, config_path) 起服——运行链 PUT settings 落盘到根
@@ -504,7 +504,7 @@ def test_settings_put_api_key_encrypted_and_hidden(tmp_path):
 
 
 def test_app_root_frozen_resolves_portable_root(tmp_path, monkeypatch):
-    """M-14：frozen-aware app_root——冻结态从 sys.executable 上溯到便携根。"""
+    """M-14：frozen-aware app_root——冻结态从 sys.executable 上溯到应用根。"""
     from lite.config import paths as paths_mod
 
     fake_exe = tmp_path / "runtime" / "backend" / "backend.exe"
@@ -537,13 +537,11 @@ def test_bootstrap_ensure_dirs_covers_required(tmp_path):
 
 
 # ------------------------------------------------------------------ #
-# build：便携包组装与压缩（打包链路步骤4）                             #
+# build：安装程序载荷组装（installer.iss PayloadDir 来源）             #
 # ------------------------------------------------------------------ #
 
-def test_build_assemble_and_zip(tmp_path):
-    """assemble 平铺壳产物 + 落位后端 + bootstrap 初始化；zip 含关键条目。"""
-    import zipfile
-
+def test_build_assemble(tmp_path):
+    """assemble 平铺壳产物 + 落位后端 + bootstrap 初始化（载荷目录齐备）。"""
     from installer import build as build_mod
 
     # 伪造 Electron 壳产物（CX-A.exe 位于根）
@@ -570,85 +568,6 @@ def test_build_assemble_and_zip(tmp_path):
     # bootstrap 初始化产物：数据目录 + 默认 config
     assert os.path.isdir(os.path.join(portable_root, "data", "lancedb"))
     assert os.path.isfile(os.path.join(portable_root, "config.json"))
-    # 批次E：模拟 bundled 组件资产落入 manifest install_target（data/local_llm/...），
-    # 验证白名单内的内置组件目录应随包分发
-    marker = os.path.join(
-        portable_root, "data", "local_llm", "qwen3-embedding-0.6b", "model.gguf"
-    )
-    os.makedirs(os.path.dirname(marker), exist_ok=True)
-    with open(marker, "wb") as fh:
-        fh.write(b"fake-gguf")
-
-    # zip：固定顶层前缀 + 关键条目 + 运行期产物排除（A-1/A-4，批次E修订）
-    release_dir = str(tmp_path / "rel")
-    zip_path = build_mod.zip_portable(portable_root, release_dir)
-    assert os.path.isfile(zip_path)
-    assert os.path.getsize(zip_path) > 0
-    with zipfile.ZipFile(zip_path) as zf:
-        names = [n.replace("\\", "/") for n in zf.namelist()]
-    # A-4：所有条目恒以 CX-A-portable/ 顶层前缀开头（与实际目录名 portable 解耦）
-    assert names, "zip 不应为空"
-    assert all(n.startswith("CX-A-portable/") for n in names)
-    assert "CX-A-portable/CX-A.exe" in names
-    assert "CX-A-portable/runtime/backend/backend.exe" in names
-    # A-1：顶层 config.json 与运行期产物（memories.db / logs）不入包
-    assert "CX-A-portable/config.json" not in names
-    assert "CX-A-portable/data/memories.db" not in names
-    assert not any(n.startswith("CX-A-portable/logs/") for n in names)
-    # 批次E：manifest 白名单内的内置组件目录随包分发（不再 data/ 整棵缺席）
-    assert "CX-A-portable/data/local_llm/qwen3-embedding-0.6b/model.gguf" in names
-
-
-def test_zip_portable_excludes_user_data_and_fixed_prefix(tmp_path):
-    """A-1/A-4 专测（批次E修订）：运行期产物不入包、内置组件目录保留、顶层前缀固定。"""
-    import zipfile
-
-    from installer import build as build_mod
-
-    # 故意使用非 CX-A-portable 的目录名：验证前缀与实际目录名解耦
-    root = tmp_path / "portable-with-timestamp"
-    (root / "resources").mkdir(parents=True)
-    (root / "CX-A.exe").write_bytes(b"fake-shell")
-    (root / "resources" / "app.asar").write_bytes(b"fake-asar")
-    (root / "runtime" / "backend" / "_internal").mkdir(parents=True)
-    (root / "runtime" / "backend" / "backend.exe").write_bytes(b"fake-backend")
-    (root / "runtime" / "backend" / "_internal" / "lib.dll").write_bytes(b"fake-dll")
-    # 运行期产物：顶层 config.json + memories.db + 白名单外 data 子目录 + logs/
-    (root / "config.json").write_text('{"cloud": {}}', encoding="utf-8")
-    (root / "data").mkdir(parents=True)
-    (root / "data" / "memories.db").write_bytes(b"sqlite-payload")
-    (root / "data" / "runtime_tables").mkdir(parents=True)
-    (root / "data" / "runtime_tables" / "user.tbl").write_bytes(b"user-runtime")
-    (root / "logs").mkdir(parents=True)
-    (root / "logs" / "app.log").write_text("log-line", encoding="utf-8")
-    # 内置组件目录（模拟 bundled 资产落入 manifest install_target 白名单）
-    (root / "data" / "lancedb").mkdir(parents=True)
-    (root / "data" / "lancedb" / "vectors-0001.lance").write_bytes(b"builtin-vectors")
-    (root / "data" / "local_llm" / "qwen3-embedding-0.6b").mkdir(parents=True)
-    (root / "data" / "local_llm" / "qwen3-embedding-0.6b" / "model.gguf").write_bytes(
-        b"fake-gguf"
-    )
-
-    zip_path = build_mod.zip_portable(str(root), str(tmp_path / "rel"))
-
-    with zipfile.ZipFile(zip_path) as zf:
-        names = [n.replace("\\", "/") for n in zf.namelist()]
-
-    # A-4：顶层目录恒为 CX-A-portable/，与实际目录名 portable-with-timestamp 无关
-    assert names, "zip 不应为空"
-    assert all(n.startswith("CX-A-portable/") for n in names)
-    assert "CX-A-portable/CX-A.exe" in names
-    assert "CX-A-portable/resources/app.asar" in names
-    assert "CX-A-portable/runtime/backend/backend.exe" in names
-    assert "CX-A-portable/runtime/backend/_internal/lib.dll" in names
-    # A-1：运行期产物缺席（顶层 config.json / memories.db / 白名单外 data 子目录 / logs）
-    assert "CX-A-portable/config.json" not in names
-    assert "CX-A-portable/data/memories.db" not in names
-    assert not any(n.startswith("CX-A-portable/data/runtime_tables/") for n in names)
-    assert not any(n.startswith("CX-A-portable/logs/") for n in names)
-    # 批次E：manifest 白名单内的内置组件目录随包分发
-    assert "CX-A-portable/data/lancedb/vectors-0001.lance" in names
-    assert "CX-A-portable/data/local_llm/qwen3-embedding-0.6b/model.gguf" in names
 
 
 def test_build_skip_electron_rejects_incomplete_artifacts(tmp_path, monkeypatch):
@@ -663,7 +582,7 @@ def test_build_skip_electron_rejects_incomplete_artifacts(tmp_path, monkeypatch)
     alt_out = str(tmp_path / "alt-out")
     with pytest.raises(SystemExit):
         build_mod.main([
-            "--skip-frontend", "--skip-electron", "--skip-backend", "--skip-zip",
+            "--skip-frontend", "--skip-electron", "--skip-backend",
             "--output", alt_out,
         ])
 
@@ -673,7 +592,7 @@ def test_build_skip_electron_rejects_incomplete_artifacts(tmp_path, monkeypatch)
         fh.write("leftover")
     with pytest.raises(SystemExit):
         build_mod.main([
-            "--skip-frontend", "--skip-electron", "--skip-backend", "--skip-zip",
+            "--skip-frontend", "--skip-electron", "--skip-backend",
             "--output", alt_out,
         ])
 
@@ -684,12 +603,12 @@ def test_build_skip_electron_rejects_incomplete_artifacts(tmp_path, monkeypatch)
     os.makedirs(work_dist, exist_ok=True)
     with open(os.path.join(work_dist, "backend.exe"), "wb") as fh:
         fh.write(b"fake-backend")
-    # 20260926：本用例只校验便携根组装结果，安装器编译为副作用——若走真实 ISCC
-    # 会对 installer/bundled 全量资产做分钟级 lzma 编译（本轮起还含 649MB 嵌入模型）。
+    # 本用例只校验载荷组装结果，安装器编译为副作用——若走真实 ISCC
+    # 会对 installer/bundled 全量资产做分钟级 lzma 编译（含 649MB 嵌入模型）。
     # 屏蔽编译器探测，让安装器步骤按"未检测到编译器"路径快速跳过（产物断言不受影响）。
     monkeypatch.setattr(build_mod, "find_iscc", lambda: None)
     build_mod.main([
-        "--skip-frontend", "--skip-electron", "--skip-backend", "--skip-zip",
+        "--skip-frontend", "--skip-electron", "--skip-backend",
         "--output", alt_out,
     ])
     assert os.path.isfile(os.path.join(alt_out, "portable", build_mod.ELECTRON_SHELL_EXE))
@@ -1257,34 +1176,25 @@ def test_t5_first_run_explicit_eco_with_igpu_writes_plan(tmp_path, monkeypatch):
 # 悬浮桌宠模型：文件型内置组件随包分发（20260924_模块0_接入VRM悬浮桌宠）  #
 # ------------------------------------------------------------------ #
 
-def test_zip_portable_keeps_file_type_builtin_target(tmp_path):
-    """文件型 install_target 保留进 zip：``data/pet/cx-open.vrm`` 命中白名单（精确匹配）。"""
-    import zipfile
+def test_manifest_registers_file_type_builtin_target():
+    """文件型 install_target 登记：``data/pet/cx-open.vrm`` 命中 manifest（精确匹配）。
 
-    from installer import build as build_mod
+    便携 zip 已移除（20261007 产品裁决：唯一交付物为安装程序），随包分发由
+    Inno Setup 载荷展开承担——载荷目录即 assemble 产物（含 bootstrap 落位的
+    data/pet/cx-open.vrm），此处保留 manifest 真相源断言防登记漂移。
+    """
+    from installer import bootstrap
 
-    root = tmp_path / "portable-file-target"
-    root.mkdir(parents=True)
-    (root / "CX-A.exe").write_bytes(b"fake-shell")
-    (root / "data" / "pet").mkdir(parents=True)
-    (root / "data" / "pet" / "cx-open.vrm").write_bytes(b"CXA-FAKE-VRM")
-    # 对照：白名单外的运行期产物仍应被排除
-    (root / "data" / "memories.db").write_bytes(b"sqlite-payload")
-
-    # 白名单真相源为 manifest：pet_model 组件已登记该文件型 install_target
     rel_target = os.path.normpath(os.path.join("data", "pet", "cx-open.vrm"))
-    whitelist = build_mod._bundled_data_whitelist()
-    assert rel_target in whitelist
-    assert build_mod._under_whitelist(rel_target, whitelist) is True
-
-    zip_path = build_mod.zip_portable(str(root), str(tmp_path / "rel"))
-    with zipfile.ZipFile(zip_path) as zf:
-        names = [n.replace("\\", "/") for n in zf.namelist()]
-    assert "CX-A-portable/data/pet/cx-open.vrm" in names
-    assert "CX-A-portable/data/memories.db" not in names
+    manifest = bootstrap.load_manifest()
+    install_targets = [
+        os.path.normpath(str(comp.get("install_target", "")))
+        for comp in manifest.get("components", [])
+    ]
+    assert rel_target in install_targets
 
 # ------------------------------------------------------------------ #
-# 安装器分发：语音桥落位 + Inno Setup 编译（步骤6）                     #
+# 安装器分发：语音桥落位 + Inno Setup 编译（步骤5）                     #
 # ------------------------------------------------------------------ #
 
 def test_assemble_places_voice_bridge_dispatch_script(tmp_path):
@@ -1293,8 +1203,6 @@ def test_assemble_places_voice_bridge_dispatch_script(tmp_path):
     客户端（voice_bridge_client._resolve_script）**仅认该分发落点**——缺它则打包态
     语音全部降级为 Mock；单一真相源为源码文件，此处断言字节一致。
     """
-    import zipfile
-
     from installer import build as build_mod
 
     electron_dist = tmp_path / "win-unpacked"
@@ -1312,12 +1220,6 @@ def test_assemble_places_voice_bridge_dispatch_script(tmp_path):
     assert os.path.isfile(bridge_dst)
     with open(bridge_dst, "rb") as dst_fh, open(bridge_src, "rb") as src_fh:
         assert dst_fh.read() == src_fh.read()
-
-    # 随包分发（zip 收录 runtime/ 树）
-    zip_path = build_mod.zip_portable(portable_root, str(tmp_path / "rel"))
-    with zipfile.ZipFile(zip_path) as zf:
-        names = [n.replace("\\", "/") for n in zf.namelist()]
-    assert "CX-A-portable/runtime/voice_bridge/bridge.py" in names
 
 
 def test_find_iscc_returns_none_without_install(tmp_path, monkeypatch):

@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
-"""一键打包编排（打包链路步骤4）——产出 Windows 便携目录 + zip。
+"""一键打包编排——产出 Windows 独立安装程序（Inno Setup）。
 
-产物形态（与 installer/bootstrap.py、manifest.json 对齐）：
-    <project>/release/portable/
-        CX-A.exe                     ← Electron 壳（electron-builder --dir 产物）
-        resources/...                ← 壳运行时
-        runtime/backend/backend.exe  ← PyInstaller 后端（installer/backend_entry.py）
-        runtime/electron/...         ← （manifest 记录位；壳即根，不再重复落位）
-        data/...                     ← 数据目录（bootstrap.install 初始化）
-        config.json                  ← 默认配置（首启引导可改）
-    <project>/release/CX-A-portable-win64.zip
+产物形态：
+    <project>/release/CX-A-Setup-<版本>.exe   ← 唯一交付物（用户安装）
+    <project>/release/portable/               ← 安装程序载荷中转目录（非交付物）
 
-流程：工具探测 → renderer 构建 → Electron 壳 → PyInstaller 后端 → 组装 → zip。
+流程：工具探测 → renderer 构建 → Electron 壳 → PyInstaller 后端
+→ 载荷组装（release/portable，壳 + 后端 + 数据目录初始化；即 installer.iss
+的 PayloadDir 来源）→ Inno Setup 编译安装程序。
 每步可用 ``--skip-*`` 跳过（增量构建）；工具缺失时给出明确安装指引后退出，
 不静默失败。全中文 [INFO]/[WARN] 输出，带时间戳。
 """
@@ -24,7 +20,6 @@ import shutil
 import subprocess
 import sys
 import time
-import zipfile
 
 # GBK 控制台防崩：electron-builder / vite 输出常含 U+2022 等非 GBK 字符，
 # print 直写 GBK 控制台会抛 UnicodeEncodeError 并掩盖真实构建失败原因。
@@ -59,12 +54,8 @@ ELECTRON_UNPACKED = os.path.join(FRONTEND_DIR, "release", "win-unpacked")
 ELECTRON_SHELL_EXE = "CX-A.exe"
 #: PyInstaller 后端产物目录名（--distpath 下的 backend/）。
 BACKEND_DIST_NAME = "backend"
-#: 便携根目录名。
+#: 安装程序载荷中转目录名（组装后交由 Inno Setup 打入安装程序，非交付物）。
 PORTABLE_DIR_NAME = "portable"
-#: 最终 zip 名。
-ZIP_BASENAME = "CX-A-portable-win64"
-#: zip 内固定顶层目录前缀（A-4：与便携根实际目录名解耦，解压结果恒定）。
-ZIP_TOP_DIR = "CX-A-portable/"
 
 
 def _log_info(message):
@@ -299,14 +290,14 @@ def _copytree_contents(src, dst):
 
 
 def _prepare_portable_root(output_dir):
-    """确定本次组装的便携根目录，规避 Windows 文件锁。
+    """确定本次组装的载荷目录，规避 Windows 文件锁。
 
     IDE 索引 / 杀毒服务等可能对上一次产物中的文件（如 app.asar）持长期独占
     句柄，导致清理重建失败。策略：优先清理复用固定目录；清理失败则自动改用
     带时间戳的新目录，保证主流程不被环境锁阻断（旧目录留给用户手动删）。
 
     :param output_dir: 产物输出目录。
-    :return: str 可用的便携根绝对路径。
+    :return: str 可用的载荷目录绝对路径。
     """
     base = os.path.join(output_dir, PORTABLE_DIR_NAME)
     if not os.path.isdir(base):
@@ -323,22 +314,23 @@ def _prepare_portable_root(output_dir):
 
 
 def assemble(electron_dist, backend_dist, portable_root):
-    """组装便携根：壳产物为根 + runtime/backend + 数据目录初始化。
+    """组装安装程序载荷目录：壳产物为根 + runtime/backend + 数据目录初始化。
 
     纯文件操作，便于单测（tmp_path 注入）。幂等：已存在则重建。
+    本目录是 installer.iss 的 PayloadDir 来源（Inno Setup 打包素材），非交付物。
 
     :param electron_dist: electron-builder 产物目录（win-unpacked）。
     :param backend_dist: PyInstaller 后端产物目录。
-    :param portable_root: 便携根输出目录。
+    :param portable_root: 载荷目录输出路径。
     :return: str portable_root。
     """
-    _log_info(f"步骤4：组装便携根 -> {portable_root}")
+    _log_info(f"步骤4：组装安装程序载荷 -> {portable_root}")
     if os.path.isdir(portable_root):
         # 调用方已通过 _prepare_portable_root 保证可写；此处防御性兜底
         _rmtree_retry(portable_root)
     os.makedirs(portable_root, exist_ok=True)
 
-    # 壳产物内容平铺为便携根（CX-A.exe 位于根）
+    # 壳产物内容平铺为载荷目录根（CX-A.exe 位于根）
     _copytree_contents(electron_dist, portable_root)
 
     # 后端 -> runtime/backend/
@@ -378,96 +370,12 @@ def assemble(electron_dist, backend_dist, portable_root):
     bootstrap.install_builtin_assets(portable_root)
     bootstrap.init_workplace(portable_root)
 
-    _log_info("便携根组装完成。")
+    _log_info("载荷组装完成。")
     return portable_root
 
 
-def _bundled_data_whitelist():
-    """从 manifest 读取落在 data/ 前缀下的内置组件目录，构造 zip 保留白名单。
-
-    单一真相源为 installer/manifest.json（经 bootstrap.load_manifest 读取，懒加载
-    与 assemble 同模式）。返回 os.sep 归一化的相对路径列表；manifest 缺失/损坏时
-    返回空列表，zip 侧退化为 data/ 整棵排除的保守行为（与旧口径一致，天然兜底）。
-
-    :return: list[str] 形如 "data\\lancedb" 的白名单前缀（Windows 下 os.sep 归一）。
-    """
-    try:
-        from installer import bootstrap
-
-        manifest = bootstrap.load_manifest()
-        prefixes = []
-        for comp in manifest.get("components", []):
-            rel = os.path.normpath(str(comp.get("install_target", "")))
-            if rel == "data" or rel.startswith("data" + os.sep):
-                prefixes.append(rel)
-        return prefixes
-    except (ImportError, OSError, ValueError, KeyError, TypeError):
-        # 清单缺失 / JSON 损坏 / 结构异常：保守退化为 data/ 整棵排除
-        return []
-
-
-def _under_whitelist(rel_path, prefixes):
-    """判定相对路径命中白名单前缀（与前缀相等或位于其目录树下）。
-
-    :param rel_path: 相对便携根的文件路径（os.sep 归一）。
-    :param prefixes: _bundled_data_whitelist 返回的前缀列表。
-    :return: True 表示该文件属内置组件目录，应保留入 zip。
-    """
-    return any(rel_path == p or rel_path.startswith(p + os.sep) for p in prefixes)
-
-
-def zip_portable(portable_root, release_dir):
-    """把便携根压成 zip（步骤5）。
-
-    用户数据排除（A-1，批次E修订）：便携根顶层 config.json、data/ 下白名单外
-    内容（memories.db 等运行期生成物）与 logs/ 树不写入 zip，避免升级解压覆盖
-    用户配置（含 Fernet 加密 Key）与记忆库；首启由 backend_entry/启动链
-    auto-init 按默认值重新生成。
-    内置组件保留（批次E）：manifest 各组件 install_target 落在 data/ 下的目录
-    （local_llm / lancedb / voices/cx-open / SenseVoiceSmall）为 bundled 资产
-    落位点，随包分发——打包期便携根由 assemble 全新组装，仅含 bundled 资产与
-    bootstrap 初始化产物，不含终端用户运行数据，无覆盖风险。
-    顶层目录固定（A-4）：arcname 恒以 CX-A-portable/ 前缀开头，与便携根
-    实际目录名解耦（清理失败回退的 portable-<时间戳> 目录解压结果一致）。
-
-    :param portable_root: 便携根目录。
-    :param release_dir: zip 输出目录。
-    :return: str zip 绝对路径。
-    """
-    os.makedirs(release_dir, exist_ok=True)
-    zip_path = os.path.join(release_dir, f"{ZIP_BASENAME}.zip")
-    if os.path.exists(zip_path):
-        os.remove(zip_path)
-    whitelist = _bundled_data_whitelist()
-    _log_info(f"步骤5：压缩 -> {zip_path}")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for base, _dirs, files in os.walk(portable_root):
-            rel_base = os.path.relpath(base, portable_root)
-            # 批次E：logs/ 为运行期日志产物，整棵不入包
-            if rel_base.split(os.sep)[0] == "logs":
-                continue
-            for name in files:
-                # A-1：便携根顶层的 config.json 为用户配置，不入包
-                if rel_base == "." and name == "config.json":
-                    continue
-                full = os.path.join(base, name)
-                rel_file = os.path.relpath(full, portable_root)
-                # A-1（批次E修订）：data/ 不再整棵剪枝——manifest 白名单内的
-                # 内置组件目录保留入包；memories.db 等白名单外运行期产物仍排除
-                if rel_file.split(os.sep)[0] == "data" and not _under_whitelist(
-                    rel_file, whitelist
-                ):
-                    continue
-                # A-4：arcname 固定 CX-A-portable/ 前缀，与实际目录名解耦
-                rel = ZIP_TOP_DIR + rel_file
-                zf.write(full, rel)
-    size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-    _log_info(f"zip 完成：{size_mb:.1f} MB")
-    return zip_path
-
-
 # ------------------------------------------------------------------ #
-# CLI 编排                                                            #
+# 安装程序编译                                                        #
 # ------------------------------------------------------------------ #
 
 def _app_version():
@@ -502,17 +410,17 @@ def find_iscc():
 
 
 def build_installer(portable_root, release_dir, version=None):
-    """步骤6：编译独立安装程序（Inno Setup）——载荷展开 + 安装期一次性装配运行时。
+    """步骤5：编译独立安装程序（Inno Setup）——载荷展开 + 安装期一次性装配运行时。
 
     非阻断口径（与既有工具探测一致）：ISCC 未安装、运行时源缺失或编译失败时
-    仅告警，不阻断主链路（便携根与 zip 产物不受影响）。
+    仅告警，不阻断主链路（载荷目录产物不受影响）。
 
-    :param portable_root: 本次组装的便携根（载荷来源）。
+    :param portable_root: 本次组装的载荷目录（安装素材来源）。
     :param release_dir: 安装程序输出目录。
     :param version: 版本号；缺省读 :func:`_app_version`。
     :return: str 安装程序 exe 路径；跳过/失败时返回 None。
     """
-    _log_info("步骤6：编译独立安装程序（Inno Setup）…")
+    _log_info("步骤5：编译独立安装程序（Inno Setup）…")
     iscc = find_iscc()
     if iscc is None:
         _log_warn(
@@ -541,7 +449,7 @@ def build_installer(portable_root, release_dir, version=None):
     if missing:
         _log_warn(
             "随包运行时源缺失（" + "、".join(missing) + "），跳过安装程序编译"
-            "（便携包产物不受影响；填充 installer/bundled/ 后重跑即可）"
+            "（载荷目录不受影响；填充 installer/bundled/ 后重跑即可）"
         )
         return None
 
@@ -575,12 +483,11 @@ def build_installer(portable_root, release_dir, version=None):
 
 def main(argv=None):
     """CLI 入口：解析 --skip-* 与 --output，顺序执行全流程。"""
-    parser = argparse.ArgumentParser(prog="installer.build", description="CX-A 便携包一键打包编排")
+    parser = argparse.ArgumentParser(prog="installer.build", description="CX-A 安装程序一键打包编排")
     parser.add_argument("--skip-frontend", action="store_true", help="跳过 renderer 构建（复用 frontend/dist）")
     parser.add_argument("--skip-electron", action="store_true", help="跳过 Electron 壳打包（复用 win-unpacked）")
     parser.add_argument("--skip-backend", action="store_true", help="跳过后端打包（复用已有 runtime/backend）")
-    parser.add_argument("--skip-zip", action="store_true", help="只组装便携目录，不压缩 zip")
-    parser.add_argument("--skip-installer", action="store_true", help="跳过独立安装程序编译（Inno Setup）")
+    parser.add_argument("--skip-installer", action="store_true", help="跳过独立安装程序编译（Inno Setup），只组装载荷目录")
     parser.add_argument("--output", default=RELEASE_DIR, help="产物输出目录（默认 <项目>/release）")
     args = parser.parse_args(argv)
 
@@ -612,13 +519,10 @@ def main(argv=None):
     portable_root = _prepare_portable_root(args.output)
     assemble(electron_dist, backend_dist, portable_root)
 
-    if not args.skip_zip:
-        zip_portable(portable_root, args.output)
-
     if not args.skip_installer:
         build_installer(portable_root, args.output)
 
-    _log_info(f"全流程完成。便携根：{portable_root}")
+    _log_info(f"全流程完成。载荷目录：{portable_root}")
     return portable_root
 
 

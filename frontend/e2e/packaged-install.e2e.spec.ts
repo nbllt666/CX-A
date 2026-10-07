@@ -6,19 +6,21 @@ import path from 'node:path';
 /**
  * 打包态「全新安装」实跑（默认不参与门禁，需显式启用）。
  *
- * 与其余 E2E 的区别：本用例打的是**便携包产物**，不是源码 + dist：
- *   `release/CX-A-portable-win64.zip` → 解压 → `<root>/CX-A.exe`（自带 runtime/backend/backend.exe
- *   与 data/pet/cx-open.vrm，顶层无 config.json = 真·全新安装）。
+ * 与其余 E2E 的区别：本用例打的是**打包产物**，不是源码 + dist：
+ *   `release/portable/`（安装程序载荷目录，与 CX-A-Setup 安装后的目录一致）
+ *   → `<root>/CX-A.exe`（自带 runtime/backend/backend.exe 与 data/pet/cx-open.vrm，
+ *   顶层无 config.json = 真·全新安装）。便携 zip 已移除（20261007 产品裁决：
+ *   唯一交付物为安装程序），本用例改以载荷目录为载体。
  *
  * 为什么要单独一关：源码态 E2E 无法覆盖「首启门控 + 打包后的后端拉起 + 内置模型路径」三者
  * 叠加的真实路径——上一轮的教训正是「源码里对了、包里的旧产物不对」，用户看到的是包。
  *
  * 覆盖链路：首启向导出现（配置未完成）→ 向导阶段不出悬浮窗 → 走完 5 步并提交（POST
  * /api/setup/complete）→ 主界面 → 自动拉起透明悬浮窗 → VRM `data-vrm-state="ready"` +
- * canvas 286px → 便携根 config.json 落盘 `completed: true`。
+ * canvas 286px → 载荷根 config.json 落盘 `completed: true`。
  *
  * 启用方式（默认 skip，避免无产物环境下误红）：
- *   $env:PW_PACKAGED=1; $env:CXA_PACKAGED_ROOT='<解压后的核心根，即含 CX-A.exe 的目录>'
+ *   $env:PW_PACKAGED=1; $env:CXA_PACKAGED_ROOT='<release/portable 目录>'
  *   npx playwright test e2e/packaged-install.e2e.spec.ts
  * 可选：CXA_PACKAGED_SHOT=<截图落盘目录>
  */
@@ -88,7 +90,7 @@ test.describe.serial('打包态全新安装实跑', () => {
   /** 用例前置：包内有 exe 与内置模型（缺失即失败，不静默跳过）。 */
   function assertPrereqs(): void {
     const exe = path.join(PACKAGED_ROOT, 'CX-A.exe');
-    expect(fs.existsSync(exe), `便携包可执行文件不存在：${exe}`).toBe(true);
+    expect(fs.existsSync(exe), `打包产物可执行文件不存在：${exe}`).toBe(true);
     expect(
       fs.existsSync(path.join(PACKAGED_ROOT, 'data', 'pet', 'cx-open.vrm')),
       '包内缺少内置模型 data/pet/cx-open.vrm',
