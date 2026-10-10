@@ -331,13 +331,17 @@ export default function VrmAvatar({ mood, talking, size = 220, reloadKey = 0 }: 
   const [failReason, setFailReason] = useState<string>('');
   const hostRef = useRef<HTMLDivElement | null>(null);
   const vrmRef = useRef<VRM | null>(null);
+  /** 渲染器 / 相机引用：供尺寸自适应 effect 轻量更新（见 [size] effect） */
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const moodRef = useRef<PetMood>(mood);
   const talkingRef = useRef<boolean>(talking);
   const prevExprRef = useRef<string | null>(null);
 
   // ---- 初始化：创建渲染器 → 取模型 → 解析 → 自适应相机 → 启动动画循环 ----
   // 依赖为 [reloadKey]：模型代际变化（更换桌宠模型）时清理旧渲染并按新代际重新拉取；
-  // 其余重挂载（PetOverlay 换尺寸档位经 key={size}）命中模块级缓存（代际一致），零请求零等待。
+  // 尺寸变化不走本 effect（见下方 [size] 自适应 effect，仅重设 drawing buffer），
+  // 命中模块级缓存（代际一致），零请求零等待。
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -385,7 +389,9 @@ export default function VrmAvatar({ mood, talking, size = 220, reloadKey = 0 }: 
         renderer.dispose();
         renderer.domElement.remove();
         renderer = null;
+        rendererRef.current = null;
       }
+      cameraRef.current = null;
       scene = null;
       camera = null;
     }
@@ -402,6 +408,7 @@ export default function VrmAvatar({ mood, talking, size = 220, reloadKey = 0 }: 
         renderer.toneMapping = THREE.NeutralToneMapping;
         renderer.toneMappingExposure = 1.0;
         renderer.setSize(width, height);
+        rendererRef.current = renderer;
         const canvas = renderer.domElement;
         canvas.style.width = '100%';
         canvas.style.height = '100%';
@@ -411,6 +418,7 @@ export default function VrmAvatar({ mood, talking, size = 220, reloadKey = 0 }: 
         scene = new THREE.Scene();
         // 30° 视角 + 自适应距离，兼顾「完整可见」与「面部清晰」
         camera = new THREE.PerspectiveCamera(30, width / height, 0.01, 200);
+        cameraRef.current = camera;
 
         // 光照：three r155+ 起采用**物理光照单位**（useLegacyLights 已移除），旧的
         // 低强度值（≈1）会渲染得明显发灰发暗。但历史值（2.4/2.6/1.2）是为救旧模型
@@ -558,6 +566,27 @@ export default function VrmAvatar({ mood, talking, size = 220, reloadKey = 0 }: 
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadKey]);
+
+  // ---- 尺寸自适应（跟手关键，20261010_模块0_悬浮窗大小滑块跟手性）----
+  // 两段式：**显示层即时、渲染分辨率防抖校准**。size 变化时容器 div 由 React 立即
+  // 更新，canvas（style 恒 100%）经 CSS 拉伸即时呈现新尺寸——视觉零延迟；
+  // GPU drawing buffer 的重建（renderer.setSize）较贵，防抖 150ms：拖动中连续
+  // onChange 不断重置定时器，停手后一次 setSize + camera.aspect 恢复原生分辨率。
+  // 挂载 init 完成前 ref 为空则跳过（init 已按当前 size 初始化，无缺口）；
+  // setSize 第三参 false 保持 canvas style（100% 跟随容器）不被覆盖。
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const renderer = rendererRef.current;
+      const camera = cameraRef.current;
+      if (!renderer || !camera) return;
+      const width = size;
+      const height = Math.round(size * 1.05);
+      renderer.setSize(width, height, false);
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [size]);
 
   // 心情联动：写入 VRM 表情（缺失静默降级），并清掉上一档权重
   useEffect(() => {

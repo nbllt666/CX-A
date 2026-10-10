@@ -89,6 +89,27 @@ function jsonResponse(body: unknown): Response {
   });
 }
 
+/** 合成一条 NDJSON 流式对话响应（delta 增量帧 + done 权威收口帧）。 */
+function chatStreamResponse(): Response {
+  const ndjson =
+    JSON.stringify({ delta: '[emotion:happy]' }) +
+    '\n' +
+    JSON.stringify({ delta: '我在呢' }) +
+    '\n' +
+    JSON.stringify({ done: true, ok: true, clean_text: '我在呢', mood: 'happy', raw: '[emotion:happy]我在呢' }) +
+    '\n';
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(ndjson));
+      controller.close();
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: { 'Content-Type': 'application/x-ndjson; charset=utf-8' },
+  });
+}
+
 function openMenu() {
   fireEvent.pointerDown(screen.getByTestId('fake-vrm').parentElement!, {
     button: 0,
@@ -211,6 +232,11 @@ describe('PetOverlay：悬浮窗语音闭环', () => {
       }
       if (url.includes('/voice/transcribe')) {
         return jsonResponse({ ok: true, text: '在吗' });
+      }
+      // 流式对话端点（20261010 语音低延迟）：必须先于 /chat/message 判断
+      // （'/chat/message_stream'.includes('/chat/message') 为真，顺序反了会错路由）
+      if (url.includes('/chat/message_stream')) {
+        return chatStreamResponse();
       }
       if (url.includes('/chat/message')) {
         return jsonResponse({
@@ -439,6 +465,62 @@ describe('PetOverlay：悬浮窗语音闭环', () => {
     expect(fetchMock).not.toHaveBeenCalledWith(
       expect.stringContaining('/computer/authorize'),
       expect.anything(),
+    );
+  });
+});
+
+describe('PetOverlay：大小滑块跟手（rAF 合并 + 记忆防抖，20261010 跟手性回归锁）', () => {
+  /** 渲染 + 打开菜单 + 等挂载校准的 resize 落地后清基线（只计滑块触发的调用）。 */
+  async function renderAndClearBaseline() {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/settings')) {
+        return jsonResponse({ config: { vision: { enabled: false } } });
+      }
+      if (url.includes('/computer/status')) {
+        return jsonResponse({ authorized: false, confirm_dangerous: true });
+      }
+      if (url.includes('/chat/history')) {
+        return jsonResponse({ ok: true, messages: [] });
+      }
+      throw new Error(`unexpected url: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<PetOverlay />);
+    openMenu();
+    const slider = await screen.findByLabelText('大小滑块');
+    // 挂载校准（幂等 resize + bounds 收紧）会直发 resize：等其稳定后清基线，
+    // 后续断言只统计滑块 onChange 触发的调用
+    await waitFor(() => expect(bridgeMocks.resize).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    bridgeMocks.resize.mockClear();
+    return slider;
+  }
+
+  it('同帧多次 onChange 合并为一次窗口 resize，发送的是最后一个值', async () => {
+    const slider = await renderAndClearBaseline();
+
+    fireEvent.change(slider, { target: { value: '300' } });
+    fireEvent.change(slider, { target: { value: '320' } });
+    await waitFor(() => expect(bridgeMocks.resize).toHaveBeenCalledTimes(1));
+    expect(bridgeMocks.resize).toHaveBeenLastCalledWith(320);
+
+    // rAF 句柄已归还：下一帧再次拖动仍能触发新一轮 resize
+    fireEvent.change(slider, { target: { value: '340' } });
+    await waitFor(() => expect(bridgeMocks.resize).toHaveBeenCalledTimes(2));
+    expect(bridgeMocks.resize).toHaveBeenLastCalledWith(340);
+  });
+
+  it('尺寸记忆防抖落盘：拖动中不写 localStorage，停手后写入最终值', async () => {
+    const slider = await renderAndClearBaseline();
+
+    fireEvent.change(slider, { target: { value: '300' } });
+    // 防抖窗口（300ms）内不落盘——拖动中不做同步存储阻塞
+    expect(window.localStorage.getItem('cx-a.petSize')).not.toBe('300');
+    await waitFor(
+      () => expect(window.localStorage.getItem('cx-a.petSize')).toBe('300'),
+      { timeout: 1500 },
     );
   });
 });

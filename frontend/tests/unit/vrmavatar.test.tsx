@@ -64,6 +64,24 @@ describe('VrmAvatar：失败时给中文提示（页面无任何替代形象）'
     expect(getByText('暂时显示不了 3D 桌宠')).not.toBeNull();
     expect(container.querySelector('canvas')).toBeNull();
   });
+
+  it('size 变化：容器 style 跟随且组件不重挂载（20261010 滑块跟手回归锁，防 key={size} 复辟）', async () => {
+    mockedFetchPetModel.mockResolvedValue(new ArrayBuffer(8));
+
+    const { container, rerender } = render(<VrmAvatar mood="calm" talking={false} size={200} />);
+    await waitFor(() => {
+      expect(container.querySelector('[data-vrm-state="unsupported"]')).not.toBeNull();
+    });
+    const first = container.firstElementChild as HTMLElement;
+    expect(first.style.width).toBe('200px');
+
+    rerender(<VrmAvatar mood="calm" talking={false} size={300} />);
+    // 同一 DOM 节点 = 未重挂载（key={size} 强制重建会让此断言变红）；
+    // 容器尺寸即时跟随（真实 renderer.setSize 由 [size] effect 在有 WebGL 时执行）
+    expect(container.firstElementChild).toBe(first);
+    expect(first.style.width).toBe('300px');
+    expect(first.style.height).toBe('315px');
+  });
 });
 
 describe('vrmExpressionForMood：心情 → VRM 预设表情名映射（纯函数）', () => {

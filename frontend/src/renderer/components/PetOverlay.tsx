@@ -5,6 +5,7 @@ import { normalizeBackendMood, type PetMood } from '../petMood';
 import { usePetMoodFeed } from '../hooks/usePetMoodFeed';
 import { PET_ENABLED_KEY } from '../hooks/usePetEnabled';
 import {
+  chatMessageStream,
   fetchComputerStatus,
   fetchSettings,
   onPetModelReload,
@@ -15,6 +16,7 @@ import {
   synthesizeSpeechStream,
   transcribeAudio,
   updateSettings,
+  warmupVoiceEngine,
 } from '../api';
 import { VoiceSession, type VoiceInteractionMode } from '../voiceSession';
 import {
@@ -58,10 +60,11 @@ import {
  *    圆形玻璃按钮沿桌宠上半身椭圆弧排布（打开主窗口/说话/屏幕共享/操作授权/大小/关闭），
  *    开关语义（聆听/共享/授权对应项主色填充）；hover 放大 + 侧向文字标签；
  *    逐个错峰入场动画；点击他处 / Escape / 窗口失焦关闭；弧形随窗口档位缩放并收拢在视口内。
- * 6. 尺寸档位：220 / 286 / 360 三档（画面宽）。点击档位 → 写 localStorage
- *    『cx-a.petSize』→ resizePetOverlay(档位)（主进程按映射表换窗口宽高、保持
- *    中心不变）→ setSize + VrmAvatar key={size} 重挂载（模型字节走模块级缓存，
- *    零请求零等待无感切换）。挂载时读记忆档位并幂等校准窗口尺寸。
+ * 6. 尺寸档位：连续无级调节（滑块量程按主屏分辨率动态推导，记忆用户选择）。
+ *    拖动滑块 → applySize：渲染层 state 立即跟手（VrmAvatar 不再 key={size} 整场
+ *    重建，内部 [size] effect 仅重设 drawing buffer）→ 窗口 resize 经 rAF 合并
+ *    （一帧最多一次 pet-overlay:resize IPC，主进程按映射表换窗口宽高、保持中心
+ *    不变）→ 尺寸记忆防抖落盘。挂载时读记忆档位并幂等校准窗口尺寸。
  * ======================== 鼠标穿透说明 ========================
  * 本组件未做整窗镂空穿透。要「区域外点击穿透到桌面」时，可：
  *   - 交互区（本体 / 菜单）保留 pointer-events:auto；
@@ -147,6 +150,12 @@ export default function PetOverlay() {
   const menuRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<DragGestureState | null>(null);
+  /** 最新尺寸镜像：applySize 同步更新，供落盘防抖 / 卸载 flush 读取（不受 rAF 清空影响） */
+  const sizeRef = useRef<PetSize>(size);
+  /** 窗口 resize rAF 合并句柄：拖动滑块时一帧最多发一次 IPC（跟手关键） */
+  const resizeRafRef = useRef(0);
+  /** 尺寸记忆落盘防抖句柄：停手 300ms 后写入 localStorage，拖动中不同步阻塞 */
+  const sizeSaveTimerRef = useRef(0);
   /** 语音链路句柄：朗读中断控制器 + 语音会话（20261006 全双工降级版） */
   const speakAbortRef = useRef<AbortController | null>(null);
   const voiceSessionRef = useRef<VoiceSession | null>(null);
@@ -207,7 +216,8 @@ export default function PetOverlay() {
       });
   }, []);
 
-  // 卸载收尾：停语音会话、停朗读（悬浮窗关闭/热重载不留悬挂会话）
+  // 卸载收尾：停语音会话、停朗读、flush 尺寸记忆与未发送的窗口 resize
+  // （悬浮窗关闭/热重载不留悬挂会话，也不丢最后一次拖动的尺寸记忆）
   useEffect(() => {
     return () => {
       try {
@@ -219,6 +229,21 @@ export default function PetOverlay() {
         speakAbortRef.current?.abort();
       } catch {
         /* no-op */
+      }
+      // flush 未落盘的尺寸记忆（防抖期间卸载时立即写入最终值）
+      if (sizeSaveTimerRef.current) {
+        window.clearTimeout(sizeSaveTimerRef.current);
+        sizeSaveTimerRef.current = 0;
+        try {
+          window.localStorage.setItem(PET_SIZE_KEY, String(sizeRef.current));
+        } catch {
+          /* no-op */
+        }
+      }
+      // 取消未发送的 rAF resize
+      if (resizeRafRef.current) {
+        window.cancelAnimationFrame(resizeRafRef.current);
+        resizeRafRef.current = 0;
       }
     };
   }, []);
@@ -236,18 +261,33 @@ export default function PetOverlay() {
     };
   }, [menuOpen]);
 
-  // 换档：写记忆 → 同步 renderer 画面（key={size} 重挂载 VrmAvatar，模型字节走缓存）
-  // → 主进程换窗口宽高（保持中心不变）
+  // 换尺寸（滑块连续拖动 / 挂载校准共用）。跟手三板斧（20261010_模块0_悬浮窗大小
+  // 滑块跟手性）：①渲染层 state 立即更新——滑块位置与画布容器即时跟手；②窗口
+  // resize 经 requestAnimationFrame 合并——拖动中一帧最多一次 IPC，同帧多次
+  // onChange 只发最后一个，停手后自然收敛；③尺寸记忆防抖 300ms 落盘——拖动中
+  // 不做同步 localStorage 阻塞，卸载时 flush（见卸载收尾 effect）。
   const applySize = (next: PetSize) => {
-    try {
-      window.localStorage.setItem(PET_SIZE_KEY, String(next));
-    } catch {
-      /* 存储不可用（隐私模式等）时静默：本会话内档位仍生效 */
-    }
+    sizeRef.current = next;
     setSize(next);
-    void resizePetOverlay(next).catch(() => {
-      /* 主进程不可达时静默 */
-    });
+    if (!resizeRafRef.current) {
+      resizeRafRef.current = window.requestAnimationFrame(() => {
+        resizeRafRef.current = 0;
+        void resizePetOverlay(sizeRef.current).catch(() => {
+          /* 主进程不可达时静默 */
+        });
+      });
+    }
+    if (sizeSaveTimerRef.current) {
+      window.clearTimeout(sizeSaveTimerRef.current);
+    }
+    sizeSaveTimerRef.current = window.setTimeout(() => {
+      sizeSaveTimerRef.current = 0;
+      try {
+        window.localStorage.setItem(PET_SIZE_KEY, String(sizeRef.current));
+      } catch {
+        /* 存储不可用（隐私模式等）时静默：本会话内档位仍生效 */
+      }
+    }, 300);
   };
 
   // 关闭：优先经 IPC 桥让主进程关闭悬浮窗；localStorage 写入保留作状态记录
@@ -391,6 +431,10 @@ export default function PetOverlay() {
         const data = await sendChatMessage({ message });
         return data;
       },
+      // 流式对话（20261010 语音低延迟）：LLM 增量 → 首个完整句即送 TTS，
+      // 不等完整回复；后端不可达/异常时由会话层回退 chat 旧路径语义
+      chatStream: (message, onDelta, signal) =>
+        chatMessageStream(message, onDelta, signal),
       speak: speakHandle,
       onReplyMeta: (mood) => {
         // 表情即时驱动（发布总线 + 本窗口立即生效）；主窗口聊天页经 tick 重载历史
@@ -404,7 +448,13 @@ export default function PetOverlay() {
     if (!ok) {
       voiceSessionRef.current = null;
       setVoiceState('idle');
+      return;
     }
+    // 语音引擎预热（fire-and-forget）：开启会话即后台拉热 sidecar/TTS/ASR 三层
+    // 懒加载——用户说完第一句话前的几秒足够引擎就绪，首次对话不再叠加冷启动
+    void warmupVoiceEngine().catch(() => {
+      /* 预热尽力而为：失败静默，真实请求仍走懒加载兜底 */
+    });
   }, [interactionMode, pushMood, speakHandle, stopVoiceSession]);
 
   /** 屏幕共享开关：乐观翻转 + 热更新 vision.enabled；失败回退并留痕。 */
@@ -569,7 +619,6 @@ export default function PetOverlay() {
         onPointerCancel={handleStagePointerCancel}
       >
         <VrmAvatar
-          key={size}
           mood={mood}
           talking={voiceState === 'speaking'}
           size={size}

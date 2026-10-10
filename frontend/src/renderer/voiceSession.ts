@@ -23,6 +23,7 @@ import {
   type ContinuousRecordingSession,
 } from './audioRecorder';
 import { splitSentences } from './sentences';
+import { StreamTextPipeline } from './streamText';
 
 export type VoiceInteractionMode = 'vad' | 'duplex';
 
@@ -47,6 +48,18 @@ export interface VoiceSessionDeps {
   transcribe: (audioBase64: string, sampleRate: number) => Promise<{ ok: boolean; text?: string }>;
   /** 发送一句话（POST /api/chat/message；后端持会话历史）。 */
   chat: (message: string) => Promise<{ clean_text?: string; mood?: string } | undefined>;
+  /**
+   * 流式发送一句话（POST /api/chat/message_stream；20261010 语音低延迟）：
+   * onDelta 逐帧回调 raw 增量（含 [emotion:x] 标签原文），Promise 在 done 帧
+   * resolve（权威 clean_text/mood）。注入后 processSentence 走流式句级流水线
+   * ——LLM 生成出首个完整句即送 TTS，不等完整回复；缺省回退 chat 旧路径。
+   * signal 为打断取消信号（打断时同步中止流式请求）。
+   */
+  chatStream?: (
+    message: string,
+    onDelta: (delta: string) => void,
+    signal: AbortSignal,
+  ) => Promise<{ clean_text?: string; mood?: string; offline?: boolean } | undefined>;
   /**
    * 流式合成并播放一段回复；返回句柄——abort() 停播停合成（打断用）、
    * done 在播放自然结束后 resolve（打断时 reject 或挂起均可，会话不再等待）。
@@ -82,6 +95,8 @@ export class VoiceSession {
   private pumping = false;
   /** 播放中的句柄集（打断时统一 abort） */
   private readonly activeSpeaks = new Set<{ abort: () => void; done: Promise<void> }>();
+  /** 流式对话的取消控制器集（打断时统一 abort 中止 LLM 流） */
+  private readonly activeStreams = new Set<AbortController>();
   /** 打断能量累计（毫秒；连续超门限计时，低于门限清零） */
   private interruptAccumMs = 0;
   private readonly interruptThreshold: number;
@@ -123,13 +138,15 @@ export class VoiceSession {
     return true;
   }
 
-  /** 关闭会话：停采集、停播、清队（幂等）。 */
+  /** 关闭会话：停采集、停播、中止流式请求、清队（幂等）。 */
   stop(): void {
     this.stopped = true;
     this.queue = [];
     this.pumping = false;
     for (const handle of this.activeSpeaks) handle.abort();
     this.activeSpeaks.clear();
+    for (const controller of this.activeStreams) controller.abort();
+    this.activeStreams.clear();
     this.recorder?.stop();
     this.recorder = null;
     this.setState('idle');
@@ -218,6 +235,12 @@ export class VoiceSession {
   /** 处理一句话：发送 LLM → 回复入历史（后端）→ 流式合成播放。 */
   private async processSentence(sentence: string): Promise<void> {
     this.setState('processing');
+    // 流式路径（20261010 语音低延迟）：LLM 增量 → 增量剥标签/切句 → 首个完整句
+    // 即送 TTS，不等完整回复；未注入 chatStream 时回退既有整段路径
+    if (this.deps.chatStream) {
+      await this.processSentenceStreamed(sentence);
+      return;
+    }
     let reply = '';
     let mood: string | undefined;
     try {
@@ -244,13 +267,86 @@ export class VoiceSession {
       });
   }
 
-  /** 播放中用户开口（duplex）：停播、清队、丢弃采集缓冲、回聆听。 */
+  /**
+   * 流式句级流水线（20261010_模块0_语音交互延迟优化）：单句 chat 的回复内部
+   * 再按句边界提前朗读——「LLM 生成中」与「TTS 播放」重叠，首响延迟从
+   * 「完整回复生成完」压缩到「首个完整句生成完」。
+   *
+   * - StreamTextPipeline 增量剥 [emotion:x] 标签（跨 chunk 悬挂缓冲）+ 句边界
+   *   切分；每凑齐完整句立即 speak（activeSpeaks 复用，播放语义与旧路径一致）；
+   * - mood 首个已识别标签到达即上报（表情提前驱动），done 帧权威值兜底再报；
+   * - 打断：流式请求经 activeStreams 统一 abort（interrupt() 扩展），已收残句
+   *   不再 flush（stopped 短路）。
+   */
+  private async processSentenceStreamed(sentence: string): Promise<void> {
+    const pipeline = new StreamTextPipeline();
+    const controller = new AbortController();
+    this.activeStreams.add(controller);
+    let spokeAny = false;
+    let moodReported = false;
+
+    const speakPiece = (piece: string): void => {
+      const text = piece.trim();
+      if (!text) return;
+      spokeAny = true;
+      this.setState('speaking');
+      const handle = this.deps.speak(text);
+      this.activeSpeaks.add(handle);
+      void handle.done
+        .catch(() => undefined)
+        .finally(() => {
+          this.activeSpeaks.delete(handle);
+          this.settleIfIdle();
+        });
+    };
+
+    let meta: { clean_text?: string; mood?: string; offline?: boolean } | undefined;
+    try {
+      meta = await this.deps.chatStream(
+        sentence,
+        (delta) => {
+          if (this.stopped) return;
+          for (const piece of pipeline.push(delta)) speakPiece(piece);
+          // 首个已识别标签到达即驱动表情（不等完整回复）
+          if (!moodReported) {
+            const early = pipeline.getMood();
+            if (early) {
+              moodReported = true;
+              this.deps.onReplyMeta?.(early);
+            }
+          }
+        },
+        controller.signal,
+      );
+    } catch (err) {
+      // 打断（signal.aborted）静默；真实失败记日志（已收文本可能已部分播放）
+      if (!controller.signal.aborted) {
+        console.error('[VoiceSession] 对话失败:', err);
+      }
+    } finally {
+      this.activeStreams.delete(controller);
+    }
+    if (this.stopped) return;
+    // 流结束：残余强制收口（未闭合标签原文保留口径），照常朗读
+    for (const piece of pipeline.flush()) speakPiece(piece);
+    // 权威 mood 兜底（流中未出现标签时 done 帧给 calm 等）
+    const mood = meta?.mood ?? pipeline.getMood();
+    this.deps.onReplyMeta?.(mood);
+    if (!spokeAny && !meta?.clean_text?.trim()) {
+      this.settleIfIdle();
+    }
+  }
+
+  /** 播放中用户开口（duplex）：停播、中止流式请求、清队、丢弃采集缓冲、回聆听。 */
   private interrupt(): void {
     if (this.stopped) return;
     this.queue = [];
     this.pumping = false;
     for (const handle of this.activeSpeaks) handle.abort();
     this.activeSpeaks.clear();
+    // 中止在途流式对话请求（LLM 生成同步停止；后端检测断开不落盘该轮历史）
+    for (const controller of this.activeStreams) controller.abort();
+    this.activeStreams.clear();
     // 丢弃采集缓冲：AI 扬声器残留混入的音频不得进入识别链路（spec 冻结段）
     this.recorder?.clearBuffer();
     this.setState('listening');

@@ -34,6 +34,8 @@ export const API_ENDPOINTS = {
     sendMessage: `${API_BASE}/chat/messages`,
     /** 表情聊天（Task H3）：走云端流式拼接 + 标签解析，返回 {clean_text, mood, raw} */
     message: `${API_BASE}/chat/message`,
+    /** 表情聊天流式版（20261010 语音低延迟）：NDJSON 增量 {delta}* → {done, clean_text, mood, raw} */
+    messageStream: `${API_BASE}/chat/message_stream`,
     /** 聊天历史（20261004 持久化）：GET → {ok, messages:[{role, content, time}]} 最近 200 条 */
     history: `${API_BASE}/chat/history`,
   },
@@ -44,6 +46,8 @@ export const API_ENDPOINTS = {
     synthesizeStream: `${API_BASE}/voice/synthesize_stream`,
     /** 语音转文本（POST {audio_base64, sample_rate?} → {ok, text}） */
     transcribe: `${API_BASE}/voice/transcribe`,
+    /** 语音引擎预热（20261010 低延迟：后台拉热 sidecar/TTS/ASR 三层懒加载，异步立即返回） */
+    warmup: `${API_BASE}/voice/warmup`,
   },
   voices: {
     /** 音色包列表（GET → {ok, voices:[{id, path, is_default, size, builtin}]}，首项恒为内置 cx-open） */
@@ -430,6 +434,100 @@ export async function sendChatMessage(payload: ChatMessagePayload): Promise<Chat
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+  });
+}
+
+/**
+ * 表情聊天流式版（20261010_模块0_语音交互延迟优化）：POST /api/chat/message_stream。
+ *
+ * NDJSON 逐行帧：`{delta}`* → `{done, ok, clean_text, mood, raw, offline?}`（流中途
+ * 失败先来一帧 `{error}` 再 done——已收文本照常可用）。onDelta 逐帧回调 raw 增量
+ * （含 [emotion:x] 标签原文，剥离由调用方的 StreamTextPipeline 增量做），返回
+ * Promise 在 done 帧时 resolve（权威 clean_text/mood；客户端 abort 时 reject）。
+ *
+ * 语音专用：VoiceSession 流式句级流水线把「LLM 生成中」与「TTS 播放」重叠——
+ * 首个完整句生成即出声，不等完整回复。文字聊天页仍走非流式端点（整段渲染语义不变）。
+ */
+export async function chatMessageStream(
+  message: string,
+  onDelta: (delta: string) => void,
+  signal?: AbortSignal,
+  agentId?: string,
+): Promise<{ clean_text?: string; mood?: string; offline?: boolean } | undefined> {
+  const token = await ensureBackendToken();
+  const headers = new Headers({ 'Content-Type': 'application/json' });
+  if (token) headers.set('X-Client-Token', token);
+  const res = await fetch(API_ENDPOINTS.chat.messageStream, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(agentId ? { message, agent_id: agentId } : { message }),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    const msg = await res.text().catch(() => '');
+    throw new Error(`流式对话失败（${res.status}）：${msg.slice(0, 200)}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  let final: { clean_text?: string; mood?: string; offline?: boolean } | undefined;
+  const handleLine = (line: string) => {
+    if (!line.trim()) return;
+    let frame: {
+      delta?: string;
+      error?: string;
+      done?: boolean;
+      clean_text?: string;
+      mood?: string;
+      offline?: boolean;
+    };
+    try {
+      frame = JSON.parse(line);
+    } catch {
+      return; // 非 JSON 行（心跳等）静默跳过
+    }
+    if (typeof frame.delta === 'string' && frame.delta) {
+      onDelta(frame.delta);
+    }
+    // error 帧仅提示（已收文本照常播放）；done 帧为权威收口
+    if (frame.done) {
+      final = {
+        clean_text: typeof frame.clean_text === 'string' ? frame.clean_text : undefined,
+        mood: typeof frame.mood === 'string' ? frame.mood : undefined,
+        offline: frame.offline === true,
+      };
+    }
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf('\n')) !== -1) {
+        handleLine(buffer.slice(0, nl));
+        buffer = buffer.slice(nl + 1);
+      }
+    }
+    if (buffer.trim()) handleLine(buffer);
+  } catch (err) {
+    if (signal?.aborted) throw err; // 打断：抛 AbortError 由会话层静默
+    throw err;
+  }
+  return final;
+}
+
+/**
+ * 语音引擎预热（20261010_模块0_语音交互延迟优化）：POST /api/voice/warmup。
+ *
+ * 后端异步拉热 voice_bridge sidecar 进程 / MeloTTS / SenseVoice 三层懒加载，
+ * 立即返回不阻塞。开启语音会话时 fire-and-forget 调用——用户说完第一句话前的
+ * 几秒足够引擎完成加载，首次对话不再叠加冷启动。失败静默（预热尽力而为，
+ * 真实请求仍走懒加载兜底）。
+ */
+export async function warmupVoiceEngine(): Promise<void> {
+  await requestJson<{ ok?: boolean; warmup?: string }>(API_ENDPOINTS.voice.warmup, {
+    method: 'POST',
   });
 }
 

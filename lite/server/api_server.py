@@ -453,6 +453,13 @@ _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 # ——请求线程与下载线程共用，防止并发落盘导致 config.json 字段丢失 / 截断。
 _CONFIG_WRITE_LOCK = threading.Lock()
 
+# 语音引擎预热防重入（20261010_模块0_语音交互延迟优化）：/api/voice/warmup 的
+# 后台预热线程进行中标志。预热尽力而为（失败仅记日志），引擎已热时重复调用
+# 代价为一次微合成热路径，无需持久状态；防重入只为避免开关麦克风密集触发时
+# 排队多个预热线程。
+_VOICE_WARMUP_LOCK = threading.Lock()
+_VOICE_WARMUP_INFLIGHT = False
+
 
 def _is_loopback_host(host) -> bool:
     """判断监听地址是否为本机回环地址（127.0.0.1 / localhost / ::1）。
@@ -2555,6 +2562,164 @@ def make_handler(
                 )
             self._send_json(payload)
 
+        def _handle_chat_message_stream(self):
+            """POST /api/chat/message_stream：表情聊天流式版（NDJSON chunked 增量下发）。
+
+            语音低延迟专用（20261010_模块0_语音交互延迟优化）：LLM 流式增量逐帧
+            下发，前端增量剥 ``[emotion:x]`` 标签并按句边界切句，首个完整句即送
+            TTS——不等完整回复（本地小模型生成 10~30 字回复的 1~3 秒里 TTS 不再
+            空转，首响延迟显著下降）。协议（NDJSON 逐行）：
+
+            - ``{"delta": "<raw 文本增量>"}``（原样增量，含标签，剥离由前端做）；
+            - ``{"done": true, "clean_text": ..., "mood": ..., "raw": ..., "offline"?}``
+              （mood/clean_text 为后端权威解析，前端流中提取值仅作提前驱动）；
+            - 流中途生成失败：``{"error": "<说明>"}`` 后紧跟 done 帧（已收文本照常可用）。
+
+            - 首帧探测：先拉第一个增量再切 NDJSON——云端不可用
+              （CloudConfigError/CloudUnavailableError）在此即抛，回退为离线占位
+              文案的 NDJSON 下发（前端把提示文案照常朗读/展示，语义与既有 200
+              JSON offline 形状一致，前端无需按 Content-Type 分流）。
+            - memory-agent 工具环需整轮完整文本做指令解析，流式无收益：本端点
+              400 引导走既有非流式端点（语音会话默认 agent 为 "default"，不受影响）。
+            - 落盘：done 时与非流式同条件 append chat_history（memory-agent 除外、
+              离线占位文案不落盘）；客户端中断（打断）不落盘——被打断的回复不算
+              完整对话。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            message = str(body.get("message") or "").strip()
+            if not message:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "message 为必填字段且不能为空"},
+                    400,
+                )
+                return
+            agent_id = self._sanitize_agent_id(body.get("agent_id"))
+            if agent_id == MEMORY_AGENT_ID:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "bad_request",
+                        "message": "memory-agent 请走非流式端点 /api/chat/message（工具环需完整文本）",
+                    },
+                    400,
+                )
+                return
+            messages = self._build_chat_messages(message, agent_id)
+            try:
+                if self._chat_fallback is not None:
+                    gen = self._chat_fallback.chat(messages)
+                    offline = getattr(self._chat_fallback, "status", "cloud") != "cloud"
+                else:
+                    gen = self._chat_cloud.chat(messages)
+                    offline = False
+                first = next(gen, None)  # 首帧探测：云端不可用在此抛
+            except (CloudConfigError, CloudUnavailableError) as exc:
+                LOGGER.warning("表情聊天流式云端不可用（%s）：%s", exc.__class__.__name__, exc)
+                self._handle_chat_stream_offline()
+                return
+
+            # chunked NDJSON 头（与 voice/synthesize_stream 同套路）
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Transfer-Encoding", "chunked")
+            for key, value in self._cors_headers().items():
+                self.send_header(key, value)
+            self.end_headers()
+
+            def _write_ndjson(obj):
+                line = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+                self.wfile.write(f"{len(line):X}\r\n".encode("ascii"))
+                self.wfile.write(line)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+
+            def _finish(full_text):
+                """done 帧下发 + 历史落盘（与非流式同条件，被打断不落盘）。"""
+                parsed = EmotionTagParser().parse(full_text)
+                done_payload = {
+                    "done": True,
+                    "ok": True,
+                    "clean_text": parsed["clean_text"],
+                    "mood": parsed["mood"],
+                    "raw": full_text,
+                }
+                if offline:
+                    done_payload["offline"] = True
+                try:
+                    _write_ndjson(done_payload)
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                if offline and parsed["clean_text"] in _offline_placeholder_texts():
+                    return  # 离线占位文案不是真实对话，不落盘
+                _append_chat_history(message, parsed["clean_text"], path=self._chat_history_file)
+
+            parts = [str(first)] if first else []
+            try:
+                if parts:
+                    _write_ndjson({"delta": parts[0]})
+                for chunk in gen:
+                    if not chunk:
+                        continue
+                    parts.append(str(chunk))
+                    _write_ndjson({"delta": str(chunk)})
+            except (BrokenPipeError, ConnectionResetError):
+                # 客户端已断开（打断/关窗）：停止消费生成器，不落盘不收尾
+                return
+            except (CloudConfigError, CloudUnavailableError) as exc:
+                # 流中途云端断：已收文本仍可用，错误帧说明后照常 done
+                try:
+                    _write_ndjson({"error": f"生成中断（{exc.__class__.__name__}）"})
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                _finish("".join(parts))
+                return
+            except Exception as exc:  # noqa: BLE001 - 生成中途异常同样保已收文本
+                try:
+                    _write_ndjson({"error": str(exc)[:200]})
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                _finish("".join(parts))
+                return
+            _finish("".join(parts))
+
+        def _handle_chat_stream_offline(self):
+            """流式聊天云端不可用兜底：离线占位文案以 NDJSON 单轮下发（不落盘）。"""
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Transfer-Encoding", "chunked")
+            for key, value in self._cors_headers().items():
+                self.send_header(key, value)
+            self.end_headers()
+
+            def _write_ndjson(obj):
+                line = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+                self.wfile.write(f"{len(line):X}\r\n".encode("ascii"))
+                self.wfile.write(line)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+
+            try:
+                _write_ndjson({"delta": CHAT_OFFLINE_TEXT})
+                _write_ndjson(
+                    {
+                        "done": True,
+                        "ok": True,
+                        "clean_text": CHAT_OFFLINE_TEXT,
+                        "mood": "calm",
+                        "raw": CHAT_OFFLINE_TEXT,
+                        "offline": True,
+                    }
+                )
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
         # ------------------------------------------------------------ 悬浮桌宠模型分发（20260924_模块0_接入VRM悬浮桌宠）
         def _handle_pet_model(self):
             """GET /api/pet/model：分发悬浮桌宠默认 VRM 模型的原始字节。
@@ -2919,6 +3084,16 @@ def make_handler(
                     return
                 if path == "/api/voice/synthesize_stream":
                     self._handle_voice_synthesize_stream()
+                    return
+                # 语音引擎预热（20261010_模块0_语音交互延迟优化）：会话开启时拉热
+                # 三层懒加载（sidecar 进程 / MeloTTS / SenseVoice）
+                if path == "/api/voice/warmup":
+                    self._handle_voice_warmup()
+                    return
+                # 表情聊天流式版（语音低延迟）：LLM 增量 NDJSON 下发，前端句级
+                # 流水线提前启动 TTS——不等完整回复
+                if path == "/api/chat/message_stream":
+                    self._handle_chat_message_stream()
                     return
                 # 桌宠模型导入/恢复（Task 4：用户自定义 VRM 桌宠模型）——
                 # 走上方统一令牌闸（无豁免），与 GET /api/pet/model 同一防线
@@ -4091,6 +4266,45 @@ def make_handler(
                 )
                 return
             self._send_json({"ok": True, "text": str(result.get("text", ""))})
+
+        def _handle_voice_warmup(self):
+            """POST /api/voice/warmup：语音引擎预热（异步后台执行，立即返回）。
+
+            背景（20261010_模块0_语音交互延迟优化）：voice_bridge sidecar 进程、
+            MeloTTS 引擎、SenseVoice ASR 模型均为「首次请求才加载」——用户开启
+            语音会话后的第一次对话要叠加三层冷启动。本端点在后台线程发一次微型
+            合成与一次微型识别把三层拉热；前端开启语音会话时 fire-and-forget
+            调用，用户说完第一句话前的几秒足够引擎完成加载。
+
+            防重入见 _VOICE_WARMUP_LOCK 注释；预热失败仅记日志（尽力而为），
+            真实请求仍走正常懒加载兜底，绝不因此 5xx。
+            """
+            global _VOICE_WARMUP_INFLIGHT
+            with _VOICE_WARMUP_LOCK:
+                if _VOICE_WARMUP_INFLIGHT:
+                    self._send_json({"ok": True, "warmup": "already_inflight"})
+                    return
+                _VOICE_WARMUP_INFLIGHT = True
+
+            def _run():
+                global _VOICE_WARMUP_INFLIGHT
+                try:
+                    voice = self._voice_config_default()
+                    # TTS：微型文本合成（拉起 sidecar 进程 + 构造 MeloTTS 引擎）
+                    self._voice.tts.synthesize("嗯", voice)
+                    # ASR：0.2s 16kHz 16bit 静音识别（构造 SenseVoice 模型）
+                    self._voice.asr.transcribe(b"\x00" * 6400, 16000)
+                    LOGGER.info("语音引擎预热完成（sidecar / TTS / ASR 已就绪）")
+                except Exception as exc:  # noqa: BLE001 - 预热尽力而为，不阻断服务
+                    LOGGER.info(
+                        "语音引擎预热未完成（%s）：%s", exc.__class__.__name__, str(exc)[:120]
+                    )
+                finally:
+                    with _VOICE_WARMUP_LOCK:
+                        _VOICE_WARMUP_INFLIGHT = False
+
+            threading.Thread(target=_run, name="voice-warmup", daemon=True).start()
+            self._send_json({"ok": True, "warmup": "started"})
 
         def _handle_voice_synthesize_stream(self):
             """POST /api/voice/synthesize_stream：按标点切分后逐句合成，chunked NDJSON 流式下发。

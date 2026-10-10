@@ -214,3 +214,118 @@ describe('VoiceSession：duplex 模式（按标点切句逐句轮询）', () => 
     expect(session.getState()).toBe('idle');
   });
 });
+
+describe('VoiceSession：流式句级流水线（20261010 语音低延迟）', () => {
+  /** 构造可控 fake chatStream：捕获 onDelta，测试分帧喂增量；done 时 resolve meta */
+  function fakeChatStream() {
+    const emitters: Array<(delta: string) => void> = [];
+    const resolvers: Array<(meta: { clean_text?: string; mood?: string }) => void> = [];
+    const signals: AbortSignal[] = [];
+    const impl = vi.fn(
+      (
+        _message: string,
+        onDelta: (delta: string) => void,
+        signal: AbortSignal,
+      ): Promise<{ clean_text?: string; mood?: string }> => {
+        emitters.push(onDelta);
+        signals.push(signal);
+        return new Promise((resolve) => resolvers.push(resolve));
+      },
+    );
+    const emit = (delta: string) => emitters.forEach((fn) => fn(delta));
+    const finish = (meta = { clean_text: '', mood: 'calm' }) =>
+      resolvers.forEach((fn) => fn(meta));
+    return { impl, emit, finish, signals };
+  }
+
+  it('首个完整句在 LLM 生成中途即送 TTS（不等完整回复）', async () => {
+    const stream = fakeChatStream();
+    const { session, recorder, speak } = makeSession({
+      mode: 'vad',
+      transcribe: vi.fn(async () => ({ ok: true, text: '你好' })),
+      chatStream: stream.impl,
+    });
+    expect(await session.start()).toBe(true);
+    recorder.captured[0].onUtterance!({ audioBase64: 'aGk=', sampleRate: 16000, durationSec: 1 });
+    await flush();
+    expect(stream.impl).toHaveBeenCalledWith('你好', expect.any(Function), expect.any(AbortSignal));
+
+    // LLM 生成中：第一个句号出现 → 立即 speak 第一句（此时流未结束）
+    stream.emit('[emotion:happy]好的，');
+    await flush();
+    expect(speak.spoken).toEqual(['好的，']);
+    expect(session.getState()).toBe('speaking');
+
+    // 第二句凑齐 → 立即 speak（流水线）
+    stream.emit('我在呢。');
+    await flush();
+    expect(speak.spoken).toEqual(['好的，', '我在呢。']);
+
+    // done：mood 权威值上报
+    stream.finish({ clean_text: '好的，我在呢。', mood: 'happy' });
+    await flush();
+    expect(speak.spoken).toEqual(['好的，', '我在呢。']);
+  });
+
+  it('标签跨 chunk 撕裂不误读；flush 收口尾句；mood 提前上报', async () => {
+    const stream = fakeChatStream();
+    const moods: Array<string | undefined> = [];
+    const { session, recorder, speak } = makeSession({
+      mode: 'vad',
+      transcribe: vi.fn(async () => ({ ok: true, text: '嗯' })),
+      chatStream: stream.impl,
+      onReplyMeta: (m) => moods.push(m),
+    });
+    await session.start();
+    recorder.captured[0].onUtterance!({ audioBase64: 'aGk=', sampleRate: 16000, durationSec: 1 });
+    await flush();
+
+    stream.emit('当然[emo'); // 悬挂：半截标签不下发（"当然"无句尾标点也不产出）
+    await flush();
+    expect(speak.spoken).toEqual([]);
+    stream.emit('tion:sad]不行呀，'); // 标签闭合剥掉 + 逗号凑齐 → 立即朗读（含前段"当然"）；mood=sad 提前上报
+    await flush();
+    expect(speak.spoken).toEqual(['当然不行呀，']);
+    expect(moods).toContain('sad');
+    stream.finish({ clean_text: '当然不行呀，', mood: 'sad' });
+    await flush();
+    expect(speak.spoken).toEqual(['当然不行呀，']);
+  });
+
+  it('打断：在途流式请求同步 abort、已播句统一停', async () => {
+    const stream = fakeChatStream();
+    const { session, recorder, speak } = makeSession({
+      mode: 'duplex',
+      transcribe: vi.fn(async () => ({ ok: true, text: '你好' })),
+      chatStream: stream.impl,
+    });
+    await session.start();
+    const handlers = recorder.captured[0];
+    handlers.onUtterance!({ audioBase64: 'aGk=', sampleRate: 16000, durationSec: 1 });
+    await flush();
+    stream.emit('好的，我在呢。');
+    await flush();
+    expect(speak.spoken).toEqual(['好的，我在呢。']);
+
+    // 播放期用户开口超门限达保护窗 → 打断：speak abort + 流 abort + 缓冲丢弃
+    for (let i = 0; i < 12; i += 1) handlers.onLevel!(0.2);
+    await flush();
+    expect(speak.aborted.length).toBe(1);
+    expect(stream.signals[0].aborted).toBe(true);
+    expect(session.getState()).toBe('listening');
+  });
+
+  it('未注入 chatStream 时回退既有 chat 整段路径（兼容性）', async () => {
+    const chat = vi.fn(async (message: string) => ({ clean_text: `回:${message}`, mood: 'calm' }));
+    const { session, recorder, speak } = makeSession({
+      mode: 'vad',
+      chat,
+      transcribe: vi.fn(async () => ({ ok: true, text: '你好' })),
+    });
+    await session.start();
+    recorder.captured[0].onUtterance!({ audioBase64: 'aGk=', sampleRate: 16000, durationSec: 1 });
+    await flush();
+    expect(chat).toHaveBeenCalledWith('你好');
+    expect(speak.spoken).toEqual(['回:你好']);
+  });
+});
