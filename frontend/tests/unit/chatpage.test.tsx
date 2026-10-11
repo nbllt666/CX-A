@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, act } from '@testing-library/react';
 import ChatPage from '../../src/renderer/pages/ChatPage';
 import { API_ENDPOINTS } from '../../src/renderer/api';
 
@@ -247,10 +247,15 @@ describe('ChatPage：发送消息后 fetch 失败', () => {
 describe('ChatPage：语音接线（朗读 + 麦克风）', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
   let playMock: ReturnType<typeof vi.fn>;
+  const players: Array<{ onended: (() => void) | null; onerror: (() => void) | null; pause: ReturnType<typeof vi.fn> }> = [];
 
   beforeEach(() => {
+    players.length = 0;
     playMock = vi.fn(async () => undefined);
     class FakeAudio {
+      constructor() {
+        players.push(this);
+      }
       onended: (() => void) | null = null;
       onerror: (() => void) | null = null;
       pause = vi.fn();
@@ -444,5 +449,58 @@ describe('ChatPage：语音接线（朗读 + 麦克风）', () => {
     await vi.waitFor(() => {
       expect(screen.getByPlaceholderText('跟你的AI说点什么吧…')).toHaveValue('语音转写结果');
     });
+  });
+
+  it('卸载取消正在采集的录音，而不是识别/发送已离开的页面', async () => {
+    stubChatAndSynth();
+    const view = render(<ChatPage />);
+    fireEvent.click(screen.getByRole('button', { name: '语音输入' }));
+    await vi.waitFor(() => expect(recorderMocks.start).toHaveBeenCalledTimes(1));
+    await act(async () => { await Promise.resolve(); });
+    view.unmount();
+    expect(recorderMocks.cancel).toHaveBeenCalledTimes(1);
+    expect(recorderMocks.stop).not.toHaveBeenCalled();
+  });
+
+  it('卸载后迟到的麦克风授权会话也立即取消', async () => {
+    stubChatAndSynth();
+    let resolveRecorder!: (session: { active: boolean; stop: ReturnType<typeof vi.fn>; cancel: ReturnType<typeof vi.fn> }) => void;
+    recorderMocks.start.mockImplementationOnce(() => new Promise((resolve) => { resolveRecorder = resolve; }));
+    const view = render(<ChatPage />);
+    fireEvent.click(screen.getByRole('button', { name: '语音输入' }));
+    view.unmount();
+    await act(async () => { resolveRecorder({ active: true, stop: recorderMocks.stop, cancel: recorderMocks.cancel }); });
+    expect(recorderMocks.cancel).toHaveBeenCalledTimes(1);
+    expect(recorderMocks.stop).not.toHaveBeenCalled();
+  });
+
+  it('等待授权时再次关闭，授权返回不恢复录音', async () => {
+    stubChatAndSynth();
+    let resolveRecorder!: (session: { active: boolean; stop: ReturnType<typeof vi.fn>; cancel: ReturnType<typeof vi.fn> }) => void;
+    recorderMocks.start.mockImplementationOnce(() => new Promise((resolve) => { resolveRecorder = resolve; }));
+    render(<ChatPage />);
+    fireEvent.click(screen.getByRole('button', { name: '语音输入' }));
+    fireEvent.click(screen.getByRole('button', { name: '停止语音输入' }));
+    await act(async () => { resolveRecorder({ active: true, stop: recorderMocks.stop, cancel: recorderMocks.cancel }); });
+    expect(recorderMocks.cancel).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: '语音输入' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '停止语音输入' })).not.toBeInTheDocument();
+  });
+
+  it('卸载停止朗读播放器、中止合成并清除播放器回调', async () => {
+    fetchMock = stubChatAndSynth();
+    const view = render(<ChatPage />);
+    fireEvent.change(screen.getByPlaceholderText('跟你的AI说点什么吧…'), { target: { value: '你好' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await screen.findByText('我在呢');
+    fireEvent.click(screen.getByRole('button', { name: '朗读' }));
+    await vi.waitFor(() => expect(playMock).toHaveBeenCalledTimes(1));
+    const request = fetchMock.mock.calls.find(([url]) => String(url).includes('/voice/synthesize_stream'));
+    const signal = request?.[1]?.signal as AbortSignal;
+    view.unmount();
+    expect(signal.aborted).toBe(true);
+    expect(players[0].pause).toHaveBeenCalledTimes(1);
+    expect(players[0].onended).toBeNull();
+    expect(players[0].onerror).toBeNull();
   });
 });

@@ -31,6 +31,8 @@ interface CxaBridge {
   getBackendToken: () => Promise<string>;
   /** 显示并聚焦主窗口（悬浮窗菜单「打开主窗口」通道） */
   showMainWindow?: () => Promise<boolean>;
+  /** 系统托盘通知（20261011 主动搭话：点击通知唤起主窗口；能力缺失主进程回 false） */
+  notifyTray?: (title: string, body: string) => Promise<boolean>;
   /** 订阅托盘桌宠开关同步；返回去订阅函数（旧主进程无此方法时为 undefined） */
   onPetSetEnabled?: (callback: (enabled: boolean) => void) => () => void;
 }
@@ -156,6 +158,17 @@ export function pickVrmFile(): Promise<string | null> {
 export function showMainWindow(): Promise<boolean> {
   if (isElectron() && window.cxaAPI?.showMainWindow) {
     return window.cxaAPI.showMainWindow();
+  }
+  return Promise.resolve(false);
+}
+
+/**
+ * 发系统托盘通知（20261011 视觉语音融合：AI 主动搭话时调用，点击通知唤起主窗口）。
+ * 仅 Electron 环境且白名单方法存在时生效；否则安全降级返回 false（不抛异常）。
+ */
+export function notifyTray(title: string, body: string): Promise<boolean> {
+  if (isElectron() && window.cxaAPI?.notifyTray) {
+    return window.cxaAPI.notifyTray(title, body);
   }
   return Promise.resolve(false);
 }

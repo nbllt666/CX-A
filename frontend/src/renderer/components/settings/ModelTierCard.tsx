@@ -73,12 +73,17 @@ export default function ModelTierCard({ modelPath, localEnabled, onLocalEnabledC
 
   const aliveRef = useRef(true);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollRequestRef = useRef<AbortController | null>(null);
+  const pollGenerationRef = useRef(0);
 
   // 卸载清理：轮询定时器必须清掉（防测试泄漏与内存泄漏）
   useEffect(() => {
     aliveRef.current = true;
     return () => {
       aliveRef.current = false;
+      pollGenerationRef.current += 1;
+      pollRequestRef.current?.abort();
+      pollRequestRef.current = null;
       if (pollTimerRef.current !== null) {
         clearInterval(pollTimerRef.current);
         pollTimerRef.current = null;
@@ -106,6 +111,9 @@ export default function ModelTierCard({ modelPath, localEnabled, onLocalEnabledC
   }, []);
 
   const stopPolling = () => {
+    pollGenerationRef.current += 1;
+    pollRequestRef.current?.abort();
+    pollRequestRef.current = null;
     if (pollTimerRef.current !== null) {
       clearInterval(pollTimerRef.current);
       pollTimerRef.current = null;
@@ -114,9 +122,13 @@ export default function ModelTierCard({ modelPath, localEnabled, onLocalEnabledC
 
   /** 拉一次进度：done / failed / canceled 终态停表；失败保留上次进度，下个周期再试 */
   const refreshProgress = async () => {
+    if (!aliveRef.current || pollRequestRef.current) return;
+    const generation = pollGenerationRef.current;
+    const controller = new AbortController();
+    pollRequestRef.current = controller;
     try {
-      const p = await fetchModelProgress();
-      if (!aliveRef.current) return;
+      const p = await fetchModelProgress(controller.signal);
+      if (!aliveRef.current || generation !== pollGenerationRef.current) return;
       setProgress(p ?? null);
       if (p?.state === 'done') {
         stopPolling();
@@ -126,27 +138,30 @@ export default function ModelTierCard({ modelPath, localEnabled, onLocalEnabledC
       }
     } catch {
       /* 单次查询失败不影响整体：保留上次进度，等下一次轮询 */
+    } finally {
+      if (pollRequestRef.current === controller) pollRequestRef.current = null;
     }
   };
 
   /** 下载所选档位：入参只带 tier（模型仓库由线路在服务端派生，与向导同口径） */
   const handleStartDownload = async () => {
     if (starting) return;
+    stopPolling();
+    const generation = pollGenerationRef.current;
     setError(null);
     setHint(null);
     setCanceled(false);
     setStarting(true);
     try {
       await startModelDownload({ tier: selectedTier || undefined });
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || generation !== pollGenerationRef.current) return;
       setStarting(false);
     } catch {
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || generation !== pollGenerationRef.current) return;
       setStarting(false);
       setError('下载没能启动…待会儿再试一次吧');
       return;
     }
-    stopPolling();
     void refreshProgress(); // 先立即拉一次，进度马上可见
     pollTimerRef.current = setInterval(() => {
       void refreshProgress();
@@ -156,9 +171,10 @@ export default function ModelTierCard({ modelPath, localEnabled, onLocalEnabledC
   /** 取消进行中的下载（保留临时文件供续传） */
   const handleCancelDownload = async () => {
     stopPolling();
+    const generation = pollGenerationRef.current;
     try {
       await cancelModelDownload();
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || generation !== pollGenerationRef.current) return;
       setProgress(null);
       setCanceled(true);
     } catch {

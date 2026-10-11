@@ -38,6 +38,8 @@ export const API_ENDPOINTS = {
     messageStream: `${API_BASE}/chat/message_stream`,
     /** 聊天历史（20261004 持久化）：GET → {ok, messages:[{role, content, time}]} 最近 200 条 */
     history: `${API_BASE}/chat/history`,
+    /** 主动视觉回复轮询（20261011）：GET → {ok, messages:[{text, summary, ts}]} 原子取空 */
+    proactive: `${API_BASE}/chat/proactive`,
   },
   voice: {
     /** 文本合成语音（POST {text, voice?} → {ok, audio_base64, mime:'audio/wav'}） */
@@ -48,6 +50,13 @@ export const API_ENDPOINTS = {
     transcribe: `${API_BASE}/voice/transcribe`,
     /** 语音引擎预热（20261010 低延迟：后台拉热 sidecar/TTS/ASR 三层懒加载，异步立即返回） */
     warmup: `${API_BASE}/voice/warmup`,
+    /** 主模型话轮判定（20261010 全双工：POST {text} → {ok, decision:'CONTINUE|SEND|IGNORE'}） */
+    turnCheck: `${API_BASE}/voice/turn_check`,
+    /**
+     * 语音视觉预填充（20261011 视觉语音融合）：开口瞬间截图进主对话 KV cache。
+     * fire-and-forget，失败静默不阻断语音。
+     */
+    visualPrefill: `${API_BASE}/voice/visual_prefill`,
   },
   voices: {
     /** 音色包列表（GET → {ok, voices:[{id, path, is_default, size, builtin}]}，首项恒为内置 cx-open） */
@@ -142,9 +151,7 @@ const DEFAULT_TIMEOUT_MS = 300_000;
 /**
  * 通用 JSON 请求封装：非 2xx 视为失败并抛错（供上层 try/catch 降级）。
  *
- * F-5（第三轮体检批次6）：内置 AbortController 超时——后端为单线程服务，
- * 被长任务阻塞时无超时的 fetch 会永久挂起、UI 锁死；超时后 abort 并抛出
- * 明确的中文超时错误，调用方 catch 后正常降级。
+ * 超时覆盖请求及响应体读取；调用方的 init.signal 同样可以取消这两个阶段。
  *
  * @param url 请求地址
  * @param init 可选 fetch 初始化（method/headers/body 等）
@@ -162,31 +169,47 @@ export async function requestJson<T>(
     headers.set('X-Client-Token', token);
   }
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let res: Response;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const signal = init?.signal;
+  const onExternalAbort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) {
+    onExternalAbort();
+  } else {
+    signal?.addEventListener('abort', onExternalAbort, { once: true });
+  }
   try {
-    res = await fetch(url, { ...init, headers, signal: controller.signal });
+    controller.signal.throwIfAborted();
+    const res = await fetch(url, { ...init, headers, signal: controller.signal });
+    controller.signal.throwIfAborted();
+    if (!res.ok) {
+      // 保留后端错误信息；读取错误体时也必须响应超时和外部取消。
+      let detail = '';
+      try {
+        const text = await res.text();
+        if (text) detail = ` ${text.slice(0, 200)}`;
+      } catch (err) {
+        if (controller.signal.aborted) throw err;
+        /* 响应体不可读（流已消费等）时跳过 */
+      }
+      controller.signal.throwIfAborted();
+      throw new Error(`后端请求失败: ${res.status} ${res.statusText}${detail}`);
+    }
+    const data = await res.json() as T;
+    controller.signal.throwIfAborted();
+    return data;
   } catch (err) {
-    if (controller.signal.aborted) {
+    if (timedOut) {
       throw new Error(`后端请求超时（${Math.round(timeoutMs / 1000)} 秒）: ${url}`);
     }
     throw err;
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onExternalAbort);
   }
-  if (!res.ok) {
-    // D5 修复：非 2xx 时读取响应体片段（截断 200 字符）拼入错误信息，
-    // 让后端错误码 / 错误说明对调用方可见；响应体不可读时静默跳过。
-    let detail = '';
-    try {
-      const text = await res.text();
-      if (text) detail = ` ${text.slice(0, 200)}`;
-    } catch {
-      /* 响应体不可读（流已消费等）时跳过 */
-    }
-    throw new Error(`后端请求失败: ${res.status} ${res.statusText}${detail}`);
-  }
-  return res.json() as Promise<T>;
 }
 
 /**
@@ -437,11 +460,88 @@ export async function sendChatMessage(payload: ChatMessagePayload): Promise<Chat
   });
 }
 
+export interface ChatStreamResult {
+  ok: boolean;
+  clean_text?: string;
+  mood?: string;
+  offline?: boolean;
+  incomplete?: boolean;
+  error?: string;
+}
+
+/** 消费 NDJSON，回调返回 true 即收口；取消也能唤醒未完成的 read。 */
+async function consumeNdjsonStream(
+  body: ReadableStream<Uint8Array>,
+  onFrame: (frame: Record<string, unknown>) => boolean | void,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  const read = async () => {
+    signal?.throwIfAborted();
+    if (!signal) return reader.read();
+    let onAbort!: () => void;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([reader.read(), aborted]);
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
+  };
+  const handleLine = (line: string): boolean => {
+    signal?.throwIfAborted();
+    if (!line.trim()) return false;
+    let frame: unknown;
+    try {
+      frame = JSON.parse(line);
+    } catch {
+      return false; // 非 JSON 行（心跳等）静默跳过。
+    }
+    if (!frame || typeof frame !== 'object' || Array.isArray(frame)) return false;
+    const finished = onFrame(frame as Record<string, unknown>) === true;
+    signal?.throwIfAborted();
+    return finished;
+  };
+  try {
+    signal?.throwIfAborted();
+    while (true) {
+      const { done, value } = await read();
+      signal?.throwIfAborted();
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (handleLine(line)) return true;
+      }
+      if (done) return buffer.trim() ? handleLine(buffer) : false;
+    }
+  } finally {
+    try {
+      // cancel 先终止读取；不等待底层连接关闭，避免清理反过来阻塞打断。
+      void reader.cancel().catch(() => {});
+    } catch {
+      /* 已失败的流仍需释放 reader；清理错误不得遮盖原始错误。 */
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        /* 清理错误不得遮盖原始错误。 */
+      }
+    }
+  }
+}
+
 /**
  * 表情聊天流式版（20261010_模块0_语音交互延迟优化）：POST /api/chat/message_stream。
  *
- * NDJSON 逐行帧：`{delta}`* → `{done, ok, clean_text, mood, raw, offline?}`（流中途
- * 失败先来一帧 `{error}` 再 done——已收文本照常可用）。onDelta 逐帧回调 raw 增量
+ * NDJSON 逐行帧：`{delta}`* → `{done, ok, clean_text, mood, raw, offline?, incomplete?}`。
+ * 中途失败保留已收文本，但 error 帧、失败 done 或缺少 done 不得被当作成功。
+ * onDelta 逐帧回调 raw 增量
  * （含 [emotion:x] 标签原文，剥离由调用方的 StreamTextPipeline 增量做），返回
  * Promise 在 done 帧时 resolve（权威 clean_text/mood；客户端 abort 时 reject）。
  *
@@ -453,68 +553,48 @@ export async function chatMessageStream(
   onDelta: (delta: string) => void,
   signal?: AbortSignal,
   agentId?: string,
-): Promise<{ clean_text?: string; mood?: string; offline?: boolean } | undefined> {
+  opts?: { visual?: boolean },
+): Promise<ChatStreamResult> {
   const token = await ensureBackendToken();
   const headers = new Headers({ 'Content-Type': 'application/json' });
   if (token) headers.set('X-Client-Token', token);
+  signal?.throwIfAborted();
+  const body: Record<string, unknown> = { message };
+  if (agentId) body.agent_id = agentId;
+  // visual=true（20261011 视觉语音融合）：后端一次性消费开口瞬间的 pending
+  // 截图（user content 组 [image_url, 文本]；云端纯文本 provider 自动剥图降级）
+  if (opts?.visual) body.visual = true;
   const res = await fetch(API_ENDPOINTS.chat.messageStream, {
     method: 'POST',
     headers,
-    body: JSON.stringify(agentId ? { message, agent_id: agentId } : { message }),
+    body: JSON.stringify(body),
     signal,
   });
   if (!res.ok || !res.body) {
     const msg = await res.text().catch(() => '');
     throw new Error(`流式对话失败（${res.status}）：${msg.slice(0, 200)}`);
   }
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let buffer = '';
-  let final: { clean_text?: string; mood?: string; offline?: boolean } | undefined;
-  const handleLine = (line: string) => {
-    if (!line.trim()) return;
-    let frame: {
-      delta?: string;
-      error?: string;
-      done?: boolean;
-      clean_text?: string;
-      mood?: string;
-      offline?: boolean;
-    };
-    try {
-      frame = JSON.parse(line);
-    } catch {
-      return; // 非 JSON 行（心跳等）静默跳过
-    }
+  let final: ChatStreamResult | undefined;
+  let streamError: string | undefined;
+  await consumeNdjsonStream(res.body, (frame) => {
+    if (typeof frame.error === 'string' && frame.error) streamError = frame.error;
     if (typeof frame.delta === 'string' && frame.delta) {
       onDelta(frame.delta);
     }
-    // error 帧仅提示（已收文本照常播放）；done 帧为权威收口
-    if (frame.done) {
+    if (frame.done === true) {
+      const ok = frame.ok !== false && frame.incomplete !== true && !streamError;
       final = {
+        ok,
         clean_text: typeof frame.clean_text === 'string' ? frame.clean_text : undefined,
         mood: typeof frame.mood === 'string' ? frame.mood : undefined,
         offline: frame.offline === true,
+        incomplete: frame.incomplete === true || !ok,
+        error: streamError,
       };
+      return true;
     }
-  };
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let nl: number;
-      while ((nl = buffer.indexOf('\n')) !== -1) {
-        handleLine(buffer.slice(0, nl));
-        buffer = buffer.slice(nl + 1);
-      }
-    }
-    if (buffer.trim()) handleLine(buffer);
-  } catch (err) {
-    if (signal?.aborted) throw err; // 打断：抛 AbortError 由会话层静默
-    throw err;
-  }
-  return final;
+  }, signal);
+  return final ?? { ok: false, incomplete: true, error: streamError ?? '流式对话未完整结束' };
 }
 
 /**
@@ -529,6 +609,78 @@ export async function warmupVoiceEngine(): Promise<void> {
   await requestJson<{ ok?: boolean; warmup?: string }>(API_ENDPOINTS.voice.warmup, {
     method: 'POST',
   });
+}
+
+/**
+ * 语音视觉预填充（20261011 视觉语音融合）：POST /api/voice/visual_prefill。
+ *
+ * 用户开口瞬间 fire-and-forget 调用——后端截一帧屏幕存为 pending 并预填充
+ * 进主对话 KV cache（llama-server cache-prompt），正式语音请求命中该前缀，
+ * 图像 token 免重算。尽力而为：截图失败 / 本地未就绪 / 预填充失败一律静默
+ * （语音链路绝不因视觉失败中断）。
+ */
+export async function prefillVoiceVisual(): Promise<void> {
+  try {
+    await requestJson<{ ok?: boolean; prefilled?: boolean }>(
+      API_ENDPOINTS.voice.visualPrefill,
+      { method: 'POST' },
+      8000,
+    );
+  } catch {
+    /* 静默：预填充是旁路优化，失败不阻断语音 */
+  }
+}
+
+/** 一条主动视觉回复（GET /api/chat/proactive 返回项；20261011 契约）。 */
+export interface ProactiveMessage {
+  /** AI 主动搭话文本（TTS 朗读 + 气泡展示） */
+  text: string;
+  /** 触发时的画面摘要（悬浮提示用，可为空） */
+  summary?: string;
+  /** 产出时间戳（秒） */
+  ts?: number;
+}
+
+/**
+ * 取走主动视觉回复（20261011）：GET /api/chat/proactive 原子取空。
+ * at-most-once——取走即清空，调用方负责气泡展示 / TTS / 托盘通知。
+ */
+export async function fetchProactiveMessages(): Promise<ProactiveMessage[]> {
+  try {
+    const data = await requestJson<{ ok?: boolean; messages?: ProactiveMessage[] }>(
+      API_ENDPOINTS.chat.proactive,
+      { method: 'GET' },
+      5000,
+    );
+    return Array.isArray(data?.messages) ? data.messages : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 话轮判定结果（对齐 CX-O agent_interrupt_user 三态；CX-A 场景 IGNORE=丢弃不回复）。 */
+export type VoiceTurnVerdict = 'CONTINUE' | 'SEND' | 'IGNORE';
+
+/**
+ * 主模型话轮判定（20261010_模块0_语音交互延迟优化）：POST /api/voice/turn_check。
+ *
+ * 判定请求复用主对话 system+历史前缀——llama-server cache-reuse 命中已缓存部分，
+ * prefill 只算判定指令增量（主模型判定模式吃投机预填充红利）。1.5s 短超时：
+ * 判定是锦上添花，超时按 SEND 兜底（宁误发不吞话，不拖慢发送路径）。
+ */
+export async function checkVoiceTurn(text: string): Promise<VoiceTurnVerdict> {
+  try {
+    const data = await requestJson<{ ok?: boolean; decision?: string }>(
+      API_ENDPOINTS.voice.turnCheck,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) },
+      1500,
+    );
+    const decision = data?.decision;
+    if (decision === 'CONTINUE' || decision === 'IGNORE') return decision;
+    return 'SEND';
+  } catch {
+    return 'SEND'; // 超时/失败兜底：固定静音断句的行为
+  }
 }
 
 /** 一条对话历史记录（GET /api/chat/history 返回项；20261004 持久化契约）。 */
@@ -634,6 +786,7 @@ export async function synthesizeSpeechStream(
   const headers = new Headers({ 'Content-Type': 'application/json' });
   if (token) headers.set('X-Client-Token', token);
   try {
+    signal?.throwIfAborted();
     const res = await fetch(API_ENDPOINTS.voice.synthesizeStream, {
       method: 'POST',
       headers,
@@ -644,39 +797,14 @@ export async function synthesizeSpeechStream(
       const msg = await res.text().catch(() => '');
       throw new Error(`流式合成失败（${res.status}）：${msg.slice(0, 200)}`);
     }
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder('utf-8');
-    let buffer = '';
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let nl: number;
-        while ((nl = buffer.indexOf('\n')) !== -1) {
-          const line = buffer.slice(0, nl).trim();
-          buffer = buffer.slice(nl + 1);
-          if (!line) continue;
-          let obj: SpeechStreamChunk;
-          try {
-            obj = JSON.parse(line) as SpeechStreamChunk;
-          } catch {
-            continue;
-          }
-          if (obj.done) {
-            onDone?.(obj.total ?? 0);
-            return;
-          }
-          onChunk(obj);
-        }
+    await consumeNdjsonStream(res.body, (frame) => {
+      const obj = frame as SpeechStreamChunk;
+      if (obj.done === true) {
+        onDone?.(obj.total ?? 0);
+        return true;
       }
-    } finally {
-      try {
-        reader.releaseLock();
-      } catch {
-        /* ignore */
-      }
-    }
+      onChunk(obj);
+    }, signal);
   } catch (e) {
     // 中断（signal 触发）是预期控制流：静默结束，不作为错误上抛；其余异常原样上抛
     if ((e as DOMException | undefined)?.name === 'AbortError' || signal?.aborted) return;
@@ -1016,8 +1144,19 @@ export interface SettingsView {
   local_llm: { enabled: boolean; ready?: boolean; model_path?: string; gpu_preference?: string };
   acp: { enabled: boolean };
   remote: { enabled: boolean };
-  /** 主动视觉开关（视图新增字段；旧后端缺失时前端按关闭处理） */
-  vision?: { enabled: boolean };
+  /**
+   * 主动视觉：enabled=采样开关（旧后端缺失时前端按关闭处理）；
+   * proactive_enabled=主动搭话开关（20261011，视觉理解判定 reply_worthy 后是否
+   * 允许 AI 主动开口；旧后端缺失时前端按开启处理）；
+   * image_window=上下文保留图像数量（1~8）/ image_max_tokens=单图 token 预算
+   * （256~4096；设置页两数字输入的回显来源，旧后端缺失时按默认值处理）
+   */
+  vision?: {
+    enabled: boolean;
+    proactive_enabled?: boolean;
+    image_window?: number;
+    image_max_tokens?: number;
+  };
   /** 聊天记忆注入开关（RAG 闭环，20261005；旧后端缺失时前端按开启处理） */
   memory?: { context_inject: boolean };
   /**
@@ -1309,10 +1448,10 @@ export async function startModelDownload(
 const PROGRESS_TIMEOUT_MS = 10_000;
 
 /** 查询下载进度（GET /api/setup/model/progress）：短超时，失败由调用方保留上次进度。 */
-export async function fetchModelProgress(): Promise<ModelProgress> {
+export async function fetchModelProgress(signal?: AbortSignal): Promise<ModelProgress> {
   return requestJson<ModelProgress>(
     API_ENDPOINTS.setup.modelProgress,
-    undefined,
+    { signal },
     PROGRESS_TIMEOUT_MS,
   );
 }

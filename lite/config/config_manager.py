@@ -149,6 +149,17 @@ DEFAULTS = {
         "min_interval_s": 30,
         "still_threshold_s": 10,
         "queue_size": 16,
+        # 20261011 主动视觉上下文管理（用户需求：视觉预算设置可调 + 图像数量控制）：
+        # image_window = 视觉会话上下文保留的图像数量（1~8，默认 3——模型看到最近
+        # N 张连续截图做时序对比理解；PUT 热更即时生效，超窗下次请求整体重置）；
+        # image_max_tokens = 单张截图 token 预算（256~4096，默认 1024——Gemma 4
+        # 视觉预算可调，argv 进程参数，改后需重启生效）。
+        "image_window": 3,
+        "image_max_tokens": 1024,
+        # 20261011 视觉语音融合：主动搭话开关——视觉理解判定 reply_worthy 后允许
+        # AI 主动开口（后端队列 + 前端气泡/TTS/托盘通知）。与采样开关（enabled）
+        # 分离：采样开着但不想被打扰时可单独关闭主动搭话。
+        "proactive_enabled": True,
     },
 }
 

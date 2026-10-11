@@ -11,7 +11,7 @@ import threading
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from http.server import HTTPServer
+from http.server import ThreadingHTTPServer
 
 from lite.cloud.adapter import CloudConfigError, CloudUnavailableError
 from lite.cloud.fallback import (
@@ -56,7 +56,7 @@ class _FakeCloud:
 
 
 @contextmanager
-def running_server(tmp_path, cloud=None, chat_fallback=None):
+def running_server(tmp_path, cloud=None, chat_fallback=None, voice=None):
     """以临时数据目录起服（make_handler 注入 cloud / chat_fallback），yield (base_url, manager)。
 
     computer 三件套显式构建于 tmp_path，避免 make_handler 默认构建落盘项目根 data/；
@@ -70,9 +70,9 @@ def running_server(tmp_path, cloud=None, chat_fallback=None):
     handler = make_handler(
         store, pipeline, manager,
         computer=computer, authorizer=authorizer, bridge=bridge,
-        chat_cloud=cloud, chat_fallback=chat_fallback,
+        chat_cloud=cloud, chat_fallback=chat_fallback, voice=voice,
     )
-    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -81,6 +81,10 @@ def running_server(tmp_path, cloud=None, chat_fallback=None):
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
+        store.close()
+        close = getattr(pipeline.vector_store, "close", None)
+        if callable(close):
+            close()
 
 
 def http_post(url, payload, method="POST"):

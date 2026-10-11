@@ -116,6 +116,85 @@ def test_ready_flags_default_false():
 
 
 # ------------------------------------------------------------------ #
+# 1b. 视觉专用实例（20261010 主动视觉 KV 隔离 + 图像预算可调）          #
+# ------------------------------------------------------------------ #
+
+def test_vision_image_budget_defaults_and_bounds():
+    """vision.image_max_tokens 预算读取：缺失/非法/越界回 1024；合法值透传。"""
+    assert LlamaRuntime(config=None)._vision_image_max_tokens == 1024
+    assert LlamaRuntime(config={"vision": {"image_max_tokens": 768}})._vision_image_max_tokens == 768
+    assert LlamaRuntime(config={"vision": {"image_max_tokens": "2048"}})._vision_image_max_tokens == 2048
+    assert LlamaRuntime(config={"vision": {"image_max_tokens": "abc"}})._vision_image_max_tokens == 1024
+    assert LlamaRuntime(config={"vision": {"image_max_tokens": 128}})._vision_image_max_tokens == 1024  # 低于下限
+    assert LlamaRuntime(config={"vision": {"image_max_tokens": 9999}})._vision_image_max_tokens == 1024  # 超上限
+
+
+def test_vision_chat_raises_when_not_ready():
+    """主 chat 路径未就绪（_external_chat None）→ vision_chat 抛 LlamaNotReady。"""
+    rt = LlamaRuntime(config=None)
+    with pytest.raises(LlamaNotReady):
+        rt.vision_chat([{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+
+
+def test_vision_chat_lazy_builds_dedicated_instance_and_close_reclaims(monkeypatch):
+    """vision_chat 走**主链路实例** + 滚动图像窗口：追加命中前缀、满窗重置、close 清空。
+
+    20261011 视觉进主链路（用户裁决：效果更好——时序对比理解；更灵活——窗口/预算
+    设置可调）。KV 复用逻辑：新图追加尾部 → 上一轮全部消息构成下一轮前缀（完美
+    命中）；窗口满 → 整体重置（锯齿式）。"""
+    captured = {}
+    requests_log = []
+
+    class FakeMainChatServer:
+        """fake 主链路实例：记录每次请求的完整 messages（断言窗口滚动形状）。"""
+
+        def __init__(self):
+            self.requests = []
+
+        def chat(self, messages, max_tokens=128, temperature=0.7, seed=None, timeout=None):
+            requests_log.append([dict(m) for m in messages])
+            captured["max_tokens"] = max_tokens
+            return f"描述第 {len(requests_log)} 张图"
+
+        def close(self):
+            pass
+
+    rt = LlamaRuntime(config={"vision": {"image_window": 2, "image_max_tokens": 768}})
+    rt._external_chat = FakeMainChatServer()
+
+    def frame(n):
+        return [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "用一句话客观描述这帧屏幕内容"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,frame{n}"}},
+            ],
+        }]
+
+    # 第 1 帧：窗口空 → 注入 system + user(图1)
+    rt.vision_chat(frame(1))
+    assert len(requests_log[0]) == 2  # system + user(图1)
+    assert requests_log[0][0]["role"] == "system"
+    assert captured["max_tokens"] == 96
+
+    # 第 2 帧：追加 → 前缀 = 第 1 轮全部（system+图1+assistant）+ user(图2)
+    rt.vision_chat(frame(2))
+    req2 = requests_log[1]
+    assert len(req2) == 4  # system + user(图1) + assistant(描述1) + user(图2)
+    assert req2[2]["role"] == "assistant" and "第 1 张图" in req2[2]["content"]
+
+    # 第 3 帧：窗口（image_window=2）已满 → 整体重置（只留 system + user(图3)）
+    rt.vision_chat(frame(3))
+    req3 = requests_log[2]
+    assert len(req3) == 2  # 重置：system + user(图3)
+    assert rt._vision_window_count == 1
+
+    # close 清空视觉窗口
+    rt.close()
+    assert rt._vision_history == [] and rt._vision_window_count == 0
+
+
+# ------------------------------------------------------------------ #
 # 2. fake llama_cpp：加载成功 + 嵌入形状 + 判定 + 离线回复           #
 # ------------------------------------------------------------------ #
 

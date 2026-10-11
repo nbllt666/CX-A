@@ -274,6 +274,11 @@ export default function SettingsPage() {
   const [localReady, setLocalReady] = useState(false);
   // 主动视觉开关（GET settings vision.enabled）
   const [visionEnabled, setVisionEnabled] = useState(false);
+  // 主动搭话开关（20261011：vision.proactive_enabled——画面值得回应时 AI 主动开口）
+  const [proactiveEnabled, setProactiveEnabled] = useState(true);
+  // 主动视觉上下文管理（20261011）：保留图像数量（1~8，热更）与单图 token 预算（256~4096，重启生效）
+  const [visionWindow, setVisionWindow] = useState(3);
+  const [visionBudget, setVisionBudget] = useState(1024);
   // 聊天时自动回忆开关（GET settings memory.context_inject，RAG 记忆注入）
   const [contextInject, setContextInject] = useState(true);
   // 音色导入成功的轻量提示（样式与运行偏好提示 accelHint 同款）
@@ -362,6 +367,9 @@ export default function SettingsPage() {
           setLocalMode(Boolean(st?.local_llm?.enabled ?? FALLBACK_LOCAL_MODE));
           setLocalReady(Boolean(st?.local_llm?.ready ?? false));
           setVisionEnabled(Boolean(st?.vision?.enabled ?? false));
+          setProactiveEnabled(Boolean(st?.vision?.proactive_enabled ?? true));
+          setVisionWindow(Number(st?.vision?.image_window ?? 3) || 3);
+          setVisionBudget(Number(st?.vision?.image_max_tokens ?? 1024) || 1024);
           setContextInject(Boolean(st?.memory?.context_inject ?? true));
           const v = st?.tts?.voice || FALLBACK_VOICE;
           setVoice(v);
@@ -481,6 +489,38 @@ export default function SettingsPage() {
     void updateSettings({ vision: { enabled: next } }).catch(() => {
       if (seq !== settingsSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
       setSaveError('主动视觉开关没保存上…待会儿再拨一次就好啦');
+    });
+  };
+  // 主动搭话开关：PUT /api/settings {vision:{proactive_enabled}}（20261011，热更段即时生效）
+  const handleProactiveChange = (next: boolean) => {
+    setProactiveEnabled(next);
+    const seq = ++settingsSeqRef.current;
+    setSaveError(null);
+    setCustomHint(null);
+    void updateSettings({ vision: { proactive_enabled: next } }).catch(() => {
+      if (seq !== settingsSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
+      setSaveError('主动搭话开关没保存上…待会儿再拨一次就好啦');
+    });
+  };
+  // 主动视觉上下文管理（20261011）：保留图像数量（热更即时）与单图预算（重启生效）
+  const handleVisionWindowChange = (next: number) => {
+    const clamped = Math.max(1, Math.min(8, Math.round(next) || 1));
+    setVisionWindow(clamped);
+    const seq = ++settingsSeqRef.current;
+    setSaveError(null);
+    void updateSettings({ vision: { image_window: clamped } }).catch(() => {
+      if (seq !== settingsSeqRef.current) return;
+      setSaveError('保留图像数量没保存上…待会儿再调一次就好啦');
+    });
+  };
+  const handleVisionBudgetChange = (next: number) => {
+    const clamped = Math.max(256, Math.min(4096, Math.round(next) || 1024));
+    setVisionBudget(clamped);
+    const seq = ++settingsSeqRef.current;
+    setSaveError(null);
+    void updateSettings({ vision: { image_max_tokens: clamped } }).catch(() => {
+      if (seq !== settingsSeqRef.current) return;
+      setSaveError('图像预算没保存上…待会儿再调一次就好啦');
     });
   };
   // 聊天时自动回忆开关：PUT /api/settings {memory:{context_inject}}（热更段即时生效）
@@ -1002,6 +1042,51 @@ export default function SettingsPage() {
         >
           <Toggle checked={visionEnabled} onChange={handleVisionChange} label="主动视觉" />
         </SettingRow>
+
+        {/* 主动视觉上下文管理（20261011）：保留图像数量 + 单图预算 */}
+        {visionEnabled ? (
+          <SettingRow
+            title="看到的画面保留几张"
+            desc="它记画面时保留最近几张截图做对比理解（1~8 张）；调大更懂连续变化、也更占脑子"
+          >
+            <input
+              type="number"
+              min={1}
+              max={8}
+              value={visionWindow}
+              onChange={(e) => handleVisionWindowChange(Number(e.target.value))}
+              aria-label="保留图像数量"
+              className="w-20 rounded-xl border border-[var(--stroke)] bg-[var(--glass)] px-3 py-1.5 text-center text-sm text-[var(--text-primary)] outline-none focus:border-[var(--pink-300)]"
+            />
+          </SettingRow>
+        ) : null}
+        {visionEnabled ? (
+          <SettingRow
+            title="单张画面理解预算"
+            desc="每张画面允许占用的思考空间（256~4096）；调大看得更细、也更占脑子（改完重启生效）"
+          >
+            <input
+              type="number"
+              min={256}
+              max={4096}
+              step={128}
+              value={visionBudget}
+              onChange={(e) => handleVisionBudgetChange(Number(e.target.value))}
+              aria-label="单图理解预算"
+              className="w-24 rounded-xl border border-[var(--stroke)] bg-[var(--glass)] px-3 py-1.5 text-center text-sm text-[var(--text-primary)] outline-none focus:border-[var(--pink-300)]"
+            />
+          </SettingRow>
+        ) : null}
+
+        {/* 主动搭话（20261011 视觉语音融合）：画面值得回应时 AI 主动开口 */}
+        {visionEnabled ? (
+          <SettingRow
+            title="主动搭话"
+            desc="看到值得回应的画面时主动跟你说一声，还会发系统通知；不想被打扰就关掉"
+          >
+            <Toggle checked={proactiveEnabled} onChange={handleProactiveChange} label="主动搭话" />
+          </SettingRow>
+        ) : null}
 
         {/* 聊天时自动回忆（RAG 记忆注入，20261005） */}
         <SettingRow

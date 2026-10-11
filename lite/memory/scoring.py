@@ -16,6 +16,7 @@ relevance 由外部（向量检索相似度）给出并通过候选 dict 的 ``s
 """
 
 import logging
+from heapq import nlargest
 
 from .decay import DecayCalculator, age_seconds_from_created
 
@@ -98,6 +99,7 @@ def score_memories(
     relevance_weight=None,
     scene_context=None,
     _decay_calculator=None,
+    limit=None,
 ):
     """对候选记忆做三维加权打分，返回附加 final_score / component_scores 并按分数降序的列表。
 
@@ -160,6 +162,8 @@ def score_memories(
         }
         cand["final_score"] = min(final, 1.0)
 
+    if limit is not None:
+        return nlargest(max(0, int(limit)), candidates, key=lambda m: m.get("final_score", 0))
     candidates.sort(key=lambda m: m.get("final_score", 0), reverse=True)
     return candidates
 

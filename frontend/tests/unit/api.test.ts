@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { requestJson, synthesizeSpeech, synthesizeSpeechStream, transcribeAudio } from '../../src/renderer/api';
+import {
+  requestJson,
+  synthesizeSpeech,
+  synthesizeSpeechStream,
+  transcribeAudio,
+  prefillVoiceVisual,
+  fetchProactiveMessages,
+} from '../../src/renderer/api';
 
 /**
  * Test1 · requestJson 非 2xx 错误体透出（D5 修复回归）。
@@ -362,5 +369,55 @@ describe('synthesizeSpeechStream：AbortError 消化（20261003）', () => {
 
     streamController.error(new Error('boom'));
     await expect(pending).rejects.toThrow('boom');
+  });
+});
+
+describe('视觉语音融合接口：开口预填充 + 主动消息轮询（20261011）', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** stub fetch 返回 2xx JSON，返回 mock 以便断言调用参数 */
+  function stubJson(payload: unknown): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('prefillVoiceVisual → POST /api/voice/visual_prefill；失败静默不抛', async () => {
+    const fetchMock = stubJson({ ok: true, prefilled: true });
+    await expect(prefillVoiceVisual()).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(API_ENDPOINTS.voice.visualPrefill);
+    expect(url).toMatch(/\/api\/voice\/visual_prefill$/);
+    expect(init.method).toBe('POST');
+
+    // 网络失败：静默（fire-and-forget 契约，绝不打断语音链路）
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('x', { status: 500 })));
+    await expect(prefillVoiceVisual()).resolves.toBeUndefined();
+  });
+
+  it('fetchProactiveMessages → GET /api/chat/proactive；取空/失败返回 []', async () => {
+    const fetchMock = stubJson({
+      ok: true,
+      messages: [{ text: '在忙什么呀', summary: '你在写代码', ts: 1.5 }],
+    });
+    const data = await fetchProactiveMessages();
+    expect(data).toHaveLength(1);
+    expect(data[0].text).toBe('在忙什么呀');
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(API_ENDPOINTS.chat.proactive);
+    expect(url).toMatch(/\/api\/chat\/proactive$/);
+    expect(init.method).toBe('GET');
+
+    // 失败兜底：返回空数组（轮询路径不抛错）
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('x', { status: 500 })));
+    await expect(fetchProactiveMessages()).resolves.toEqual([]);
   });
 });

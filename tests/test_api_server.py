@@ -879,6 +879,61 @@ def test_voice_synthesize_empty_text_400(api_server):
         assert body["error"] == "bad_request"
 
 
+def test_strip_speech_noise_strips_emoji_and_squeezes_blank():
+    """朗读清洗（20261010 全双工实测发现）：emoji/装饰符号剥离 + 空白压缩去首尾。"""
+    from lite.server.api_server import _strip_speech_noise
+
+    # 全双工实测原始案例：模型回复尾部 emoji → 剥掉且不留尾空格
+    assert _strip_speech_noise("在呢 。您有什么需要我帮忙的吗？ \U0001F60A") == (
+        "在呢 。您有什么需要我帮忙的吗？"
+    )
+    # 连续 emoji 紧贴正文 → 剥后不留空洞
+    assert _strip_speech_noise("好的\U0001F525！一起\U0001F525\U0001F525走吧") == "好的！一起走吧"
+    # 纯 emoji → 空串（端点据此 400「无可用内容」）
+    assert _strip_speech_noise("\U0001F60A\U0001F60A") == ""
+    # 组合 emoji（零宽连接 + 变体选择符）整体剥离
+    assert _strip_speech_noise("好\u200D\U0001F91D\n吧") == "好\n吧"
+    # 普通文本原样
+    assert _strip_speech_noise("普通文本不动") == "普通文本不动"
+
+
+def test_voice_synthesize_strips_emoji(api_server):
+    """POST /api/voice/synthesize：含 emoji 的文本照常合成，emoji 不进 TTS（不 400）。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(
+        f"{base}/api/voice/synthesize", {"text": "你好 \U0001F60A 世界"}
+    )
+    assert status == 200
+    assert body["ok"] is True
+
+
+def test_voice_synthesize_emoji_only_400(api_server):
+    """POST /api/voice/synthesize：剥掉 emoji 后无可用内容 → 400。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/voice/synthesize", {"text": "\U0001F60A\U0001F3B5"})
+    assert status == 400
+    assert body["error"] == "bad_request"
+
+
+def test_voice_turn_check_empty_text_400(api_server):
+    """POST /api/voice/turn_check：text 缺失 / 空白 → 400 bad_request。"""
+    _store, _pipeline, base = api_server
+    for payload in ({}, {"text": ""}, {"text": "   "}):
+        status, body = http_post(f"{base}/api/voice/turn_check", payload)
+        assert status == 400
+        assert body["error"] == "bad_request"
+
+
+def test_voice_turn_check_local_llm_not_ready_sends(api_server):
+    """POST /api/voice/turn_check：本地 LLM 未就绪 → SEND 兜底（宁误发不吞话）。"""
+    _store, _pipeline, base = api_server
+    status, body = http_post(f"{base}/api/voice/turn_check", {"text": "今天我们"})
+    assert status == 200
+    assert body["ok"] is True
+    assert body["decision"] == "SEND"
+    assert body["reason"] == "local_llm_not_ready"
+
+
 def test_voice_transcribe_returns_text(api_server):
     """POST /api/voice/transcribe：MockASR 返回占位文本 → 200 {ok:true, text}。"""
     _store, _pipeline, base = api_server
@@ -2780,11 +2835,11 @@ def test_vision_tick_thread_survives_capture_exception(vision_env):
 
 
 def test_settings_view_contains_vision_enabled(api_server):
-    """GET /api/settings：vision.enabled 默认 False 出现在视图中。"""
+    """GET /api/settings：vision.enabled 默认 False（+ proactive_enabled 默认 True）出现在视图中。"""
     _store, _pipeline, base = api_server
     status, body, _raw = http_get(f"{base}/api/settings")
     assert status == 200
-    assert body["vision"] == {"enabled": False}
+    assert body["vision"] == {"enabled": False, "proactive_enabled": True}
 
 
 def test_settings_put_vision_enabled_applied_and_echoed(api_server):

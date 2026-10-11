@@ -24,6 +24,7 @@ from .manager import MemoryManager, tokenize_text
 from .scoring import _get_weights, score_memories
 from .storage import MemoryStore
 from .vector_store import VectorStore
+from ._locking import synchronized
 
 # 关键字混合加权默认值（与任务契约对齐）
 DEFAULT_VECTOR_WEIGHT = 0.6
@@ -112,6 +113,7 @@ class MemoryRetrievalPipeline:
             embed_fn=self._embed_one,
         )
         self.decay = self.manager.decay
+        self._lock = self.manager._lock
         # 与内部 manager 保持同一生效阈值（含配置接线后的值）
         self.dedup_threshold = self.manager.dedup_threshold
         #: 嵌入失败告警去重标记（首次失败告警，恢复成功后复位，避免逐请求刷屏）
@@ -140,6 +142,7 @@ class MemoryRetrievalPipeline:
         return vector
 
     # ------------------------------------------------------------------ 写
+    @synchronized
     def add(
         self,
         content,
@@ -187,7 +190,10 @@ class MemoryRetrievalPipeline:
         return memory_id
 
     # ------------------------------------------------------------------ 读
-    def retrieve(self, query, agent_id="default", top_k=None) -> dict:
+    @synchronized
+    def retrieve(self, query, agent_id="default", top_k=None, mem_type=None,
+                 importance_weight=None, time_weight=None, relevance_weight=None,
+                 limit=None) -> dict:
         """检索并注入上下文。
 
         流程：
@@ -233,7 +239,7 @@ class MemoryRetrievalPipeline:
         # b) 关键字检索：对全量内存（含衰减所需状态字段）打分。
         # 中-2（第四轮体检批次B）：分词统一走 manager.tokenize_text（中文 bigram +
         # 拉丁整词），修复中文整句单 token 导致 keyword_score 恒 0。
-        memories = self.store.list(agent_id=agent_id, include_deleted=False)
+        memories = self.store.list(type=mem_type, agent_id=agent_id, include_deleted=False)
         query_tokens = tokenize_text(query)
         candidates = []
         for mem in memories:
@@ -249,27 +255,30 @@ class MemoryRetrievalPipeline:
             candidates.append(mem)
 
         if not candidates:
-            return {"memories": [], "context_text": _build_context([])}
+            return {"memories": [], "context_text": _build_context([]), "total": 0}
 
         # d) 三维打分（复用 scoring + DecayCalculator 衰减校正）
         weights = _get_weights(self.scene_context)
+        result_limit = self.max_memories if limit is None else max(0, int(limit))
         scored = score_memories(
             candidates,
             query=query,
-            importance_weight=weights["importance"],
-            time_weight=weights["time"],
-            relevance_weight=weights["relevance"],
+            importance_weight=weights["importance"] if importance_weight is None else importance_weight,
+            time_weight=weights["time"] if time_weight is None else time_weight,
+            relevance_weight=weights["relevance"] if relevance_weight is None else relevance_weight,
             _decay_calculator=self.decay,
+            limit=result_limit,
         )
         # 中-1b（第四轮体检批次B）：先截断再去重——只对最终 top 候选两两比较，
         # 去重后不足 max_memories 不再回捞（保持简单），不再对全量 N 条 O(N²) 比较
-        truncated = scored[: self.max_memories]
+        truncated = scored
         deduped = self.manager._dedup_retrieved(truncated)
 
         # e) 组装注入上下文
-        return {"memories": deduped, "context_text": _build_context(deduped)}
+        return {"memories": deduped, "context_text": _build_context(deduped), "total": len(candidates)}
 
     # ------------------------------------------------------------------ 预热
+    @synchronized
     def warmup_vectors(self, batch_size=None, budget_s=None) -> dict:
         """向量索引预热（启动期**有界**回填）：清理孤儿向量 + 补建"有记忆无向量"条目。
 

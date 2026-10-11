@@ -300,6 +300,58 @@ class OfflineFallbackManager:
         except Exception:  # noqa: BLE001 - 兜底失败（含 LlamaNotReady）不崩溃
             return None
 
+    def _try_local_chat_stream(self, messages) -> Optional[Iterator[str]]:
+        """本地小 LLM 的流式版（20261010_模块0_语音交互延迟优化）。
+
+        与 :meth:`_try_local_chat` 同解析/同预算，但优先返回**token 增量生成器**——
+        常驻 chat 服务路径（llama-server SSE）逐 token 产出，句级 TTS 流水线
+        据此把首响前移到「首个完整句生成完」。runtime 未实现 ``offline_chat_stream``
+        （旧实现/测试替身）时**回退同步版**包成单块生成器（语义等价，仅失去句级
+        前移收益）；完全不可用返回 None（与同步版同口径）。
+
+        Returns:
+            Optional[Iterator[str]]: 增量文本生成器；不可用时 None。
+        """
+        runtime = self._resolve_local_llm()
+        if runtime is None:
+            return None
+        if hasattr(runtime, "offline_chat_stream"):
+            return runtime.offline_chat_stream(messages)
+        # 回退：无流式接口的 runtime/替身 → 同步版单块产出
+        text = self._try_local_chat(messages)
+        if text is None:
+            return None
+        return iter((text,))
+
+    def _yield_local_stream(self, messages, failure_prompt=None) -> Iterator[str]:
+        """消费本地流式生成器：产出首个增量时切 ``status = "local"``。
+
+        :param failure_prompt: 不可用/无产出时的兜底文案——由调用方按语义给：
+            本地模式分支传 ``LOCAL_NOT_READY_PROMPT``（「本地大脑还没准备好」），
+            云端失败降级分支缺省产 :meth:`_offline_prompt`（「当前离线…」）。
+            与原单块实现的文案口径逐字一致。
+        """
+        gen = self._try_local_chat_stream(messages)
+        fallback_text = failure_prompt if failure_prompt is not None else self._offline_prompt()
+        if gen is None:
+            self.status = "offline_hint"
+            yield fallback_text
+            return
+        produced = False
+        try:
+            for piece in gen:
+                if not piece:
+                    continue
+                if not produced:
+                    produced = True
+                    self.status = "local"
+                yield piece
+        except Exception:  # noqa: BLE001 - 中途失败保留已产出内容（与 chat_stream 同口径）
+            pass
+        if not produced:
+            self.status = "offline_hint"
+            yield fallback_text
+
     def _offline_prompt(self) -> str:
         """按诊断态产出离线提示文案（N5）：有配置错误时提示配置未完成，否则提示断网。"""
         if self._config_error:
@@ -307,17 +359,11 @@ class OfflineFallbackManager:
         return OFFLINE_PROMPT
 
     def _fallback_like_offline(self, messages) -> Iterator[str]:
-        """离线（或云端调用失败）降级分支：切本地兜底，否则产提示。"""
+        """离线（或云端调用失败）降级分支：切本地兜底（流式），否则产提示。"""
         if self.local_mode_enabled():
-            self.change_mode("local")
-            text = self._try_local_chat(messages)
-            if text is None:
-                # 本地模型未就绪 / 缺失 → 提示而不抛出
-                self.status = "offline_hint"
-                yield self._offline_prompt()
-                return
-            self.status = "local"
-            yield text
+            self.change_mode("local")  # 与原单块实现同时机：进入降级承接即切
+            # 流式本地承接（20261010）：逐 token 下发，首个完整句即出声
+            yield from self._yield_local_stream(messages)
             return
         # 本地模式未开启：不切换状态机（mode 保持 cloud），仅产提示
         # （N5：按诊断态区分"断网"与"云端配置未完成"文案）
@@ -352,8 +398,9 @@ class OfflineFallbackManager:
     def _local_mode_stream(self, messages) -> Iterator[str]:
         """本地模式分支（本地优先路由）：完全不探测网络、不连云端。
 
-        - 运行时就绪 → 切 local、本地单块产出；本地调用中途失败返回 None 时
-          产出 {@link LOCAL_NOT_READY_PROMPT}（本地模式下的语义不再是"断网"，
+        - 运行时就绪 → 流式本地承接（20261010：逐 token 下发，首个完整句即出声）；
+          本地调用中途失败保留已产出内容、为空时产出
+          {@link LOCAL_NOT_READY_PROMPT}（本地模式下的语义不再是"断网"，
           且绝不静默回落云端）。
         - 未就绪 → 不切换状态机（mode 保持 cloud），产出引导提示文案。
         """
@@ -362,15 +409,8 @@ class OfflineFallbackManager:
             self.status = "offline_hint"
             yield LOCAL_NOT_READY_PROMPT
             return
-        self.change_mode("local")
-        text = self._try_local_chat(messages)
-        if text is None:
-            # 就绪判定通过但本地调用中途失败：产引导提示，不抛、不回落云端
-            self.status = "offline_hint"
-            yield LOCAL_NOT_READY_PROMPT
-            return
-        self.status = "local"
-        yield text
+        self.change_mode("local")  # 与原单块实现同时机：就绪即切，runtime 失败也已进入本地承接
+        yield from self._yield_local_stream(messages, failure_prompt=LOCAL_NOT_READY_PROMPT)
 
     def chat(self, messages) -> Iterator[str]:
         """对外统一对话入口（流式，本地优先路由）。

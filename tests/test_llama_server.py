@@ -708,6 +708,31 @@ def test_chat_argv_appends_mmproj_when_model_dir_has_mmproj(tmp_path):
     assert argv[-2:] == ["--mmproj", str(mmproj)]
 
 
+def test_chat_argv_image_max_tokens_budget(tmp_path):
+    """image_max_tokens 有值 → argv 追加 --image-max-tokens（Gemma 4 视觉预算可调）；None 不追加。"""
+    exe = tmp_path / "llama-server.exe"
+    exe.write_bytes(b"fake")
+    model = tmp_path / "gemma-4-E2B-it-Q4_K_M.gguf"
+    model.write_bytes(b"fake-gguf")
+
+    # 有预算：argv 含 --image-max-tokens 768
+    popen = _PopenRecorder()
+    client = LlamaServerChat(
+        str(exe), str(model), image_max_tokens=768,
+        popen_factory=popen, http_factory=_FakeHttp(),
+    )
+    client.ensure_started()
+    assert popen.calls[0][-2:] == ["--image-max-tokens", "768"]
+
+    # 无预算（None，主对话实例）：argv 不含该参数（行为与历史逐字一致）
+    popen2 = _PopenRecorder()
+    client2 = LlamaServerChat(
+        str(exe), str(model), popen_factory=popen2, http_factory=_FakeHttp()
+    )
+    client2.ensure_started()
+    assert "--image-max-tokens" not in popen2.calls[0]
+
+
 def test_chat_server_context_capped_at_8192(tmp_path):
     """LlamaRuntime chat 服务上下文固定 8192（Gemma 4 KV 封顶），不随 self._n_ctx 走。"""
     from lite.runtime.llama_runtime import LlamaRuntime

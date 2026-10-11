@@ -6,9 +6,12 @@ import { usePetMoodFeed } from '../hooks/usePetMoodFeed';
 import { PET_ENABLED_KEY } from '../hooks/usePetEnabled';
 import {
   chatMessageStream,
+  checkVoiceTurn,
   fetchComputerStatus,
+  fetchProactiveMessages,
   fetchSettings,
   onPetModelReload,
+  prefillVoiceVisual,
   publishChatTick,
   readPetModelReloadTick,
   sendChatMessage,
@@ -24,6 +27,7 @@ import {
   dragPetOverlayEnd,
   dragPetOverlayStart,
   getPetOverlaySizeBounds,
+  notifyTray,
   resizePetOverlay,
   showMainWindow,
 } from '../bridge';
@@ -157,10 +161,19 @@ export default function PetOverlay() {
   /** 尺寸记忆落盘防抖句柄：停手 300ms 后写入 localStorage，拖动中不同步阻塞 */
   const sizeSaveTimerRef = useRef(0);
   /** 语音链路句柄：朗读中断控制器 + 语音会话（20261006 全双工降级版） */
-  const speakAbortRef = useRef<AbortController | null>(null);
+  const speakAbortRef = useRef<{ abort: () => void } | null>(null);
   const voiceSessionRef = useRef<VoiceSession | null>(null);
+  const voiceStartingRef = useRef(false);
+  const voiceGenerationRef = useRef(0);
   /** 语音交互模式（voice.interaction_mode；挂载探测，设置页可切） */
   const [interactionMode, setInteractionMode] = useState<VoiceInteractionMode>('vad');
+  /**
+   * 主动搭话气泡文本（20261011 视觉语音融合）：轮询 GET /api/chat/proactive
+   * 取到 AI 主动消息时展示，10 秒后自动收起；正文同步托盘通知 + 语音会话
+   * 开着时 TTS 播报。null = 无主动消息。
+   */
+  const [proactiveText, setProactiveText] = useState<string | null>(null);
+  const proactiveTimerRef = useRef(0);
 
   // 挂载即校准窗口尺寸（幂等）：主进程建窗固定为默认档，若记忆尺寸非默认，
   // 这里立即把窗口对齐到记忆尺寸，保证「初始 size 与窗口大小一致」
@@ -220,6 +233,8 @@ export default function PetOverlay() {
   // （悬浮窗关闭/热重载不留悬挂会话，也不丢最后一次拖动的尺寸记忆）
   useEffect(() => {
     return () => {
+      voiceGenerationRef.current += 1;
+      voiceStartingRef.current = false;
       try {
         voiceSessionRef.current?.stop();
       } catch {
@@ -254,10 +269,12 @@ export default function PetOverlay() {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setMenuOpen(false);
     };
+    const handleBlur = () => setMenuOpen(false);
     window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('blur', () => setMenuOpen(false));
+    window.addEventListener('blur', handleBlur);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('blur', handleBlur);
     };
   }, [menuOpen]);
 
@@ -321,6 +338,8 @@ export default function PetOverlay() {
 
   /** 停掉整段语音会话（关闭会话 + 朗读；悬浮窗卸载 / 按钮再点关闭时调用）。 */
   const stopVoiceSession = useCallback(() => {
+    voiceGenerationRef.current += 1;
+    voiceStartingRef.current = false;
     voiceSessionRef.current?.stop();
     voiceSessionRef.current = null;
     stopSpeaking();
@@ -340,39 +359,68 @@ export default function PetOverlay() {
         resolveDone = resolve;
       });
       if (!text.trim()) {
-        setVoiceState('idle');
         resolveDone();
         return { abort: () => {}, done };
       }
-      setVoiceState('speaking');
       const controller = new AbortController();
-      speakAbortRef.current = controller;
       const queue: string[] = [];
       let playing = false;
       let finished = false;
-      let current: Audio | null = null;
+      let current: HTMLAudioElement | null = null;
+      const handle = {
+        abort: () => {
+          controller.abort();
+          queue.length = 0;
+          if (current) {
+            current.onended = null;
+            current.onerror = null;
+            try {
+              current.pause();
+            } catch {
+              /* 播放器未启动时忽略 */
+            }
+          }
+          current = null;
+          playing = false;
+          finished = true;
+          finish();
+        },
+        done,
+      };
+      const finish = () => {
+        if (speakAbortRef.current === handle) speakAbortRef.current = null;
+        resolveDone();
+      };
+      speakAbortRef.current = handle;
 
       const playNext = () => {
+        if (controller.signal.aborted) return;
         const next = queue.shift();
         if (!next) {
           playing = false;
           current = null;
-          if (finished) {
-            setVoiceState('idle');
-            resolveDone();
-          }
+          if (finished) finish();
           return;
         }
         const player = new Audio(`data:audio/wav;base64,${next}`);
         current = player;
-        player.onended = () => playNext();
-        player.onerror = () => playNext();
-        void player.play().catch(() => playNext());
+        let advanced = false;
+        const advance = () => {
+          if (advanced || controller.signal.aborted) return;
+          advanced = true;
+          player.onended = null;
+          player.onerror = null;
+          playNext();
+        };
+        player.onended = advance;
+        player.onerror = advance;
+        void player.play().catch(advance);
       };
 
       synthesizeSpeechStream(
         text,
         (chunk) => {
+          if (controller.signal.aborted) return;
           if (chunk.audio_base64) {
             queue.push(chunk.audio_base64);
             if (!playing) {
@@ -383,68 +431,76 @@ export default function PetOverlay() {
           // error 帧：忽略该句，继续等待后续帧
         },
         () => {
+          if (controller.signal.aborted) return;
           finished = true;
           if (!playing && queue.length === 0) {
-            setVoiceState('idle');
-            resolveDone();
+            finish();
           }
         },
         controller.signal,
       ).catch((err) => {
         if (controller.signal.aborted) {
-          resolveDone();
+          finish();
           return;
         }
         console.error('[Pet] 朗读失败:', err);
-        setVoiceState('idle');
-        resolveDone();
+        handle.abort();
       });
 
-      return {
-        abort: () => {
-          controller.abort();
-          try {
-            current?.pause();
-          } catch {
-            /* 播放器未启动时忽略 */
-          }
-          queue.length = 0;
-          setVoiceState('idle');
-          resolveDone();
-        },
-        done,
-      };
+      return handle;
     },
     [stopSpeaking],
   );
 
   /** 「麦克风」开关（会话总开关）：开启 VoiceSession（按当前模式），再点关闭。 */
   const toggleVoice = useCallback(async () => {
-    if (voiceSessionRef.current) {
+    if (voiceSessionRef.current || voiceStartingRef.current) {
       stopVoiceSession();
       return;
     }
+    voiceStartingRef.current = true;
+    const generation = ++voiceGenerationRef.current;
+    setVoiceState('listening');
+    const settings = await fetchSettings().catch(() => undefined);
+    if (generation !== voiceGenerationRef.current) return;
+    const mode = settings?.voice?.interaction_mode;
+    const currentMode = mode === 'duplex' || mode === 'vad' ? mode : interactionMode;
+    setInteractionMode(currentMode);
     const session = new VoiceSession({
-      mode: interactionMode,
+      mode: currentMode,
       transcribe: (base64, sampleRate) => transcribeAudio(base64, sampleRate),
       chat: async (message) => {
+        // 非流式回退路径（未注入 chatStream 时才会走）：visual 仅有流式端点消费
         const data = await sendChatMessage({ message });
         return data;
       },
       // 流式对话（20261010 语音低延迟）：LLM 增量 → 首个完整句即送 TTS，
-      // 不等完整回复；后端不可达/异常时由会话层回退 chat 旧路径语义
-      chatStream: (message, onDelta, signal) =>
-        chatMessageStream(message, onDelta, signal),
+      // 不等完整回复；后端不可达/异常时由会话层回退 chat 旧路径语义。
+      // opts.visual（20261011）：开口后首句携带截图（后端消费 pending 图）
+      chatStream: (message, onDelta, signal, opts) =>
+        chatMessageStream(message, onDelta, signal, undefined, opts),
+      // 开口瞬间截图预填充（20261011 视觉语音融合）：fire-and-forget，失败静默
+      onSpeechStart: () => {
+        void prefillVoiceVisual();
+      },
+      // 主模型话轮判定（20261010）：半截话 CONTINUE 挂起合并，完整句 SEND——
+      // 判定请求复用主对话前缀吃投机预填充红利，亚秒返回
+      turnCheck: (text) => checkVoiceTurn(text),
       speak: speakHandle,
-      onReplyMeta: (mood) => {
+      onReplyMeta: (mood, complete) => {
+        if (voiceSessionRef.current !== session) return;
         // 表情即时驱动（发布总线 + 本窗口立即生效）；主窗口聊天页经 tick 重载历史
         pushMood(normalizeBackendMood(mood));
-        publishChatTick();
+        if (complete) publishChatTick();
       },
-      onStateChange: (s) => setVoiceState(s === 'processing' ? 'thinking' : s),
+      onStateChange: (s) => {
+        if (voiceSessionRef.current === session) setVoiceState(s === 'processing' ? 'thinking' : s);
+      },
     });
     voiceSessionRef.current = session;
     const ok = await session.start();
+    if (generation !== voiceGenerationRef.current || voiceSessionRef.current !== session) return;
+    voiceStartingRef.current = false;
     if (!ok) {
       voiceSessionRef.current = null;
       setVoiceState('idle');
@@ -456,6 +512,50 @@ export default function PetOverlay() {
       /* 预热尽力而为：失败静默，真实请求仍走懒加载兜底 */
     });
   }, [interactionMode, pushMood, speakHandle, stopVoiceSession]);
+
+  // ---- 主动搭话轮询（20261011 视觉语音融合与主动回复）----
+  // 后端 VisionPipeline 判定画面值得回应（reply_worthy）→ 主动消息入队 → 前端
+  // 8s 轮询原子取空（at-most-once）：悬浮窗气泡展示（10s 自动收起）+ 系统托盘
+  // 通知（点击唤起主窗口）+ 语音会话开着且未在朗读时 TTS 播报 + 通知聊天页
+  // 刷新历史（主动消息已由后端写入聊天记录）。
+  useEffect(() => {
+    let cancelled = false;
+    const POLL_MS = 8000;
+    const tick = () => {
+      void (async () => {
+        if (cancelled) return;
+        const messages = await fetchProactiveMessages();
+        if (cancelled || messages.length === 0) return;
+        publishChatTick();
+        const latest = messages[messages.length - 1];
+        const text = String(latest?.text ?? '').trim();
+        for (const item of messages) {
+          const body = String(item?.text ?? '').trim();
+          if (body) void notifyTray('CX-A', body).catch(() => undefined);
+        }
+        if (!text) return;
+        setProactiveText(text);
+        if (proactiveTimerRef.current) window.clearTimeout(proactiveTimerRef.current);
+        proactiveTimerRef.current = window.setTimeout(() => {
+          proactiveTimerRef.current = 0;
+          setProactiveText(null);
+        }, 10000);
+        // TTS 播报：仅语音会话开着且当前无朗读在播时（不打断正在进行的对话回复）
+        if (voiceSessionRef.current && speakAbortRef.current === null) {
+          speakHandle(text);
+        }
+      })();
+    };
+    const timer = window.setInterval(tick, POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      if (proactiveTimerRef.current) {
+        window.clearTimeout(proactiveTimerRef.current);
+        proactiveTimerRef.current = 0;
+      }
+    };
+  }, [speakHandle]);
 
   /** 屏幕共享开关：乐观翻转 + 热更新 vision.enabled；失败回退并留痕。 */
   const toggleScreenShare = useCallback(() => {
@@ -624,6 +724,11 @@ export default function PetOverlay() {
           size={size}
           reloadKey={modelTick}
         />
+        {proactiveText ? (
+          <div className="pet-overlay-proactive" data-testid="pet-proactive-bubble">
+            {proactiveText}
+          </div>
+        ) : null}
       </div>
 
       {menuOpen ? (
@@ -732,6 +837,30 @@ const PET_OVERLAY_CSS = `
 }
 .pet-overlay-stage:active {
   cursor: grabbing;
+}
+/* 主动搭话气泡（20261011 视觉语音融合）：玻璃拟态小气泡悬于桌宠头顶，
+   pointer-events:none——不拦截拖拽/点击手势，10s 自动收起 */
+.pet-overlay-proactive {
+  pointer-events: none;
+  position: absolute;
+  left: 50%;
+  top: 4%;
+  transform: translateX(-50%);
+  max-width: 82%;
+  padding: 8px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(12px) saturate(1.4);
+  color: #4a4a5c;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: center;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8), 0 4px 14px rgba(255, 145, 210, 0.28);
+  animation: pet-overlay-bubble-in 200ms var(--ease-spring, cubic-bezier(0.34, 1.56, 0.64, 1)) both;
+  z-index: 4;
 }
 /* 弧形气泡菜单容器：铺满窗口的定位层，本身不拦截事件（圆钮各自 auto） */
 .pet-overlay-menu {

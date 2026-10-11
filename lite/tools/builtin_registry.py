@@ -718,7 +718,12 @@ class BuiltinToolRegistry:
                     "result": None,
                 }
             try:
-                updated = store.update(memory_id, fields)
+                manager = self.manager or getattr(self.pipeline, "manager", None)
+                if manager is None:
+                    from lite.memory.manager import MemoryManager
+                    manager = MemoryManager(store=store)
+                    self.manager = manager
+                updated = manager.update(memory_id, fields)
             except ValueError as exc:
                 # type 非法等契约校验失败：明确回执（不崩、不写库）
                 return {

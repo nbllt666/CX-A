@@ -9,12 +9,16 @@
 """
 
 import logging
+import math
 from datetime import datetime
+from functools import lru_cache
+from threading import RLock
 
 from .decay import DecayCalculator
 from .scoring import _get_weights, score_memories
 from .storage import MemoryStore
 from .vector_store import InMemoryVectorStore
+from ._locking import synchronized
 
 # 原生日志记录器（20260926_模块0_真实嵌入与向量持久化：向量写入失败告警留痕）
 LOGGER = logging.getLogger(__name__)
@@ -37,6 +41,15 @@ FIND_SIMILAR_SCAN_LIMIT = 500
 
 
 def tokenize_text(text) -> set:
+    """Return independent tokens while caching immutable tokenization results."""
+    text = "" if text is None else str(text)
+    if len(text) > 2048:
+        return set(_tokenize_cached.__wrapped__(text))
+    return set(_tokenize_cached(text))
+
+
+@lru_cache(maxsize=1024)
+def _tokenize_cached(text):
     """共享分词：CJK 连续段取相邻两字 bigram，ASCII 拉丁/数字连续段取整词小写。
 
     中-2（第四轮体检批次B）：manager 与 pipeline 原先各自用 ``lower().split()``
@@ -82,13 +95,14 @@ def tokenize_text(text) -> set:
             _flush_cjk()
     _flush_word()
     _flush_cjk()
-    return tokens
+    return frozenset(tokens)
 
 
 class MemoryManager:
     """记忆管理器门面：存储 + 衰减 + 三维打分 + 去重 + 分层升降级。"""
 
     def __init__(self, store=None, vector_store=None, db_path=None, permanent_threshold=None, dedup_threshold=None, embed_fn=None):
+        self._lock = RLock()
         """初始化内存管理器。
 
         Args:
@@ -154,6 +168,7 @@ class MemoryManager:
         return None
 
     # -------------------------------------------------------- 写：添加
+    @synchronized
     def add_memory(
         self,
         content,
@@ -226,6 +241,70 @@ class MemoryManager:
                 )
         return memory_id
 
+    @synchronized
+    def update(self, memory_id, fields, embed_fn=None):
+        """Update a memory and its derived index; failures keep the previous row."""
+        with self.store._lock:
+            return self._update(memory_id, fields, embed_fn)
+
+    def _update(self, memory_id, fields, embed_fn=None):
+        fields = dict(fields or {})
+        if not fields:
+            return 0
+        previous = self.store.get(memory_id)
+        if previous is None or previous.get("is_deleted"):
+            return 0
+        if "content" in fields:
+            self.store._validate_content(fields["content"])
+        if "type" in fields:
+            self.store._validate_type(fields["type"])
+            fields["permanent"] = fields["type"] == "permanent"
+        if "importance" in fields:
+            importance = fields["importance"]
+            if (isinstance(importance, bool) or not isinstance(importance, (int, float))
+                    or not 1 <= importance <= 5 or int(importance) != importance):
+                raise ValueError("importance must be an integer from 1 to 5")
+            fields["importance"] = int(importance)
+            fields["importance_score"] = int(importance) / 5.0
+
+        reindex = any(key in fields and fields[key] != previous.get(key) for key in ("content", "agent_id"))
+        if not reindex:
+            return self.store.update(memory_id, fields)
+        vector_id = str(memory_id)
+        old_vector = self.vector_store.get(vector_id)
+        effective_embed = embed_fn if embed_fn is not None else self._embed_fn
+        merged = dict(previous, **fields)
+        vector = effective_embed(merged["content"]) if effective_embed is not None else None
+        if vector is not None:
+            vector = [float(value) for value in vector]
+            if not vector or not all(math.isfinite(value) for value in vector):
+                raise ValueError("embedding must be a nonempty finite vector")
+        try:
+            if vector is None:
+                self.vector_store.delete(vector_id)
+            else:
+                self.vector_store.upsert(vector_id, vector, metadata={
+                    "memory_id": memory_id, "agent_id": merged.get("agent_id", "default"),
+                })
+            updated = self.store.update(memory_id, fields)
+            if updated <= 0:
+                raise RuntimeError("memory update did not affect a row")
+        except Exception:
+            try:
+                if old_vector is None:
+                    self.vector_store.delete(vector_id)
+                else:
+                    self.vector_store.upsert(vector_id, old_vector["vector"], metadata=old_vector.get("metadata"))
+            except Exception:
+                LOGGER.exception("Failed to restore vector index for memory %s", memory_id)
+                try:
+                    self.vector_store.delete(vector_id)
+                except Exception:
+                    LOGGER.exception("Failed to invalidate inconsistent vector for memory %s", memory_id)
+            raise
+        return updated
+
+    @synchronized
     def soft_delete(self, memory_id):
         """软删除一条记忆，并同步清理向量库中的对应向量（M-10，第三轮体检批次3）。
 
@@ -252,6 +331,7 @@ class MemoryManager:
             return None
         return mem
 
+    @synchronized
     def update_reactivation(self, memory_id, emotion_intensity=0.0):
         """记录一次再激活：reactivation_count+1、更新 emotion_score，并检查自动提升分层。
 
@@ -292,6 +372,7 @@ class MemoryManager:
             return self._get_memory(memory_id)
         return self._get_memory(memory_id)
 
+    @synchronized
     def promote(self, memory_id, target_type=None):
         """显式提升一条记忆分层。
 
@@ -313,6 +394,7 @@ class MemoryManager:
         self.store.update(memory_id, {"type": target_type, "permanent": True if target_type == "permanent" else mem.get("permanent", False)})
         return self._get_memory(memory_id)
 
+    @synchronized
     def demote(self, memory_id, target_type=None):
         """显式降低一条记忆分层。
 
@@ -344,6 +426,7 @@ class MemoryManager:
         return self._get_memory(memory_id)
 
     # -------------------------------------------------------- 读：检索
+    @synchronized
     def retrieve(
         self,
         query,

@@ -806,13 +806,19 @@ class LlamaServerChat(_LlamaServerProcess):
     def __init__(self, exe_path, model_path, n_gpu_layers=0, n_ctx=2048,
                  host="127.0.0.1", ready_timeout=CHAT_READY_TIMEOUT_S,
                  request_timeout=CHAT_REQUEST_TIMEOUT_S,
-                 popen_factory=None, http_factory=None):
-        """初始化 chat 客户端（不启动任何进程，懒启动由 ``ensure_started`` 触发）。"""
+                 popen_factory=None, http_factory=None, image_max_tokens=None):
+        """初始化 chat 客户端（不启动任何进程，懒启动由 ``ensure_started`` 触发）。
+
+        :param image_max_tokens: 每张图像的 token 预算上限（None 不传——20261010
+            主动视觉：Gemma 4 视觉预算可调，``--image-max-tokens`` 控制单图 token
+            占用，防高分截图吃穿上下文预算；视觉专用实例按预算设值）。
+        """
         super().__init__(
             exe_path, model_path, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx,
             host=host, ready_timeout=ready_timeout, request_timeout=request_timeout,
             popen_factory=popen_factory, http_factory=http_factory,
         )
+        self._image_max_tokens = image_max_tokens
 
     def _build_argv(self, port):
         """chat 服务启动 argv（无嵌入专用开关；其余同嵌入服务口径）。
@@ -826,6 +832,10 @@ class LlamaServerChat(_LlamaServerProcess):
         256`` 允许按 256 token 块跳过历史中已被缓存的片段——逐句轮询场景
         （每句请求仅追加新内容）大幅降低 prefill 延迟。嵌入服务无需该参数
         （无对话前缀复用场景）。
+
+        20261010 主动视觉预算：``image_max_tokens`` 有值时追加
+        ``--image-max-tokens``——单图 token 上限可调，与视觉专用实例的小上下文
+        配合构成有界的图像 KV 占用。
         """
         argv = [
             self._exe_path, "-m", self._model_path,
@@ -833,6 +843,8 @@ class LlamaServerChat(_LlamaServerProcess):
             "-c", str(self._n_ctx), "-ngl", str(self._n_gpu_layers), "--no-webui",
             "--cache-prompt", "--cache-reuse", "256",
         ]
+        if self._image_max_tokens is not None:
+            argv += ["--image-max-tokens", str(int(self._image_max_tokens))]
         mmproj = find_mmproj_path(self._model_path)
         if mmproj:
             argv += ["--mmproj", mmproj]
@@ -934,9 +946,122 @@ class LlamaServerChat(_LlamaServerProcess):
             )
         return str(message.get("content") or "")
 
+    def chat_stream(self, messages, max_tokens=128, temperature=0.7, seed=None, timeout=None):
+        """流式 chat 补全（20261010_模块0_语音交互延迟优化）：逐 token 产出增量文本。
+
+        与 :meth:`chat` 同参数、同失败分流口径（未产出任何 token 前失败 → 重启
+        重试一次；**产出中途失败** → 生成器结束（保留已产出内容，不重试——重试
+        会从零开始重复输出）。调用方（OfflineFallbackManager 流式路径）把增量
+        经 NDJSON delta 帧下发前端，句级 TTS 流水线据此前移首响。
+
+        :yields: str——OpenAI 流式 delta 的增量文本片段（可能为空串，调用方跳过）
+        :raises RuntimeError: 输入非法，或未产出 token 前失败且重启重试仍失败
+        """
+        if not isinstance(messages, list) or not messages:
+            raise RuntimeError("chat_stream 的 messages 必须为非空列表。")
+        effective_timeout = self._request_timeout if timeout is None else timeout
+        url = f"http://{self._host}:{self._port}/v1/chat/completions"
+        payload = {
+            "messages": list(messages),
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "stream": True,  # SSE：choices[0].delta.content 逐 token
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        if seed is not None:
+            payload["seed"] = int(seed)
+        body = json.dumps(payload).encode("utf-8")
+
+        with self._lock:
+            self._ensure_started_locked()
+
+        first_exc = None
+        yielded = False
+        # 未产出 token 前的失败允许重启重试一次（与 chat 同口径）；产出中途失败
+        # 只能结束流——SSE 断开后上下文状态未知，重试会整段重复。
+        for attempt in (0, 1):
+            try:
+                resp = _stream_http(url, body, effective_timeout)
+                with resp:
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[len("data:"):].strip()
+                        if data_str == "[DONE]":
+                            return
+                        try:
+                            event = json.loads(data_str)
+                        except ValueError:
+                            continue  # 心跳/注释行静默跳过
+                        choices = event.get("choices") if isinstance(event, dict) else None
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+                        piece = (delta or {}).get("content") if isinstance(delta, dict) else None
+                        if piece:
+                            yielded = True
+                            yield str(piece)
+                return
+            except _ServerRequestError as exc:
+                if yielded or not exc.retriable:
+                    if yielded:
+                        return  # 中途断流：保留已产出内容即止
+                    raise RuntimeError(str(exc)) from exc
+                first_exc = exc
+            except Exception as exc:  # noqa: BLE001 - 传输类异常按可重试处理
+                if yielded:
+                    return
+                first_exc = exc
+            if attempt == 0:
+                self._stop_process()
+                try:
+                    self._ensure_started_locked()
+                except Exception as restart_exc:  # noqa: BLE001 - 重启失败按原错误上抛
+                    raise RuntimeError(
+                        f"chat 流式请求失败且服务重启失败：{_clip_text(restart_exc)}"
+                        f"（首次错误：{_clip_text(first_exc)}）"
+                    ) from restart_exc
+        if first_exc is not None and not yielded:
+            raise RuntimeError(
+                f"chat 流式请求失败且已重启重试仍失败：{_clip_text(first_exc)}"
+            )
+
 
 def _decode_body(body):
     """把响应体 bytes 解码为 str（已为 str 则原样返回）。"""
     if isinstance(body, (bytes, bytearray)):
         return bytes(body).decode("utf-8")
     return str(body)
+
+
+def _stream_http(url, payload, timeout):
+    """流式 HTTP POST（SSE）：返回**未读完**的响应对象，调用方逐行迭代。
+
+    与 :func:`_default_http`（一次性读全）不同——token 级流式需要边收边发；
+    ``urlopen`` 返回的 file-like 对象支持逐行迭代（llama-server SSE 每事件一行）。
+    非 2xx 直接转 :class:`_ServerRequestError`（流式没有"读完后分流"的机会）。
+
+    :param url: 完整请求 URL
+    :param payload: 已编码请求体 bytes
+    :param timeout: 超时秒数
+    :return: 可逐行迭代的响应对象
+    """
+    request = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        method="POST",
+    )
+    try:
+        resp = urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read()
+        except Exception:  # noqa: BLE001 - 错误体读取失败按空处理
+            body = b""
+        code = int(exc.code)
+        raise _ServerRequestError(
+            f"chat 流式接口返回 HTTP {code}：{_clip_bytes(body)}",
+            retriable=code >= 500 or code in (408, 429),
+        ) from exc
+    return resp

@@ -23,7 +23,9 @@ worker 取出的不回队，**恢复在线后从新片段开始，离线期间�
 返回新记忆 id；沉淀失败仅告警不崩。
 """
 
+import json
 import logging
+import re
 
 from lite.cloud.adapter import CloudUnavailableError
 from lite.vision.queue import VisionClipQueue
@@ -31,14 +33,55 @@ from lite.vision.queue import VisionClipQueue
 #: 原生日志记录器（告警统一携带 [VisionPipeline][WARN] 前缀）
 LOGGER = logging.getLogger(__name__)
 
-#: 生产默认理解提示词（中文，一句话客观描述，限 60 字内）
-VISION_PROMPT = "用一句话客观描述这帧屏幕内容，不超过 60 字"
+#: 生产默认理解提示词（20261011 视觉语音融合升级为 JSON 判定输出）：
+#: ``summary`` 照旧沉淀记忆（摘要经聊天自动记忆注入进上下文）；
+#: ``reply_worthy``/``proactive_text`` 驱动 AI 主动搭话（sink 入队 → 前端
+#: 轮询气泡/TTS + 托盘通知）。解析失败降级：全文当 summary，不触发主动回复。
+VISION_PROMPT = (
+    "观察这帧屏幕内容，只输出一个 JSON 对象（不要输出其他文字）："
+    '{"summary": "一句话客观描述画面内容，不超过60字", '
+    '"reply_worthy": false, "proactive_text": ""}。'
+    "reply_worthy 仅当画面出现用户明确在做、需要你主动回应协助的事情才为 true"
+    "（普通屏幕内容一律 false）；为 true 时 proactive_text 写你要主动对用户说的"
+    "一句话（口语化，不超过30字），否则留空。"
+)
 
 #: 亮度拓扑渲染字符集（下标随亮度递增）
 _BRIGHTNESS_CHARS = " .:-=+*#@"
 
 #: 亮度拓扑渲染的行宽（与默认降采样宽度一致）
 _BRIGHTNESS_MAP_WIDTH = 64
+
+
+def _parse_vision_json(raw):
+    """解析视觉理解产出的 JSON（容错：剥围栏 + 提取首个平衡对象；非法返回 None）。
+
+    :param raw: 理解产出的原始文本（模型可能混入说明文字 / markdown 围栏）
+    :return: dict（合法 JSON 对象）或 None（无 JSON / 解析失败）
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(text[start:i + 1])
+                except ValueError:
+                    return None
+                return obj if isinstance(obj, dict) else None
+    return None
 
 
 def _render_brightness_map(frame, width: int = _BRIGHTNESS_MAP_WIDTH) -> str:
@@ -65,7 +108,7 @@ class VisionPipeline:
 
     def __init__(self, sampler=None, queue: VisionClipQueue = None, cloud=None,
                  memory_store=None, config=None, understanding=None,
-                 local_understanding=None):
+                 local_understanding=None, proactive_sink=None):
         """构造管线（全部组件可注入，缺省仅队列可自建）。
 
         :param sampler: :class:`~lite.vision.sampler.AdaptiveSampler` 实例；
@@ -84,6 +127,11 @@ class VisionPipeline:
             默认理解优先把截图帧（image_url base64）/ 灰度拓扑交给本地小 LLM
             （llama-server ``--mmproj``）理解——数据不出本机；回调未就绪（返回
             None）/ 抛异常时自动回落云端。
+        :param proactive_sink: 主动搭话回调（20261011 视觉语音融合），
+            callable(payload: dict) -> None；理解产出 JSON 且
+            ``reply_worthy=true`` 时以
+            ``{"summary", "proactive_text", "timestamp"}`` 调用——缺省 None 时
+            判定通过也只沉淀记忆不搭话。回调异常仅告警不影响记忆沉淀主链路。
         """
         self._sampler = sampler
         self._cloud = cloud
@@ -91,6 +139,7 @@ class VisionPipeline:
         self._config = config
         self._understanding = understanding if understanding is not None else self._default_understanding
         self._local_understanding = local_understanding
+        self._proactive_sink = proactive_sink
         self._queue = queue if queue is not None else VisionClipQueue()
         # consumer 接线（对齐 CX-O register_vision_pipeline 的装配职责）
         self._queue.set_consumer(self._consume)
@@ -165,10 +214,21 @@ class VisionPipeline:
         if summary is None or not str(summary).strip():
             LOGGER.warning("[VisionPipeline][WARN] 理解产出为空，跳过沉淀")
             return None
+        raw_text = str(summary).strip()
+        # JSON 解析分流（20261011 视觉语音融合）：summary 照旧沉淀记忆；
+        # reply_worthy=true 且 proactive_text 非空 → proactive_sink 主动搭话。
+        # 解析失败降级：全文当 summary（不触发主动回复）——模型输出不可靠时
+        # 行为与旧版逐字等价。
+        parsed = _parse_vision_json(raw_text)
+        if parsed is not None and str(parsed.get("summary") or "").strip():
+            summary_text = str(parsed.get("summary")).strip()
+        else:
+            summary_text = raw_text
+            parsed = None
         try:
-            return self._memory_store.add({
+            memory_id = self._memory_store.add({
                 "type": "short_term",
-                "content": str(summary).strip(),
+                "content": summary_text,
                 "source": "vision",
                 "importance": 2,
                 "agent_id": "default",
@@ -176,6 +236,29 @@ class VisionPipeline:
         except Exception as exc:  # noqa: BLE001 —— 沉淀失败不崩 worker
             LOGGER.warning("[VisionPipeline][WARN] 视觉记忆沉淀失败（不阻断 worker）: %s", exc)
             return None
+        # 主动搭话分流（在记忆沉淀成功之后——sink 异常只告警，不影响返回值）
+        if (
+            parsed is not None
+            and parsed.get("reply_worthy") is True
+            and self._proactive_sink is not None
+        ):
+            proactive_text = str(parsed.get("proactive_text") or "").strip()
+            if proactive_text:
+                try:
+                    self._proactive_sink({
+                        "summary": summary_text,
+                        "proactive_text": proactive_text,
+                        "timestamp": item.get("timestamp"),
+                    })
+                except Exception as exc:  # noqa: BLE001 —— sink 失败不影响沉淀
+                    LOGGER.warning(
+                        "[VisionPipeline][WARN] 主动搭话回调失败（不影响记忆沉淀）: %s", exc
+                    )
+            else:
+                LOGGER.warning(
+                    "[VisionPipeline][WARN] reply_worthy=true 但 proactive_text 为空，跳过主动搭话"
+                )
+        return memory_id
 
     # ------------------------------------------------------------------ #
     # 内部：enabled 判定与默认理解实现                                    #

@@ -547,9 +547,11 @@ class TestVisionPipeline:
         assert len(memories) == 1
         assert memories[0]["content"] == "一句话描述"
         # 提示词契约：多模态 content 数组含默认中文提示词与降采样亮度拓扑描述
+        # （20261011 JSON 判定提示词含引号，payload JSON 转义后按无引号片段断言）
         assert len(cloud.chat_calls) == 1
         payload = json.dumps(cloud.chat_calls[0], ensure_ascii=False)
-        assert VISION_PROMPT in payload
+        assert "只输出一个 JSON 对象" in payload
+        assert "reply_worthy" in payload
         assert "画面亮度拓扑" in payload
 
     # -------------------------------------------------------------- 20261004 本地视觉
@@ -702,13 +704,16 @@ class TestVisionPipeline:
 # ------------------------------------------------------------------ #
 
 def test_vision_config_defaults():
-    """DEFAULTS.vision 与 H2.5 契约严格一致。"""
+    """DEFAULTS.vision 与 H2.5 契约严格一致（含 20261011 上下文管理两键 + 主动搭话开关）。"""
     assert DEFAULTS["vision"] == {
         "enabled": False,
         "max_interval_s": 2,
         "min_interval_s": 30,
         "still_threshold_s": 10,
         "queue_size": 16,
+        "image_window": 3,  # 上下文保留图像数量（时序对比理解）
+        "image_max_tokens": 1024,  # 单图 token 预算（Gemma 4 视觉预算可调）
+        "proactive_enabled": True,  # 主动搭话开关（视觉语音融合 20261011）
     }
 
 
@@ -728,6 +733,126 @@ def test_vision_config_env_override(monkeypatch, tmp_path):
         data_dir=str(tmp_path / "data"),
     )
     assert cfg.get("vision", "enabled") is True
+
+
+# ------------------------------------------------------------------ #
+# 5.5 主动搭话分流（20261011 视觉语音融合：JSON 判定 + proactive_sink） #
+# ------------------------------------------------------------------ #
+
+from lite.vision.pipeline import _parse_vision_json  # noqa: E402
+
+
+class TestParseVisionJson:
+    """视觉理解 JSON 解析容错契约（围栏 / 前后噪声 / 非法输入）。"""
+
+    def test_plain_json(self):
+        assert _parse_vision_json(
+            '{"summary": "一张代码屏幕", "reply_worthy": true, "proactive_text": "在写代码吗"}'
+        ) == {"summary": "一张代码屏幕", "reply_worthy": True, "proactive_text": "在写代码吗"}
+
+    def test_fenced_json(self):
+        raw = '```json\n{"summary": "s", "reply_worthy": false, "proactive_text": ""}\n```'
+        assert _parse_vision_json(raw)["reply_worthy"] is False
+
+    def test_json_with_surrounding_noise(self):
+        raw = '好的，这是结果：{"summary": "s", "reply_worthy": true, "proactive_text": "嗨"}请查收'
+        assert _parse_vision_json(raw)["proactive_text"] == "嗨"
+
+    def test_invalid_returns_none(self):
+        assert _parse_vision_json("不是 JSON 的普通描述") is None
+        assert _parse_vision_json('{"summary": 破损') is None
+        assert _parse_vision_json("") is None
+        assert _parse_vision_json(None) is None
+
+
+class TestVisionProactiveDispatch:
+    """_consume 的 JSON 分流：summary 沉淀 + reply_worthy → sink（异常隔离）。"""
+
+    def _make(self, tmp_path, understanding_text, sink_calls):
+        def sink(payload):
+            sink_calls.append(payload)
+
+        backend = ScriptedBackend([solid_frame(0), solid_frame(255)])
+        sampler = AdaptiveSampler(backend)
+        store = make_memory_store(tmp_path)
+        pipeline = VisionPipeline(
+            sampler=sampler, cloud=MockCloud(online=True), memory_store=store,
+            config={"vision": {"enabled": True}},
+            understanding=lambda item: understanding_text, proactive_sink=sink,
+        )
+        return pipeline, store
+
+    def _drive(self, pipeline):
+        assert pipeline.run_once(now=0.0) is None  # 基线
+        assert pipeline.run_once(now=2.0) is not None
+        pipeline.stop()
+
+    def test_reply_worthy_dispatches_sink_and_stores_summary(self, tmp_path):
+        """reply_worthy=true → sink 收 {summary, proactive_text, timestamp}；记忆只落 summary。"""
+        sink_calls = []
+        raw = json.dumps({
+            "summary": "用户正在写 Python 代码",
+            "reply_worthy": True,
+            "proactive_text": "写代码遇到问题了吗？",
+        }, ensure_ascii=False)
+        pipeline, store = self._make(tmp_path, raw, sink_calls)
+        self._drive(pipeline)
+        memories = store.list(type="short_term")
+        assert len(memories) == 1
+        assert memories[0]["content"] == "用户正在写 Python 代码"  # JSON 本体不进记忆
+        assert len(sink_calls) == 1
+        assert sink_calls[0]["proactive_text"] == "写代码遇到问题了吗？"
+        assert sink_calls[0]["summary"] == "用户正在写 Python 代码"
+        assert "timestamp" in sink_calls[0]
+
+    def test_not_worthy_stores_summary_without_sink(self, tmp_path):
+        """reply_worthy=false → 记忆照常沉淀，sink 零调用。"""
+        sink_calls = []
+        raw = json.dumps({
+            "summary": "屏幕显示网页", "reply_worthy": False, "proactive_text": "",
+        }, ensure_ascii=False)
+        pipeline, store = self._make(tmp_path, raw, sink_calls)
+        self._drive(pipeline)
+        assert store.list(type="short_term")[0]["content"] == "屏幕显示网页"
+        assert sink_calls == []
+
+    def test_invalid_json_falls_back_to_whole_text(self, tmp_path):
+        """解析失败降级：全文当 summary，不触发主动回复（与旧版行为等价）。"""
+        sink_calls = []
+        pipeline, store = self._make(tmp_path, "普通一句话描述", sink_calls)
+        self._drive(pipeline)
+        assert store.list(type="short_term")[0]["content"] == "普通一句话描述"
+        assert sink_calls == []
+
+    def test_sink_exception_does_not_break_memory(self, tmp_path):
+        """sink 抛异常只告警——记忆沉淀照常返回 id（主链路不受影响）。"""
+        def broken_sink(payload):
+            raise RuntimeError("sink boom")
+
+        raw = json.dumps({
+            "summary": "s", "reply_worthy": True, "proactive_text": "嗨",
+        }, ensure_ascii=False)
+        backend = ScriptedBackend([solid_frame(0), solid_frame(255)])
+        sampler = AdaptiveSampler(backend)
+        store = make_memory_store(tmp_path)
+        pipeline = VisionPipeline(
+            sampler=sampler, cloud=MockCloud(online=True), memory_store=store,
+            config={"vision": {"enabled": True}},
+            understanding=lambda item: raw, proactive_sink=broken_sink,
+        )
+        self._drive(pipeline)
+        assert store.list(type="short_term")[0]["content"] == "s"
+
+    def test_worthy_without_text_skips_sink(self, tmp_path):
+        """reply_worthy=true 但 proactive_text 为空 → 跳过主动搭话（只沉淀）。"""
+        sink_calls = []
+        raw = json.dumps({
+            "summary": "s", "reply_worthy": True, "proactive_text": "  ",
+        }, ensure_ascii=False)
+        pipeline, store = self._make(tmp_path, raw, sink_calls)
+        self._drive(pipeline)
+        assert store.list(type="short_term")
+        assert sink_calls == []
 
 
 # ------------------------------------------------------------------ #

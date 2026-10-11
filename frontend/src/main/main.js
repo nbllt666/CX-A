@@ -18,7 +18,7 @@
  * will-navigate 按 URL 解析精确放行（自身 dist 产物 / dev server origin，D2），
  * setWindowOpenHandler 一律拒绝 window.open。
  */
-const { app, BrowserWindow, ipcMain, dialog, screen, Tray, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen, Notification, Tray, Menu } = require('electron');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const http = require('http');
@@ -494,6 +494,23 @@ ipcMain.handle('app:show-main', () => {
   return true;
 });
 
+// 系统托盘通知（20261011_模块0_视觉语音融合与主动回复）：AI 主动搭话时由渲染层
+// 发起——系统通知点击唤起主窗口查看。通知能力缺失（部分 Linux 环境）静默跳过。
+ipcMain.handle('app:notify', (_event, payload) => {
+  try {
+    const title = String((payload && payload.title) || 'CX-A').slice(0, 60);
+    const body = String((payload && payload.body) || '').slice(0, 200);
+    if (!Notification.isSupported() || !body) return false;
+    const notice = new Notification({ title, body, silent: true });
+    notice.on('click', () => showMainWindow());
+    notice.show();
+    return true;
+  } catch (err) {
+    console.warn('[notify] 系统通知失败:', err);
+    return false;
+  }
+});
+
 // 拖拽主进程化（20261003_模块0_桌宠拖拽主进程化与六档尺寸）：
 // 渲染层只在 pointerdown/up 发 start/end，移动循环全在主进程——
 // 16ms 轮询光标 → setPosition(光标 - 抓取偏移)，消除渲染层→IPC 往返延迟（拖拽跟手关键）。
@@ -619,6 +636,7 @@ if (!gotSingleInstanceLock) {
   app.on('second-instance', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
       mainWindow.focus();
     }
   });

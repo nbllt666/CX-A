@@ -13,9 +13,14 @@ import logging
 import math
 import os
 import sqlite3
+import tempfile
 from abc import ABC, abstractmethod
 from array import array
 from datetime import datetime
+from heapq import nlargest, nsmallest
+from threading import RLock
+
+from ._locking import synchronized
 
 # 原生日志记录器（prepare 嵌入模型标识变化告警留痕）
 LOGGER = logging.getLogger(__name__)
@@ -62,6 +67,10 @@ class VectorStore(ABC):
         """可选能力：返回已知向量 id 集合；未实现该能力的子类返回 None（调用方需容错）。"""
         return None
 
+    def get(self, vector_id):
+        """Return an exact vector snapshot for rollback-capable updates."""
+        raise NotImplementedError("vector snapshots are not supported")
+
 
 class LanceVectorStore(VectorStore):
     """LanceDB 向量存储适配（可选依赖 lancedb）。
@@ -70,7 +79,8 @@ class LanceVectorStore(VectorStore):
     测试不依赖本类，若环境中无 lancedb 请使用 InMemoryVectorStore。
     """
 
-    def __init__(self, db_path="data/lancedb", table_name="memories"):
+    def __init__(self, db_path="data/lancedb", table_name="memories", model_tag="", dim=None):
+        self._lock = RLock()
         try:
             import lancedb
         except ImportError as exc:  # pragma: no cover - 依赖缺失路径
@@ -81,8 +91,58 @@ class LanceVectorStore(VectorStore):
         self._lancedb = lancedb
         self.db_path = db_path
         self.table_name = table_name
+        self.model_tag = model_tag
+        self.dim = dim
+        self._prepared = False
+        self._identity_path = os.path.join(db_path, table_name + ".embedding.json")
         self._conn = lancedb.connect(db_path)
         self._table = self._open_table()
+
+    def _write_identity(self, current):
+        os.makedirs(self.db_path, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.db_path, delete=False) as handle:
+                temporary = handle.name
+                json.dump(current, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self._identity_path)
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
+
+    @synchronized
+    def prepare(self):
+        """Invalidate legacy or incompatible embeddings before warmup."""
+        previous = None
+        try:
+            with open(self._identity_path, encoding="utf-8") as handle:
+                previous = json.load(handle)
+            if not isinstance(previous, dict) or "model_tag" not in previous or "dim" not in previous:
+                previous = None
+            elif (not isinstance(previous["model_tag"], str)
+                    or (previous["dim"] is not None and (
+                        isinstance(previous["dim"], bool)
+                        or not isinstance(previous["dim"], int)
+                        or previous["dim"] <= 0))):
+                previous = None
+        except (OSError, ValueError, TypeError):
+            previous = None
+        current = {"model_tag": self.model_tag, "dim": self.dim}
+        matches = previous is not None and previous["model_tag"] == self.model_tag and (
+            self.dim is None or previous["dim"] == self.dim
+        )
+        action = "ok" if matches else "init"
+        if not matches and self._table is not None:
+            self._conn.drop_table(self.table_name)
+            self._table = None
+            action = "reset"
+            LOGGER.warning("Embedding identity changed: old=%s new=%s; LanceDB index reset", previous, current)
+        if not matches:
+            self._write_identity(current)
+        self._prepared = True
+        return {"action": action, "previous": previous, "current": current}
 
     def _open_table(self):
         try:
@@ -92,25 +152,32 @@ class LanceVectorStore(VectorStore):
             # （部分 lancedb 版本不允许用空列表建表，必须携带数据或 schema）
             return None
 
+    @synchronized
     def upsert(self, vector_id, vector, metadata=None):
         """写入或覆盖向量。先删重名再写入，保证按 vector_id 唯一。"""
-        self.delete(vector_id)
-        record = {"vector_id": vector_id, "vector": list(vector)}
+        values = list(vector)
+        if self.dim is not None and len(values) != int(self.dim):
+            raise ValueError("embedding dimension does not match the prepared index")
+        record = {"vector_id": str(vector_id), "vector": values}
         if metadata:
             record["metadata"] = metadata
         if self._table is None:
             self._table = self._conn.create_table(self.table_name, data=[record])
         else:
-            self._table.add([record])
+            self._table.merge_insert("vector_id").when_matched_update_all().when_not_matched_insert_all().execute([record])
+        if self._prepared and self.dim is None:
+            self.dim = len(values)
+            self._write_identity({"model_tag": self.model_tag, "dim": self.dim})
         return True
 
+    @synchronized
     def search(self, vector, top_k=10):
         """检索 top_k 条最相似向量（LanceDB 返回 L2 距离，此处转为相似度）。
 
         与 InMemoryVectorStore 口径对齐：score 为相似度、越大越相似，
         归一公式 ``score = 1 / (1 + L2距离)``——相同向量为 1.0，越远越接近 0。
         """
-        if self._table is None:
+        if self._table is None or int(top_k) <= 0:
             return []
         results = self._table.search(list(vector)).limit(int(top_k)).to_list()
         return [
@@ -124,6 +191,7 @@ class LanceVectorStore(VectorStore):
             for r in results
         ]
 
+    @synchronized
     def delete(self, vector_id):
         """按 vector_id 删除向量。
 
@@ -138,6 +206,15 @@ class LanceVectorStore(VectorStore):
         self._table.delete(from_lance_filter)
         return True
 
+    @synchronized
+    def get(self, vector_id):
+        if self._table is None:
+            return None
+        predicate = "vector_id = '{0}'".format(str(vector_id).replace("'", "''"))
+        rows = self._table.search().where(predicate).limit(1).to_list()
+        return rows[0] if rows else None
+
+    @synchronized
     def vector_ids(self):
         """可选能力 best-effort：返回已知向量 id 集合。
 
@@ -145,7 +222,7 @@ class LanceVectorStore(VectorStore):
         表尚未创建或导出异常时返回 None（调用方容错）。
         """
         if self._table is None:
-            return None
+            return set()
         try:
             column = self._table.to_arrow()["vector_id"].to_pylist()
         except Exception:
@@ -157,6 +234,7 @@ class InMemoryVectorStore(VectorStore):
     """纯 Python 内存向量存储（cosine 距离），供单测与无 lancedb 环境使用。"""
 
     def __init__(self):
+        self._lock = RLock()
         self._vectors = {}
         self._metas = {}
 
@@ -172,6 +250,7 @@ class InMemoryVectorStore(VectorStore):
             return 0.0
         return dot / (na * nb)
 
+    @synchronized
     def upsert(self, vector_id, vector, metadata=None):
         """写入或覆盖向量，并关联 metadata。"""
         self._vectors[vector_id] = list(vector)
@@ -181,19 +260,20 @@ class InMemoryVectorStore(VectorStore):
             self._metas.setdefault(vector_id, {})
         return True
 
+    @synchronized
     def search(self, vector, top_k=10):
         """按 cosine 相似度降序返回 top_k 条。"""
-        scored = [
+        scored = (
             {
                 "vector_id": vid,
                 "score": self._cosine(vector, vec),
                 "metadata": self._metas.get(vid, {}),
             }
             for vid, vec in self._vectors.items()
-        ]
-        scored.sort(key=lambda item: item["score"], reverse=True)
-        return scored[: max(0, int(top_k))]
+        )
+        return nlargest(max(0, int(top_k)), scored, key=lambda item: item["score"])
 
+    @synchronized
     def delete(self, vector_id):
         """按 vector_id 删除向量，返回是否命中。"""
         existed = vector_id in self._vectors
@@ -201,6 +281,15 @@ class InMemoryVectorStore(VectorStore):
         self._metas.pop(vector_id, None)
         return existed
 
+    @synchronized
+    def get(self, vector_id):
+        if vector_id not in self._vectors:
+            return None
+        metadata = self._metas.get(vector_id, {})
+        return {"vector_id": vector_id, "vector": list(self._vectors[vector_id]),
+                "metadata": dict(metadata) if isinstance(metadata, dict) else metadata}
+
+    @synchronized
     def vector_ids(self):
         """可选能力实现：返回已知向量 id 集合。"""
         return set(self._vectors.keys())
@@ -219,6 +308,7 @@ class SQLiteVectorStore(VectorStore):
         单线程串行访问；db_path 的父目录自动创建）；构造即建表（CREATE TABLE
         IF NOT EXISTS，幂等）——但构造不做任何清空，清空仅由 prepare() 触发。
         """
+        self._lock = RLock()
         self.db_path = db_path
         self.model_tag = model_tag
         self.dim = dim
@@ -230,6 +320,7 @@ class SQLiteVectorStore(VectorStore):
         self._ensure_tables()
 
     # ------------------------------------------------------------------ 连接与建表
+    @synchronized
     def _connect(self):
         """惰性建立连接，必要时自动创建数据库所在目录（口径同 MemoryStore）。"""
         if self._conn is None:
@@ -257,6 +348,7 @@ class SQLiteVectorStore(VectorStore):
         )
         conn.commit()
 
+    @synchronized
     def close(self):
         """关闭数据库连接（幂等）。"""
         if self._conn is not None:
@@ -288,6 +380,7 @@ class SQLiteVectorStore(VectorStore):
             return True
         return previous["dim"] == int(self.dim)
 
+    @synchronized
     def prepare(self) -> dict:
         """按当前 model_tag / dim 校准向量索引表，返回三态动作描述。
 
@@ -333,6 +426,7 @@ class SQLiteVectorStore(VectorStore):
         return {"action": action, "previous": previous, "current": current}
 
     # ------------------------------------------------------------------ 写
+    @synchronized
     def upsert(self, vector_id, vector, metadata=None) -> bool:
         """写入或覆盖向量（INSERT OR REPLACE）。
 
@@ -354,6 +448,7 @@ class SQLiteVectorStore(VectorStore):
         conn.commit()
         return True
 
+    @synchronized
     def delete(self, vector_id) -> bool:
         """按 vector_id 删除向量，返回是否命中（rowcount > 0）。"""
         self._ensure_tables()
@@ -389,6 +484,7 @@ class SQLiteVectorStore(VectorStore):
         dot = sum(x * y for x, y in zip(query, row))
         return dot / (qnorm * norm)
 
+    @synchronized
     def search(self, vector, top_k=10) -> list:
         """全量 brute-force cosine 检索，返回按相关性降序的 top_k 条。
 
@@ -411,18 +507,30 @@ class SQLiteVectorStore(VectorStore):
         qnorm = math.sqrt(sum(x * x for x in query))
         rows = self._connect().execute(
             f"SELECT vector_id, dim, norm, vector, metadata FROM {self.table_name}"
-        ).fetchall()
-        scored = [
+        )
+        scored = (
             {
                 "vector_id": vector_id,
                 "score": self._cosine_row(query, qnorm, dim, norm, blob),
                 "metadata": _parse_metadata(meta_text),
             }
             for vector_id, dim, norm, blob, meta_text in rows
-        ]
-        scored.sort(key=lambda item: (-item["score"], str(item["vector_id"])))
-        return scored[:limit]
+        )
+        return nsmallest(limit, scored, key=lambda item: (-item["score"], str(item["vector_id"])))
 
+    @synchronized
+    def get(self, vector_id):
+        self._ensure_tables()
+        row = self._connect().execute(
+            f"SELECT vector, metadata FROM {self.table_name} WHERE vector_id=?", (str(vector_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        values = array("f")
+        values.frombytes(row[0])
+        return {"vector_id": str(vector_id), "vector": list(values), "metadata": _parse_metadata(row[1])}
+
+    @synchronized
     def count(self) -> int:
         """返回向量条数。"""
         self._ensure_tables()
@@ -431,6 +539,7 @@ class SQLiteVectorStore(VectorStore):
         ).fetchone()
         return int(row[0]) if row else 0
 
+    @synchronized
     def vector_ids(self) -> set:
         """可选能力实现：返回已知向量 id 的 str 集合。"""
         self._ensure_tables()

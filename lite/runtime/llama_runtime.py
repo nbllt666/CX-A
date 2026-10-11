@@ -416,6 +416,38 @@ class LlamaRuntime:
         self.warnings = []
         #: 离线对话可拼接的最大历史消息条数
         self._chat_window = DEFAULT_CHAT_WINDOW
+        #: 视觉会话滚动窗口（20261011 视觉进主链路）：消息列表 = [视觉 system,
+        #: (user 图 + assistant 描述)*]——新图**追加尾部**（前缀完美命中跨 tick
+        #: 复用图像 KV），窗口内图像数超 ``vision.image_window`` → 整体重置。
+        self._vision_history = []
+        #: 视觉会话当前窗口内图像数（与 _vision_history 中 user 图消息数一致）
+        self._vision_window_count = 0
+        #: 单张图像 token 预算（config ``vision.image_max_tokens``；非法/缺失回
+        #: 1024）——主对话实例 argv 的 --image-max-tokens（启动期读取，改后需重启）
+        self._vision_image_max_tokens = self._read_vision_image_budget(config)
+        #: 保留图像数量（config ``vision.image_window``；非法/缺失回 3）——PUT
+        #: 热更即时生效（超窗下次请求整体重置）
+        self._vision_image_window = self._read_vision_image_window(config)
+
+    @staticmethod
+    def _read_vision_image_budget(config):
+        """读 ``vision.image_max_tokens``（单图 token 预算；非法/缺失回 1024）。"""
+        raw = LlamaRuntime._read_cfg(config, "vision", "image_max_tokens", None)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 1024
+        return value if 256 <= value <= 4096 else 1024
+
+    @staticmethod
+    def _read_vision_image_window(config):
+        """读 ``vision.image_window``（上下文保留图像数量；非法/缺失回 3）。"""
+        raw = LlamaRuntime._read_cfg(config, "vision", "image_window", None)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 3
+        return value if 1 <= value <= 8 else 3
 
     # ------------------------------------------------------------------ #
     # 内部：配置读取 / 输出解析                                           #
@@ -764,6 +796,9 @@ class LlamaRuntime:
                 # 20261004 Gemma 4：chat 服务上下文固定 8192（KV cache 显式封顶 +
                 # 覆盖多模态图片 token），不再沿用嵌入口径的 self._n_ctx（2048）
                 n_ctx=int(CHAT_SERVER_N_CTX),
+                # 20261011 主动视觉进主链路：主实例 argv 带单图 token 预算
+                # （config vision.image_max_tokens，Gemma 4 视觉预算可调）
+                image_max_tokens=int(self._vision_image_max_tokens),
             )
         except Exception as exc:  # noqa: BLE001 - 构造失败按外部不可用处理
             self.warnings.append(f"常驻 chat 路径不可用：{exc}")
@@ -788,6 +823,66 @@ class LlamaRuntime:
             return True
         except Exception:  # noqa: BLE001 - 预热失败静默（首次真实请求再兜底拉起）
             return False
+
+    # ------------------------------------------------------------------ #
+    # 视觉理解（20261011 进主链路：共享主实例 + 滚动图像窗口）              #
+    # ------------------------------------------------------------------ #
+
+    #: 视觉理解生成上限（一句话客观描述 ≤ 60 字 ≈ 60~90 token）
+    VISION_MAX_TOKENS = 96
+    #: 视觉理解温度（客观描述，低随机）
+    VISION_TEMPERATURE = 0.3
+    #: 视觉会话 system 指令（滚动窗口首条；固定不变保前缀稳定）
+    VISION_SYSTEM_PROMPT = (
+        "你是屏幕画面观察助手。用户会陆续发来屏幕截图，"
+        "请对每张截图用一句话客观描述内容（不超过 60 字）；"
+        "若此前已有截图，请结合连续画面说明变化。"
+    )
+
+    def vision_chat(self, messages, max_tokens=None, temperature=None) -> str:
+        """视觉理解（主动视觉截图帧）：**主链路实例** + 滚动图像窗口。
+
+        进主链路的收益（用户裁决）：共享主实例 8192 大上下文与缓存体系；滚动
+        窗口让模型看到最近 N 张连续截图——时序对比理解优于孤立单帧。
+
+        KV 复用逻辑：新图**追加尾部**——上一轮请求的全部消息构成下一轮的前缀
+        （cache-prompt/cache-reuse 完美命中，旧图 KV 免重算）；窗口内图像数超过
+        ``vision.image_window`` 时**整体重置**（锯齿式：N-1 次增量 + 1 次重置，
+        平均 prefill ≈ 单图成本 × 2）。
+
+        Args:
+            messages: 本轮多模态消息（[user(content 数组含 image_url)]，由
+                VisionPipeline._build_local_messages 组装）。
+            max_tokens: 生成上限；None 用 VISION_MAX_TOKENS。
+            temperature: 采样温度；None 用 VISION_TEMPERATURE。
+        Returns:
+            str: 对截图的文本理解结果。
+        Raises:
+            LlamaNotReady: 主路径未就绪时抛出（调用方回落云端）。
+        """
+        if self._external_chat is None:
+            raise LlamaNotReady("视觉理解依赖常驻 chat 路径（主实例未就绪）。")
+        budget = self.VISION_MAX_TOKENS if max_tokens is None else int(max_tokens)
+        temp = self.VISION_TEMPERATURE if temperature is None else float(temperature)
+
+        # 窗口管理：满 → 整体重置（只留本轮）；未满 → 追加（前缀命中）
+        if self._vision_window_count >= self._vision_image_window:
+            self._vision_history = []
+            self._vision_window_count = 0
+        if not self._vision_history:
+            self._vision_history = [{"role": "system", "content": self.VISION_SYSTEM_PROMPT}]
+        self._vision_history.extend(messages)
+        self._vision_window_count += 1
+
+        chat_server = self._external_chat
+        reply = chat_server.chat(
+            list(self._vision_history), max_tokens=budget, temperature=temp,
+        )
+        # assistant 描述追加进窗口——下一轮请求的前缀包含「上一张图 + 它的描述」，
+        # 模型才能做时序对比（缺这段前缀断裂，模型看不到自己说过什么）
+        if reply and reply.strip():
+            self._vision_history.append({"role": "assistant", "content": str(reply).strip()})
+        return reply
 
     def _try_load_bridge_llm(self, path) -> bool:
         """尝试外部 llama-cli 路径（预编译二进制 + 语音桥 sidecar）。
@@ -951,7 +1046,8 @@ class LlamaRuntime:
         """回收外部服务进程（幂等；in-process 模型无需显式回收）。
 
         覆盖两块常驻子进程：嵌入服务（``_external_emb``）与常驻 chat 服务
-        （``_external_chat``，20260930）。回收失败不抛（进程随系统回收）。
+        （``_external_chat``，20260930）。回收失败不抛（进程随系统回收）；
+        视觉滚动窗口同步清空（20261011——重启后视觉会话从新窗口开始）。
         """
         embedder = self._external_emb
         self._external_emb = None
@@ -967,6 +1063,8 @@ class LlamaRuntime:
                 chat_server.close()
             except Exception:  # noqa: BLE001 - 回收失败不抛（进程随系统回收）
                 pass
+        self._vision_history = []
+        self._vision_window_count = 0
 
     def embed_texts(self, texts: list) -> list:
         """embed 的显式别名，便于调用方按语义命名。"""
@@ -1070,37 +1168,63 @@ class LlamaRuntime:
         result = self._llm(prompt, max_tokens=JUDGE_MAX_TOKENS, temperature=0.0)
         return self._parse_yes(self._extract_text(result))
 
-    def offline_chat(self, messages) -> str:
+    def offline_chat(self, messages, max_tokens=None, temperature=None) -> str:
         """断网兜底：本地小 LLM 按 system + 最近消息生成回复。
 
         Args:
             messages: list[dict]，形如 ``[{"role": "system", "content": ...},
                 {"role": "user", "content": ...}]``。
+            max_tokens: 生成上限；None 用 OFFLINE_CHAT_MAX_TOKENS（话轮判定等
+                短输出调用传小值——20261010 主模型判定模式：判定请求复用主对话
+                前缀吃 cache-reuse，增量 prefill + 极短生成 → 亚秒级）。
+            temperature: 采样温度；None 用 OFFLINE_CHAT_TEMPERATURE（判定类传
+                0.0 保输出稳定可解析）。
         Returns:
             str: 本地小 LLM 生成的纯文本回复（in-process / 常驻 chat 服务 / 外部桥）。
         Raises:
             LlamaNotReady: 本地小 LLM 未就绪（三条路径均不可用）时抛出。
         """
+        budget = OFFLINE_CHAT_MAX_TOKENS if max_tokens is None else int(max_tokens)
+        temp = OFFLINE_CHAT_TEMPERATURE if temperature is None else float(temperature)
         if not self._llm_available():
             raise LlamaNotReady("本地小 LLM 未就绪：请先调用 load_local_llm 加载模型后再进行离线对话。")
         # 常驻 chat 服务路径（20260930）：直接投递 messages（走 chat template +
         # enable_thinking=false 原生关思考），n_ctx 预算由 _fit_messages 防护
         if self._external_chat is not None:
-            fitted = self._fit_messages(messages, OFFLINE_CHAT_MAX_TOKENS)
-            return self._external_chat_generate(
-                fitted, OFFLINE_CHAT_MAX_TOKENS, OFFLINE_CHAT_TEMPERATURE
-            )
+            fitted = self._fit_messages(messages, budget)
+            return self._external_chat_generate(fitted, budget, temp)
         prompt = self._fit_prompt(
-            self._format_messages(messages), OFFLINE_CHAT_MAX_TOKENS, messages=messages
+            self._format_messages(messages), budget, messages=messages
         )
         # 关闭思维链（20260930）：思考块混入回复会被 TTS 当作正文朗读（见 NO_THINK_SUFFIX）
         prompt = prompt + NO_THINK_SUFFIX
         if self._external_client is not None:
-            return self._external_generate(
-                prompt, OFFLINE_CHAT_MAX_TOKENS, OFFLINE_CHAT_TEMPERATURE
-            ).strip()
-        result = self._llm(prompt, max_tokens=OFFLINE_CHAT_MAX_TOKENS)
+            return self._external_generate(prompt, budget, temp).strip()
+        result = self._llm(prompt, max_tokens=budget, temperature=temp)
         return self._extract_text(result).strip()
+
+    def offline_chat_stream(self, messages):
+        """断网兜底的**流式**版（20261010_模块0_语音交互延迟优化）：逐 token 产出。
+
+        与 :meth:`offline_chat` 同参数、同预算/温度/关思考口径；仅常驻 chat 服务
+        路径实现真流式（llama-server SSE）——其余路径（in-process / 外部桥）退化为
+        单块产出（语义等价，仅失去句级前移收益）。失败语义：未产出任何 token 的
+        异常向上抛（LlamaNotReady / RuntimeError），由 fallback 降级出口兜底；
+        **产出中途失败生成器即结束**（不抛——保留已产出内容，与 chat_stream 同口径）。
+
+        :yields: str 文本增量片段
+        """
+        if not self._llm_available():
+            raise LlamaNotReady("本地小 LLM 未就绪：请先调用 load_local_llm 加载模型后再进行离线对话。")
+        if self._external_chat is not None:
+            fitted = self._fit_messages(messages, OFFLINE_CHAT_MAX_TOKENS)
+            yield from self._external_chat.chat_stream(
+                fitted, OFFLINE_CHAT_MAX_TOKENS, OFFLINE_CHAT_TEMPERATURE,
+                seed=CHAT_DEFAULT_SEED,
+            )
+            return
+        # 退化路径：整段生成后单块产出（与 offline_chat 同逻辑）
+        yield self.offline_chat(messages)
 
 
 class LlamaEmbeddingProvider(EmbeddingProvider):

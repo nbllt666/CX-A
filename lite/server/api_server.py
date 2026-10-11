@@ -114,9 +114,8 @@ CXFC relay 前端转接（Task H1，对齐 C:\\CX-O\\docs\\CXFC开发文档.md �
 支持命令行参数：-h/--host、-p/--port；Ctrl+C 优雅退出。
 所有 JSON 响应以 UTF-8 编码且 ensure_ascii=False，中文不做转义。
 
-线程安全说明：本服务使用单线程 HTTPServer（一次只处理一个连接/请求），
-MemoryStore 的 sqlite3 连接与 MemoryRetrievalPipeline 均在主处理线程内串行使用，
-不引入并发读写，故无需加锁。若要切换到并发服务器，需另行处理存储连接竞争。
+线程安全说明：请求由 ThreadingHTTPServer 并发处理。管理操作串行化，聊天、
+TTS、ASR 使用独立锁；存储与检索层保护自己的共享连接和索引。
 relay 两端点仅做「取走队列 / 回填等待者」轻量操作：relay 调用的阻塞等待由
 LiteCXFC 内部 Event 在调用方线程承载，不占用 HTTP 线程（Task H1）。
 """
@@ -124,6 +123,7 @@ LiteCXFC 内部 Event 在调用方线程承载，不占用 HTTP 线程（Task H1
 import argparse
 import atexit
 import base64
+from collections import deque
 import datetime
 import hmac
 import importlib.util
@@ -135,7 +135,9 @@ import shutil
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from contextlib import nullcontext
+from functools import wraps
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 # 原生日志记录器（低-5：内部异常完整消息仅写日志，不外泄到响应体）
@@ -159,7 +161,9 @@ _CHAT_DEFAULT_SYSTEM = (
 # 对话真相（跨窗口刷新经前端 localStorage ``cx-a.chatTick`` 总线驱动）。
 _CHAT_HISTORY_FILENAME = "chat_history.json"
 _CHAT_HISTORY_CAP = 200
-_CHAT_HISTORY_LOCK = threading.Lock()
+_CHAT_CONTEXT_MESSAGES = 20
+_CHAT_CONTEXT_CHARS = 12000
+_CHAT_HISTORY_LOCK = threading.RLock()
 
 
 def _chat_history_path(data_dir=None):
@@ -177,15 +181,16 @@ def _load_chat_history(path=None):
     :param path: 历史文件绝对路径；None 用 :func:`_chat_history_path` 默认解析。
     :return: list[dict]（``{role, content, time}``；非列表结构按空处理）。
     """
-    try:
-        with open(path or _chat_history_path(), "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return []
+    with _CHAT_HISTORY_LOCK:
+        try:
+            with open(path or _chat_history_path(), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return []
     return data if isinstance(data, list) else []
 
 
-def _append_chat_history(user_text, assistant_text, path=None):
+def _append_chat_history(user_text, assistant_text, path=None, agent_id="default"):
     """追加一轮对话（用户原文 + clean 回复 + 时间），cap 截断 + 原子写。
 
     写失败仅告警不抛（历史落盘不得阻断聊天主链路）；``.tmp`` + ``os.replace``
@@ -197,8 +202,8 @@ def _append_chat_history(user_text, assistant_text, path=None):
     """
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     entries = [
-        {"role": "user", "content": str(user_text), "time": now},
-        {"role": "assistant", "content": str(assistant_text), "time": now},
+        {"role": "user", "content": str(user_text), "time": now, "agent_id": agent_id},
+        {"role": "assistant", "content": str(assistant_text), "time": now, "agent_id": agent_id},
     ]
     with _CHAT_HISTORY_LOCK:
         history = _load_chat_history(path)
@@ -214,6 +219,79 @@ def _append_chat_history(user_text, assistant_text, path=None):
             os.replace(tmp, target)
         except OSError as exc:
             LOGGER.warning("对话历史落盘失败（不阻断聊天主链路）：%s", exc)
+
+
+def _chat_context(path, agent_id):
+    """Only complete, bounded turns from the same agent enter inference."""
+    if agent_id == MEMORY_AGENT_ID:
+        return []
+    history = [
+        entry for entry in _load_chat_history(path)
+        if isinstance(entry, dict)
+        and (entry.get("agent_id") or "default") == agent_id
+        and entry.get("role") in ("user", "assistant")
+        and isinstance(entry.get("content"), str)
+    ]
+    turns = []
+    pending = None
+    for entry in history:
+        if entry["role"] == "user":
+            pending = entry
+        elif pending is not None:
+            turns.append((pending, entry))
+            pending = None
+    selected = []
+    remaining = _CHAT_CONTEXT_CHARS
+    for user, assistant in reversed(turns[-(_CHAT_CONTEXT_MESSAGES // 2):]):
+        size = len(user["content"]) + len(assistant["content"])
+        if size > remaining:
+            break
+        selected[0:0] = [
+            {"role": "user", "content": user["content"]},
+            {"role": "assistant", "content": assistant["content"]},
+        ]
+        remaining -= size
+    return selected
+
+
+def _serialize_request(method):
+    """Separate inference resources so a chat stream cannot starve TTS."""
+    @wraps(method)
+    def wrapped(self):
+        path = urlparse(self.path).path
+        if self.command == "GET" and path in (
+            "/api/health", "/api/status", "/api/setup/model/progress",
+            "/api/cxfc/relay/pending",
+        ):
+            return method(self)
+        if self.command == "POST" and path in (
+            "/api/voice/warmup", "/api/cxfc/relay/result",
+        ):
+            return method(self)
+        if self.command == "POST" and path in (
+            "/api/chat/message", "/api/chat/message_stream", "/api/voice/turn_check",
+            # 语音视觉预填充（20261011）：与 message_stream 同持聊天锁串行——
+            # 预填充写入的 KV 前缀在正式请求前不被其他聊天流量冲掉
+            "/api/voice/visual_prefill",
+        ):
+            lock = self._chat_lock
+        elif self.command == "POST" and path in (
+            "/api/voice/synthesize", "/api/voice/synthesize_stream",
+        ):
+            lock = self._tts_lock
+        elif self.command == "POST" and path == "/api/voice/transcribe":
+            lock = self._asr_lock
+        else:
+            lock = self._state_lock
+        # Model replacement must not close a runtime serving an active stream.
+        reconfigure = (
+            self.command == "PUT" and path == "/api/settings"
+            or self.command == "POST" and path == "/api/setup/complete"
+        )
+        with self._chat_lock if reconfigure else nullcontext():
+            with lock:
+                return method(self)
+    return wrapped
 
 
 def _offline_placeholder_texts():
@@ -251,6 +329,27 @@ def _warm_chat_runtime(runtime):
         LOGGER.warning("常驻 chat 服务预热线程异常：%s", exc)
 
 
+def _vision_section_of(config):
+    """取出 config 的 ``vision`` 段（dict 载体；ConfigManager 逐键读齐预算键）。
+
+    :param config: ConfigManager 或 dict（build_local_chat_runtime 同款双形态）。
+    :return: dict（至少含 image_max_tokens 键；取不到时用默认 1024 占位结构）。
+    """
+    if config is None:
+        return {"image_max_tokens": 1024}
+    get = getattr(config, "get", None)
+    if callable(get) and not isinstance(config, dict):
+        try:
+            return {
+                "image_max_tokens": config.get("vision", "image_max_tokens", 1024),
+            }
+        except TypeError:
+            pass  # 非 ConfigManager 三参签名，走 dict 分支
+    if isinstance(config, dict):
+        return dict(config.get("vision") or {}) or {"image_max_tokens": 1024}
+    return {"image_max_tokens": 1024}
+
+
 def build_local_chat_runtime(config):
     """按 local_llm 配置段组装本地小 LLM 运行时（供离线聊天兜底）。
 
@@ -284,7 +383,10 @@ def build_local_chat_runtime(config):
                     "n_ctx": local_llm_cfg.get("n_ctx"),
                     "device": local_llm_cfg.get("device"),
                     "n_gpu_layers": local_llm_cfg.get("n_gpu_layers"),
-                }
+                },
+                # 20261010 主动视觉：透传 vision 段——runtime 据此读
+                # ``vision.image_max_tokens``（单图 token 预算，视觉专用实例 argv）
+                "vision": _vision_section_of(config),
             }
         )
         if not runtime.load_local_llm(model_path):
@@ -427,6 +529,31 @@ _MAX_DISTILL_MESSAGES = 200
 # 语音合成文本长度上限（字符）（M-5）：超限 400——防超长文本分钟级合成阻塞服务
 _MAX_SYNTH_TEXT_CHARS = 5000
 
+# TTS 朗读前剥离的字符（20261010_模块0_语音交互延迟优化·全双工实测发现）：本地
+# 大模型偶尔在回复中输出 emoji（如 😊）——TTS 引擎遇 emoji 会跳字或产出怪音，
+# 文字气泡显示无妨但**朗读前必须剥掉**。范围覆盖 emoji 主区 / 杂项符号与装饰 /
+# 箭头 / 符号扩展 / 变体选择符 / 零宽连接符（组合 emoji 的连接件）。
+_SPEECH_STRIP_RE = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U00002190-\U000021FF"
+    "\U00002B00-\U00002BFF"
+    "\U0000FE00-\U0000FE0F"
+    "\U0000200D"
+    "]+"
+)
+
+
+def _strip_speech_noise(text):
+    """TTS 朗读文本清洗：剥 emoji/装饰符号 + 压缩剥落后遗留的多重空白并去首尾。"""
+    if not text:
+        return text
+    cleaned = _SPEECH_STRIP_RE.sub("", text)
+    # emoji 常紧贴标点（「吗？ 😊」剥后成「吗？ 」）——多空格压一个、首尾清空
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    return cleaned
+
 # 记忆列表 limit / 检索 top_k 的允许上限（M-6）：负数 400、超上限钳制——
 # 防 LIMIT -1 全表返回与超大整数触发 sqlite OverflowError
 _MAX_LIST_LIMIT = 1000
@@ -459,6 +586,74 @@ _CONFIG_WRITE_LOCK = threading.Lock()
 # 排队多个预热线程。
 _VOICE_WARMUP_LOCK = threading.Lock()
 _VOICE_WARMUP_INFLIGHT = False
+
+# ------------------------------------------------------------------ 视觉语音融合
+# （20261011_模块0_视觉语音融合与主动回复）用户开口瞬间截图 → 主对话 KV 预填充，
+# ASR 文本就绪后正式请求命中该前缀（图像 token 不再重算）。
+#
+# 语义约定：
+# - pending 截图**一次性消费**：visual_prefill 存入、message_stream(visual=true)
+#   取走即清空；两请求同持 _chat_lock 串行，不存在并发读写窗口。
+# - 聊天历史落盘天然剥图（_append_chat_history 只落文本），图仅活当前轮——
+#   每轮重算一次图 token，成本由 vision.image_max_tokens 封顶。
+_VOICE_PENDING_VISUAL_LOCK = threading.Lock()
+_VOICE_PENDING_VISUAL = None
+
+# 带图请求的固定前缀说明（预填充与正式请求共享同一形状，保证前缀命中）
+_VOICE_VISUAL_NOTE = "（附：你说话那一刻看到的当前屏幕画面）"
+
+# 主动视觉回复队列（有界 deque，溢出丢最旧）：VisionPipeline 判定 reply_worthy
+# 时经 sink 入队，前端轮询 GET /api/chat/proactive 原子取空。
+_PROACTIVE_QUEUE_CAP = 10
+_PROACTIVE_QUEUE_LOCK = threading.Lock()
+_PROACTIVE_QUEUE = deque(maxlen=_PROACTIVE_QUEUE_CAP)
+
+# 主动消息回写聊天历史的合成 user 轮（配对要求：历史按 user→assistant 成对进入
+# 推理上下文，见 _chat_context；assistant-only 条目会被配对逻辑丢弃）
+_PROACTIVE_HISTORY_USER_TURN = "（AI 观察到屏幕上出现了值得留意的内容，主动开口）"
+
+# 云端 provider 视觉能力表：聊天请求允许携带截图的 provider（deepseek 纯文本
+# 不支持图像输入；未知 provider 保守按纯文本处理，避免网关 400 打断对话）
+VISION_CAPABLE_PROVIDERS = frozenset({"openai", "tongyi", "moonshot"})
+
+
+def _store_voice_pending_visual(image_b64):
+    """存入待消费的语音截图（新截图覆盖旧截图——只保留最新开口画面）。"""
+    global _VOICE_PENDING_VISUAL
+    with _VOICE_PENDING_VISUAL_LOCK:
+        _VOICE_PENDING_VISUAL = {
+            "image_b64": str(image_b64),
+            "created_at": time.time(),
+        }
+
+
+def _take_voice_pending_visual():
+    """原子取走待消费截图（一次消费即清空；无则返回 None）。"""
+    global _VOICE_PENDING_VISUAL
+    with _VOICE_PENDING_VISUAL_LOCK:
+        item = _VOICE_PENDING_VISUAL
+        _VOICE_PENDING_VISUAL = None
+    return (item or {}).get("image_b64")
+
+
+def _capture_voice_screenshot():
+    """截一帧屏幕 PNG base64（语音开口预填充用）；任何失败返回 None 不阻断语音。
+
+    复用主动视觉的 GDI 截图后端（构造零 GDI 调用，按需新建实例即可——与
+    视觉 tick 线程的采样互不共享状态）。隐私口径：截图仅经回环递交本机
+    llama-server（本地模式）；云端模式仅在 provider 具备视觉能力时随聊天请求
+    外发（用户已裁决云端 API 支持视觉输入）。
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        # 函数内延迟导入：ctypes/GDI 依赖链不进入非 Windows 平台导入路径
+        from lite.vision.screen_backend import WindowsGrayscaleScreenBackend
+
+        return WindowsGrayscaleScreenBackend().capture_image_b64()
+    except Exception as exc:  # noqa: BLE001 - 截图失败不阻断语音链路
+        LOGGER.warning("语音视觉截图失败（不阻断语音链路）：%s", exc)
+        return None
 
 
 def _is_loopback_host(host) -> bool:
@@ -870,7 +1065,7 @@ _VISION_TICK_INTERVAL_S = 1.0
 
 
 def build_vision_pipeline(config=None, memory_store=None, cloud=None,
-                          local_understanding=None):
+                          local_understanding=None, proactive_sink=None):
     """装配主动视觉管线（Task C）：屏幕后端 + 自适应采样器 + VisionPipeline。
 
     - 屏幕后端：Windows 下构建纯标准库 GDI 后端
@@ -892,6 +1087,9 @@ def build_vision_pipeline(config=None, memory_store=None, cloud=None,
         local_understanding: 本地多模态理解回调（20261004 Gemma 4 本地视觉，
             callable(messages) -> str）；注入后默认理解优先走本地（截图帧
             image_url / 灰度拓扑交本地小 LLM），未就绪/失败回落云端。
+        proactive_sink: 主动搭话回调（20261011 视觉语音融合，callable(dict)）；
+            理解产出 JSON 且 reply_worthy=true 时调用（入队 + 回写历史见
+            make_handler 的 _vision_proactive_sink）。
 
     Returns:
         VisionPipeline: 已接线 queue consumer 的视觉管线实例。
@@ -914,7 +1112,7 @@ def build_vision_pipeline(config=None, memory_store=None, cloud=None,
     )
     return VisionPipeline(
         sampler=sampler, cloud=cloud, memory_store=memory_store, config=config,
-        local_understanding=local_understanding,
+        local_understanding=local_understanding, proactive_sink=proactive_sink,
     )
 
 
@@ -1085,7 +1283,19 @@ def _build_vector_store(config, data_dir, embed_kind, embed_meta):
         try:
             from lite.memory.vector_store import LanceVectorStore
 
-            store = LanceVectorStore(db_path=os.path.join(data_dir, "lancedb"))
+            configured_path = str(config.get("vector", "path", "") or "").strip()
+            if not configured_path or configured_path.replace("\\", "/") == DEFAULTS["vector"]["path"]:
+                vector_path = os.path.join(data_dir, "lancedb")
+            else:
+                vector_path = os.path.abspath(os.path.join(app_root(), configured_path))
+            store = LanceVectorStore(
+                db_path=vector_path,
+                model_tag=str(embed_meta.get("model_tag", "")),
+                dim=embed_meta.get("dim"),
+            )
+            result = store.prepare()
+            if result["action"] == "reset":
+                LOGGER.warning("Embedding identity changed; LanceDB index will be rebuilt")
         except Exception as exc:  # noqa: BLE001 - 初始化失败按禁止降级语义硬失败
             raise RuntimeError(
                 f"LanceDB 初始化失败（禁止降级，启动中止）：{exc}。"
@@ -1366,6 +1576,10 @@ def make_handler(
     #   PUT local_llm.enabled 经 ensure_started / release 动态接线，无需重启；
     # 装配异常仅告警并置 None——端点退化为旧的直连云端 + 固定离线文案路径，绝不崩。
     _local_holder = _LocalChatRuntimeHolder()
+    state_lock = threading.RLock()
+    chat_lock = threading.RLock()
+    tts_lock = threading.RLock()
+    asr_lock = threading.RLock()
     _resolved_chat_fallback = chat_fallback
     if _resolved_chat_fallback is None:
         try:
@@ -1391,14 +1605,48 @@ def make_handler(
     # 20261004 Gemma 4 本地视觉：理解回调复用聊天运行时持有器（禁止同一模型
     # 加载两份），把多模态消息交本地小 LLM；未就绪 / 失败返回 None → 管线回落
     # 云端（本地优先、云端拓扑兜底的双通道语义见 lite/vision/pipeline.py）。
+    # 20261011 视觉进主链路（用户裁决）：vision_chat 走主对话实例 + 滚动图像
+    # 窗口（尾部追加完美命中前缀，窗口满整体重置）——独立实例方案废除。
     def _vision_local_understanding(messages):
-        runtime = _local_holder.get()
-        if runtime is None:
-            return None
         try:
-            return runtime.offline_chat(messages)
+            with chat_lock:
+                runtime = _local_holder.get()
+                if runtime is None:
+                    return None
+                return runtime.vision_chat(messages)
         except Exception:  # noqa: BLE001 - LlamaNotReady / 服务失败 → 回落云端
             return None
+
+    # 主动搭话 sink（20261011 视觉语音融合）：VisionPipeline 判定 reply_worthy
+    # 后经此入队（有界 deque）+ 回写聊天历史（AI 说过的话进上下文保持连续）。
+    # 开关 vision.proactive_enabled 逐次现读（热更段）即时生效；队列条目由前端
+    # GET /api/chat/proactive 原子取空（at-most-once）。
+    def _vision_proactive_sink(payload):
+        try:
+            proactive_on = bool(config.get("vision", "proactive_enabled", True))
+        except Exception:  # noqa: BLE001 - 配置读取异常按开启处理（默认行为）
+            proactive_on = True
+        if not proactive_on:
+            return
+        payload = payload or {}
+        text = str(payload.get("proactive_text") or "").strip()
+        if not text:
+            return
+        with _PROACTIVE_QUEUE_LOCK:
+            _PROACTIVE_QUEUE.append({
+                "text": text,
+                "summary": str(payload.get("summary") or "").strip(),
+                "ts": time.time(),
+            })
+        # 回写聊天历史：合成 user 轮（历史按 user→assistant 成对进入推理上下文，
+        # 见 _chat_context 配对逻辑）+ assistant 主动话术——后续对话自然延续
+        try:
+            _append_chat_history(
+                _PROACTIVE_HISTORY_USER_TURN, text,
+                path=chat_history_file, agent_id="default",
+            )
+        except Exception as exc:  # noqa: BLE001 - 历史回写失败不影响入队
+            LOGGER.warning("主动消息回写聊天历史失败：%s", exc)
 
     # Task C「主动视觉接线」（N8 语义延续）：仅对显式为 None 的视觉管线回落默认
     # 装配——纯标准库 GDI 屏幕后端（非 Windows 注入 None 空转）+ 自适应采样器
@@ -1410,6 +1658,7 @@ def make_handler(
             _resolved_vision = build_vision_pipeline(
                 config=config, memory_store=store, cloud=chat_cloud,
                 local_understanding=_vision_local_understanding,
+                proactive_sink=_vision_proactive_sink,
             )
         except Exception as exc:  # noqa: BLE001 - 视觉装配失败不阻断服务启动
             LOGGER.warning("主动视觉管线装配失败（%s）：%s", exc.__class__.__name__, exc)
@@ -1420,7 +1669,7 @@ def make_handler(
         _resolved_vision_thread = start_vision_tick_thread(_resolved_vision)
 
     class ApiHandler(BaseHTTPRequestHandler):
-        """REST 请求处理器。单线程 HTTPServer 内串行执行，无共享状态竞争。"""
+        """Concurrent REST handler with resource-specific synchronization."""
 
         server_version = "CXLiteAPI/0.1"
         #: socket 读写超时（秒）（H-4 配套，第三轮体检批次2）：防慢客户端
@@ -1448,6 +1697,10 @@ def make_handler(
         _download_manager = download_manager
         _vision = _resolved_vision
         _vision_thread = _resolved_vision_thread
+        _state_lock = state_lock
+        _chat_lock = chat_lock
+        _tts_lock = tts_lock
+        _asr_lock = asr_lock
 
         # ------------------------------------------------------------ 底层工具
         def log_message(self, fmt, *args):
@@ -1663,8 +1916,15 @@ def make_handler(
                     ),
                 },
                 # 主动视觉（Task C）：设置页开关回显；开启后由 vision tick 线程
-                # 驱动采样（默认 False，隐私红线：关闭状态绝不产生屏幕采样）
-                "vision": {"enabled": bool(self._config.get("vision", "enabled", False))},
+                # 驱动采样（默认 False，隐私红线：关闭状态绝不产生屏幕采样）。
+                # proactive_enabled（20261011）：视觉理解判定 reply_worthy 时是否
+                # 允许 AI 主动搭话（队列+托盘通知），与采样开关分离可独立关闭。
+                "vision": {
+                    "enabled": bool(self._config.get("vision", "enabled", False)),
+                    "proactive_enabled": bool(
+                        self._config.get("vision", "proactive_enabled", True)
+                    ),
+                },
             }
 
         def _handle_settings_get(self):
@@ -1873,6 +2133,47 @@ def make_handler(
                     applied.append("vision.enabled")
                 else:
                     ignored.append("vision.enabled（必须为布尔）")
+
+            # 主动视觉上下文管理（20261011）：image_window 热更即时生效（同步
+            # runtime 属性——超窗下次视觉请求整体重置）；image_max_tokens 为
+            # llama-server argv 进程参数，持久化保存但需重启生效。
+            image_window = body.get("vision", {}).get("image_window")
+            if image_window is not None:
+                try:
+                    window_val = int(image_window)
+                except (TypeError, ValueError):
+                    window_val = 0
+                if 1 <= window_val <= 8:
+                    self._config.set("vision", "image_window", window_val)
+                    runtime_now = _local_holder.get()
+                    if runtime_now is not None:
+                        runtime_now._vision_image_window = window_val
+                    applied.append("vision.image_window")
+                else:
+                    ignored.append("vision.image_window（必须为 1~8 的整数）")
+
+            image_budget = body.get("vision", {}).get("image_max_tokens")
+            if image_budget is not None:
+                try:
+                    budget_val = int(image_budget)
+                except (TypeError, ValueError):
+                    budget_val = 0
+                if 256 <= budget_val <= 4096:
+                    self._config.set("vision", "image_max_tokens", budget_val)
+                    applied.append("vision.image_max_tokens（重启后生效）")
+                else:
+                    ignored.append("vision.image_max_tokens（必须为 256~4096 的整数）")
+
+            # 主动搭话开关（20261011 视觉语音融合）：视觉理解判定 reply_worthy 后
+            # 是否允许 AI 主动开口（入队 + 前端轮询气泡/TTS + 托盘通知）。布尔校验，
+            # 非法入 ignored；vision 为热更段，sink 逐次现读即时生效。
+            proactive_enabled = body.get("vision", {}).get("proactive_enabled")
+            if proactive_enabled is not None:
+                if isinstance(proactive_enabled, bool):
+                    self._config.set("vision", "proactive_enabled", proactive_enabled)
+                    applied.append("vision.proactive_enabled")
+                else:
+                    ignored.append("vision.proactive_enabled（必须为布尔）")
 
             # 聊天记忆注入开关（RAG 闭环，20261005）：布尔校验，非法入 ignored。
             # memory 为热更段——内存写即时生效（_build_memory_context 逐次读取）。
@@ -2376,7 +2677,13 @@ def make_handler(
             每条 ``{role, content, time}``）；文件缺失 / 损坏返回空列表（不 5xx，
             前端按无历史渲染）。
             """
-            self._send_json({"ok": True, "messages": _load_chat_history(self._chat_history_file)})
+            agent_id = self._sanitize_agent_id(self._parse_query().get("agent_id"))
+            history = [
+                entry for entry in _load_chat_history(self._chat_history_file)
+                if isinstance(entry, dict)
+                and (entry.get("agent_id") or "default") == agent_id
+            ]
+            self._send_json({"ok": True, "messages": history})
 
         # ------------------------------------------------------------ 表情聊天（Task H3）
         def _build_memory_context(self, message, agent_id):
@@ -2410,32 +2717,67 @@ def make_handler(
                 return ""
             return str((result or {}).get("context_text") or "").strip()
 
-        def _build_chat_messages(self, message, agent_id):
-            """组装表情聊天的消息列表（system 人设 + 记忆注入 + user 输入）。
+        def _build_chat_prefix(self, agent_id, memory_query):
+            """组装主对话公共前缀（system 人设 + 记忆注入 + 会话历史）。
 
-            :param message: 用户输入文本（已 strip 非空）
-            :param agent_id: 归一化后的 agent_id；命中本地 Agent 时以其 persona
-                作为人设前缀，未命中（含 AgentNotFound）回落默认提示
-            :return: OpenAI 兼容消息列表 [{role, content}, ...]
+            预填充（/api/voice/visual_prefill）与正式聊天请求共享同一前缀数组
+            ——llama-server ``--cache-prompt --cache-reuse`` 命中已缓存部分，
+            开口瞬间送入的图像 KV 与人设/历史 token 在正式请求时免重算
+            （20261011_模块0_视觉语音融合）。
+
+            :param agent_id: 归一化后的 agent_id（人设归属）
+            :param memory_query: 记忆检索查询文本（预填充阶段用户文本未知，传 ""）
+            :return: list[dict]——[{system}, *历史]（不含本轮 user 消息）
             """
             persona = None
-            try:
-                persona = str(self._manager.get(agent_id).persona or "").strip()
-            except AgentNotFound:
-                persona = None
+            with self._state_lock:
+                try:
+                    persona = str(self._manager.get(agent_id).persona or "").strip()
+                except AgentNotFound:
+                    persona = None
+                memory_block = self._build_memory_context(memory_query, agent_id)
             if persona:
                 system = f"你的角色设定：{persona}\n{_CHAT_DEFAULT_SYSTEM}"
             else:
                 system = _CHAT_DEFAULT_SYSTEM
             # 记忆注入（RAG 闭环，20261005）：开关开且有回忆时把【回忆】块拼入 system，
             # 让聊天回复自然引用记忆（memory-agent 跳过、空库/失败不注入）
-            memory_block = self._build_memory_context(message, agent_id)
             if memory_block:
                 system = f"{system}\n{memory_block}"
             return [
                 {"role": "system", "content": system},
+                *_chat_context(self._chat_history_file, agent_id),
+            ]
+
+        def _build_chat_messages(self, message, agent_id):
+            """组装表情聊天的消息列表（公共前缀 + 本轮 user 输入）。
+
+            :param message: 用户输入文本（已 strip 非空）
+            :param agent_id: 归一化后的 agent_id；命中本地 Agent 时以其 persona
+                作为人设前缀，未命中（含 AgentNotFound）回落默认提示
+            :return: OpenAI 兼容消息列表 [{role, content}, ...]
+            """
+            return [
+                *self._build_chat_prefix(agent_id, message),
                 {"role": "user", "content": message},
             ]
+
+        def _voice_request_allows_image(self):
+            """带图语音请求是否允许携带截图。
+
+            - 本地模式（local_llm.enabled 且兜底管理器在位）：恒可——Gemma 4
+              多模态本地看图，数据不出本机；
+            - 云端路径（未开本地模式或无兜底管理器直连云端）：按 provider 视觉
+              能力表判定（deepseek 等纯文本 provider 剥图降级，防网关 400）。
+            """
+            fallback = self._chat_fallback
+            if fallback is not None and fallback.local_mode_enabled():
+                return True
+            try:
+                provider = str(getattr(self._chat_cloud, "provider", "") or "").strip().lower()
+            except Exception:  # noqa: BLE001 - provider 不可得按纯文本处理
+                return False
+            return provider in VISION_CAPABLE_PROVIDERS
 
         def _handle_chat_message(self):
             """POST /api/chat/message：表情聊天端点（Task H3）。
@@ -2516,7 +2858,8 @@ def make_handler(
                         elif args is None:
                             outcome = {"success": False, "error": "指令参数必须是合法 JSON 对象"}
                         else:
-                            outcome = self._registry.call(tool_id, args)
+                            with self._state_lock:
+                                outcome = self._registry.call(tool_id, args)
                         follow_up_messages.append(
                             {"role": "user", "content": _memory_tool_result_message(op, raw_tag, outcome)}
                         )
@@ -2539,6 +2882,8 @@ def make_handler(
             # 残留与 JSON 非法残缺标签）；其他 agent 保持 EmotionTagParser 既有语义
             display_text = _strip_memory_tags(full_text) if agent_id == MEMORY_AGENT_ID else full_text
             parsed = EmotionTagParser().parse(display_text)
+            if self._chat_fallback is not None:
+                offline = getattr(self._chat_fallback, "status", "cloud") != "cloud"
             payload = {
                 "ok": True,
                 "clean_text": parsed["clean_text"],
@@ -2555,10 +2900,10 @@ def make_handler(
             # 不落盘——避免管理指令污染悬浮窗/桌宠的日常聊天历史。
             if (
                 agent_id != MEMORY_AGENT_ID
-                and not (offline and parsed["clean_text"] in _offline_placeholder_texts())
+                and parsed["clean_text"] not in _offline_placeholder_texts()
             ):
                 _append_chat_history(
-                    message, parsed["clean_text"], path=self._chat_history_file
+                    message, parsed["clean_text"], path=self._chat_history_file, agent_id=agent_id
                 )
             self._send_json(payload)
 
@@ -2607,14 +2952,31 @@ def make_handler(
                     400,
                 )
                 return
-            messages = self._build_chat_messages(message, agent_id)
+            # 20261011 视觉语音融合：visual=true 时消费开口瞬间预填充的截图
+            # （一次性消费，取走即清空；预填充与正式请求共享同一 prefix 数组，
+            # 图像 KV 命中免重算）。云端路径按 provider 视觉能力表降级——deepseek
+            # 等纯文本 provider 剥掉 image 部件只发文本，避免网关 400 打断对话。
+            visual = bool(body.get("visual"))
+            image_b64 = _take_voice_pending_visual() if visual else None
+            if image_b64 and self._voice_request_allows_image():
+                user_content = [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64," + image_b64},
+                    },
+                    {"type": "text", "text": f"{_VOICE_VISUAL_NOTE}\n{message}"},
+                ]
+                messages = [
+                    *self._build_chat_prefix(agent_id, message),
+                    {"role": "user", "content": user_content},
+                ]
+            else:
+                messages = self._build_chat_messages(message, agent_id)
             try:
                 if self._chat_fallback is not None:
                     gen = self._chat_fallback.chat(messages)
-                    offline = getattr(self._chat_fallback, "status", "cloud") != "cloud"
                 else:
                     gen = self._chat_cloud.chat(messages)
-                    offline = False
                 first = next(gen, None)  # 首帧探测：云端不可用在此抛
             except (CloudConfigError, CloudUnavailableError) as exc:
                 LOGGER.warning("表情聊天流式云端不可用（%s）：%s", exc.__class__.__name__, exc)
@@ -2636,27 +2998,39 @@ def make_handler(
                 self.wfile.write(b"\r\n")
                 self.wfile.flush()
 
-            def _finish(full_text):
+            def _finish(full_text, complete=True):
                 """done 帧下发 + 历史落盘（与非流式同条件，被打断不落盘）。"""
                 parsed = EmotionTagParser().parse(full_text)
                 done_payload = {
                     "done": True,
-                    "ok": True,
+                    "ok": complete,
                     "clean_text": parsed["clean_text"],
                     "mood": parsed["mood"],
                     "raw": full_text,
                 }
+                offline = (
+                    self._chat_fallback is not None
+                    and getattr(self._chat_fallback, "status", "cloud") != "cloud"
+                )
+                if not complete:
+                    done_payload["incomplete"] = True
                 if offline:
                     done_payload["offline"] = True
+                # A refresh triggered by done must wait for the matching history write.
+                with _CHAT_HISTORY_LOCK:
+                    try:
+                        _write_ndjson(done_payload)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                    if complete and parsed["clean_text"] not in _offline_placeholder_texts():
+                        _append_chat_history(
+                            message, parsed["clean_text"], path=self._chat_history_file, agent_id=agent_id
+                        )
                 try:
-                    _write_ndjson(done_payload)
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     return
-                if offline and parsed["clean_text"] in _offline_placeholder_texts():
-                    return  # 离线占位文案不是真实对话，不落盘
-                _append_chat_history(message, parsed["clean_text"], path=self._chat_history_file)
 
             parts = [str(first)] if first else []
             try:
@@ -2676,15 +3050,22 @@ def make_handler(
                     _write_ndjson({"error": f"生成中断（{exc.__class__.__name__}）"})
                 except (BrokenPipeError, ConnectionResetError):
                     return
-                _finish("".join(parts))
+                _finish("".join(parts), complete=False)
                 return
             except Exception as exc:  # noqa: BLE001 - 生成中途异常同样保已收文本
                 try:
                     _write_ndjson({"error": str(exc)[:200]})
                 except (BrokenPipeError, ConnectionResetError):
                     return
-                _finish("".join(parts))
+                _finish("".join(parts), complete=False)
                 return
+            finally:
+                close = getattr(gen, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        LOGGER.debug("Chat generator cleanup failed", exc_info=True)
             _finish("".join(parts))
 
         def _handle_chat_stream_offline(self):
@@ -2901,6 +3282,7 @@ def make_handler(
             )
 
         # ------------------------------------------------------------ 路由
+        @_serialize_request
         def do_GET(self):
             """处理 GET：health/status/settings/chat 守卫、记忆/Agent/远端/电脑状态、/api/tools、/api/pet/model。
 
@@ -2943,6 +3325,10 @@ def make_handler(
 
                 if path == "/api/chat/history":
                     self._handle_chat_history()
+                    return
+                # 主动视觉回复轮询（20261011）：原子取空队列（at-most-once）
+                if path == "/api/chat/proactive":
+                    self._handle_chat_proactive()
                     return
 
                 if path == "/api/remote/status":
@@ -3008,6 +3394,7 @@ def make_handler(
                 # SystemExit / KeyboardInterrupt 继承 BaseException，不会被此处捕获
                 self._guard_internal_error(exc)
 
+        @_serialize_request
         def do_POST(self):
             """处理 POST：chat 守卫/表情聊天、Agent/远端/电脑控制、tools/call、memory/distill、voice/*。"""
             if not self._check_host():
@@ -3090,6 +3477,15 @@ def make_handler(
                 if path == "/api/voice/warmup":
                     self._handle_voice_warmup()
                     return
+                # 主模型话轮判定（20261010 全双工：主模型判定模式吃投机预填充红利）
+                if path == "/api/voice/turn_check":
+                    self._handle_voice_turn_check()
+                    return
+                # 语音视觉预填充（20261011）：开口瞬间截图进主对话 KV cache，
+                # 正式语音请求命中前缀免重算图像 token
+                if path == "/api/voice/visual_prefill":
+                    self._handle_voice_visual_prefill()
+                    return
                 # 表情聊天流式版（语音低延迟）：LLM 增量 NDJSON 下发，前端句级
                 # 流水线提前启动 TTS——不等完整回复
                 if path == "/api/chat/message_stream":
@@ -3116,6 +3512,7 @@ def make_handler(
             except Exception as exc:  # noqa: BLE001 - 兜底：结构化 500 而非连接中断
                 self._guard_internal_error(exc)
 
+        @_serialize_request
         def do_PUT(self):
             """处理 PUT：/api/settings 更新配置；/api/agents/{id} 更新指定 Agent。"""
             if not self._check_host():
@@ -3146,6 +3543,7 @@ def make_handler(
             except Exception as exc:  # noqa: BLE001 - 兜底：结构化 500 而非连接中断
                 self._guard_internal_error(exc)
 
+        @_serialize_request
         def do_DELETE(self):
             """处理 DELETE：/api/memories/{id} 软删除 / /api/agents/{id} 删除 Agent。"""
             if not self._check_host():
@@ -3484,7 +3882,11 @@ def make_handler(
                 )
                 return
             try:
-                updated = store.update(memory_id, fields)
+                memory_manager = getattr(self._pipeline, "manager", None)
+                if memory_manager is not None:
+                    updated = memory_manager.update(memory_id, fields)
+                else:
+                    updated = store.update(memory_id, fields)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
                 return
@@ -3708,19 +4110,25 @@ def make_handler(
             # 不可用/无 query 时退化 store.list_recent（relevance 缺省 0.5，对齐
             # CX-O「向量库不可用时无损降级」口径）。
             candidates = None
+            total = None
             degraded = False
             pipeline = self._pipeline
             if q and pipeline is not None:
                 try:
-                    result = pipeline.retrieve(q, agent_id=agent_id, top_k=_MEMORY_3D_CANDIDATE_LIMIT)
+                    result = pipeline.retrieve(
+                        q, agent_id=agent_id, top_k=max(limit, _MEMORY_3D_CANDIDATE_LIMIT),
+                        mem_type=mem_type, importance_weight=w_importance,
+                        time_weight=w_time, relevance_weight=w_rel, limit=limit,
+                    )
                     candidates = list(result.get("memories") or [])
+                    total = result.get("total", len(candidates))
                 except Exception as exc:  # noqa: BLE001 - 检索链异常降级（不 500）
                     LOGGER.warning("3D 检索候选预取失败，降级列表扫描：%s", exc)
                     candidates = None
             if candidates is None:
                 degraded = True
                 try:
-                    rows = self._store.list(type=mem_type, agent_id=None if agent_id == "default" else agent_id)
+                    rows = self._store.list(type=mem_type, agent_id=agent_id)
                 except ValueError as exc:
                     self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
                     return
@@ -3728,18 +4136,19 @@ def make_handler(
                     # 子串过滤模拟相关性（与 builtin_registry 退化检索同口径）
                     rows = [m for m in rows if q in str(m.get("content") or "")]
                 candidates = rows
-            scored = _memory_score_3d(
-                candidates,
-                query=q,
-                importance_weight=w_importance,
-                time_weight=w_time,
-                relevance_weight=w_rel,
-            )
+            if degraded:
+                total = len(candidates)
+                scored = _memory_score_3d(
+                    candidates, query=q, importance_weight=w_importance,
+                    time_weight=w_time, relevance_weight=w_rel, limit=limit,
+                )
+            else:
+                scored = candidates
             self._send_json(
                 {
                     "ok": True,
                     "memories": scored[:limit],
-                    "total": len(scored),
+                    "total": total,
                     "applied_weights": {"importance": w_importance, "time": w_time, "relevance": w_rel},
                     "degraded": degraded,
                 }
@@ -4197,6 +4606,13 @@ def make_handler(
                     {"ok": False, "error": "bad_request", "message": "text 为必填字段且不能为空"}, 400
                 )
                 return
+            # 朗读清洗：剥 emoji/装饰符号（模型偶发输出，TTS 会跳字/怪音）
+            text = _strip_speech_noise(text).strip()
+            if not text:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "文本剥离符号后无可用内容"}, 400
+                )
+                return
             # M-5：文本长度上限——防超长文本分钟级合成阻塞单线程服务
             if len(text) > _MAX_SYNTH_TEXT_CHARS:
                 self._send_json(
@@ -4291,9 +4707,11 @@ def make_handler(
                 try:
                     voice = self._voice_config_default()
                     # TTS：微型文本合成（拉起 sidecar 进程 + 构造 MeloTTS 引擎）
-                    self._voice.tts.synthesize("嗯", voice)
+                    with self._tts_lock:
+                        self._voice.tts.synthesize("嗯", voice)
                     # ASR：0.2s 16kHz 16bit 静音识别（构造 SenseVoice 模型）
-                    self._voice.asr.transcribe(b"\x00" * 6400, 16000)
+                    with self._asr_lock:
+                        self._voice.asr.transcribe(b"\x00" * 6400, 16000)
                     LOGGER.info("语音引擎预热完成（sidecar / TTS / ASR 已就绪）")
                 except Exception as exc:  # noqa: BLE001 - 预热尽力而为，不阻断服务
                     LOGGER.info(
@@ -4305,6 +4723,129 @@ def make_handler(
 
             threading.Thread(target=_run, name="voice-warmup", daemon=True).start()
             self._send_json({"ok": True, "warmup": "started"})
+
+        def _handle_voice_turn_check(self):
+            """POST /api/voice/turn_check：主模型话轮判定（对齐 CX-O agent_interrupt_user 语义）。
+
+            全双工「说完没有」不再只靠固定静音时长——ASR 文本到手后由**主对话模型**
+            快速三态判定（20261010_模块0_语音交互延迟优化·主模型判定模式）：
+
+            - **CONTINUE**：用户还在组织语言（半截话）→ 前端挂起合并下一句再发；
+            - **SEND**：完整一句 → 立即发送回复；
+            - **IGNORE**：无意义音节/自言自语 → 丢弃。
+
+            **主模型判定模式的缓存红利**（用户裁决：只有主模型判定才吃投机预填充）：
+            判定请求经 ``_build_chat_messages`` 复用主对话的 system（人设）+ 会话
+            历史前缀——llama-server ``--cache-prompt --cache-reuse`` 命中已缓存部分，
+            prefill 只算判定指令增量；生成上限 24 token、温度 0（输出稳定可解析），
+            亚秒级完成。独立小模型则每次全量 prefill 且需额外养一个引擎——不采用。
+
+            兜底口径（宁误发不吞话）：runtime 未就绪 / 超时 / 输出不可解析 → 一律
+            ``SEND``（固定静音断句的行为兜底，绝不因判定失败吞掉用户的话）。
+            """
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            text = str(body.get("text") or "").strip()
+            if not text:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "text 为必填字段且不能为空"},
+                    400,
+                )
+                return
+            runtime = _local_holder.get()
+            if runtime is None:
+                self._send_json({"ok": True, "decision": "SEND", "reason": "local_llm_not_ready"})
+                return
+            # 判定输出只要**一个枚举词**（非 JSON）——生成 1~3 token，CPU 上 <0.1s；
+            # JSON+reason 形态的 32 token 生成在 CPU 上要 0.8s+（实测），判定延迟大头
+            judge_text = (
+                "（话轮判定，非聊天）判断用户语音是否完整说了一句。只回一个词："
+                "CONTINUE（话没说完）/ SEND（完整一句）/ IGNORE（无意义音节）。\n"
+                f"【用户语音】{text}"
+            )
+            try:
+                messages = self._build_chat_messages(judge_text, agent_id="default")
+                # 复用主对话 system+历史前缀（cache 命中）+ 单词生成 → 亚秒判定
+                raw = runtime.offline_chat(messages, max_tokens=8, temperature=0.0)
+            except Exception as exc:  # noqa: BLE001 - 判定失败兜底 SEND，不吞话
+                LOGGER.info("话轮判定失败（%s）：%s", exc.__class__.__name__, str(exc)[:120])
+                self._send_json({"ok": True, "decision": "SEND", "reason": "judge_error"})
+                return
+            decision = "SEND"
+            reason = ""
+            # 关键词兜底解析：CONTINUE 优先（安全侧——宁可多等不吞话的合并语义）
+            if "CONTINUE" in raw:
+                decision = "CONTINUE"
+            elif "IGNORE" in raw:
+                decision = "IGNORE"
+            self._send_json({"ok": True, "decision": decision, "reason": reason})
+
+        def _handle_voice_visual_prefill(self):
+            """POST /api/voice/visual_prefill：开口瞬间截图预填充主对话 KV cache。
+
+            视觉语音融合（20261011_模块0_视觉语音融合与主动回复）三步：
+
+            1. **截图**：GDI 后端 ``capture_image_b64()`` 抓一帧 PNG base64——
+               失败静默返回（ok:false，语音链路绝不因视觉失败中断）；
+            2. **存 pending**：截图存入 _voice_pending_visual（一次性消费语义，
+               message_stream(visual=true) 取走即清空）——本地未就绪/云端模式下
+               预填充跳过，但截图仍随正式请求外发（云端 provider 具备视觉能力时）；
+            3. **预填充**：本地运行时就绪时，组装「公共前缀 + user([截图, 说明])」
+               经 ``offline_chat(max_tokens=1)`` 打进主实例 KV cache——llama-server
+               ``--cache-prompt`` 缓存该前缀，ASR 文本就绪后的正式请求命中缓存，
+               图像 token（vision.image_max_tokens 封顶）与人设/历史免重算。
+
+            本端点与 message_stream 同持 _chat_lock 串行（见 _serialize_request）
+            ——预填充与正式请求之间不会插入其他聊天流量冲掉缓存槽。
+            """
+            body = self._read_body_json()
+            if body is None:
+                # 预填充是尽力而为的旁路：空 body / 坏 JSON 不 400（前端 fire-and-forget）
+                body = {}
+            image_b64 = _capture_voice_screenshot()
+            if not image_b64:
+                self._send_json({"ok": True, "prefilled": False, "reason": "screenshot_unavailable"})
+                return
+            _store_voice_pending_visual(image_b64)
+            runtime = _local_holder.get()
+            if runtime is None:
+                # 本地大脑未就绪：截图照存（云端正式请求仍可带图），仅跳过预填充
+                self._send_json({"ok": True, "prefilled": False, "reason": "local_llm_not_ready"})
+                return
+            try:
+                prefill_messages = [
+                    *self._build_chat_prefix("default", ""),
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64," + image_b64},
+                            },
+                            {"type": "text", "text": _VOICE_VISUAL_NOTE},
+                        ],
+                    },
+                ]
+                runtime.offline_chat(prefill_messages, max_tokens=1, temperature=0.0)
+            except Exception as exc:  # noqa: BLE001 - 预填充失败静默，不阻断语音
+                LOGGER.info("语音视觉预填充未完成（%s）：%s", exc.__class__.__name__, str(exc)[:120])
+                self._send_json({"ok": True, "prefilled": False, "reason": "prefill_failed"})
+                return
+            self._send_json({"ok": True, "prefilled": True})
+
+        def _handle_chat_proactive(self):
+            """GET /api/chat/proactive：原子取空主动视觉回复队列。
+
+            队列由 VisionPipeline sink 在判定 reply_worthy 时写入（有界 deque，
+            溢出丢最旧）；前端 8s 轮询取走即清空（at-most-once，与 relay/pending
+            同口径）。取走后主动消息不再可取，前端负责气泡展示 / TTS / 托盘通知。
+            """
+            with _PROACTIVE_QUEUE_LOCK:
+                items = list(_PROACTIVE_QUEUE)
+                _PROACTIVE_QUEUE.clear()
+            self._send_json({"ok": True, "messages": items})
 
         def _handle_voice_synthesize_stream(self):
             """POST /api/voice/synthesize_stream：按标点切分后逐句合成，chunked NDJSON 流式下发。
@@ -4326,6 +4867,13 @@ def make_handler(
             if not text:
                 self._send_json(
                     {"ok": False, "error": "bad_request", "message": "text 为必填字段且不能为空"}, 400
+                )
+                return
+            # 朗读清洗：剥 emoji/装饰符号（与整段合成同口径）
+            text = _strip_speech_noise(text).strip()
+            if not text:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "文本剥离符号后无可用内容"}, 400
                 )
                 return
             if len(text) > _MAX_SYNTH_TEXT_CHARS:
@@ -4750,9 +5298,9 @@ def create_app(data_dir=None, config_path=None):
 
 
 def create_server(host=DEFAULT_HOST, port=DEFAULT_PORT, data_dir=None, config_path=None):
-    """构建并返回配置好的 HTTPServer（单线程串行处理）。"""
+    """Build a concurrent server; resource locks live on the handler."""
     _store, _pipeline, handler = create_app(data_dir, config_path=config_path)
-    return HTTPServer((host, port), handler)
+    return ThreadingHTTPServer((host, port), handler)
 
 
 # 管理 API 令牌落盘（20261004_模块0_管理API令牌落盘）：外部管理 Agent 在应用运行时

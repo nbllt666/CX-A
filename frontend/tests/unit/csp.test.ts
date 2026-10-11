@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 // Vite ?raw 导入：直接取 index.html 原文（避免 cwd / import.meta.url 在不同 runner 下的路径差异）
 import html from '../../index.html?raw';
+import overlayHtml from '../../pet-overlay.html?raw';
 
 /**
  * CSP 静态断言（回归防线）。
@@ -13,13 +14,13 @@ import html from '../../index.html?raw';
  * 本用例是那类缺陷的最低成本防线：任何后续 CSP 调整若抹掉 media-src 放行，
  * 会在此直接变红，而不是等到用户点朗读才发现。
  */
-describe('index.html CSP', () => {
+describe.each([['index.html', html], ['pet-overlay.html', overlayHtml]])('%s CSP', (name, source) => {
   /** 取 CSP meta 的 content 值。 */
   function cspContent(): string {
-    const match = html.match(
+    const match = source.match(
       /http-equiv="Content-Security-Policy"\s+content="([^"]+)"/,
     );
-    expect(match, 'index.html 必须存在 CSP meta').not.toBeNull();
+    expect(match, `${name} 必须存在 CSP meta`).not.toBeNull();
     return match![1];
   }
 

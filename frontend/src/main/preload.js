@@ -32,6 +32,13 @@ contextBridge.exposeInMainWorld('cxaAPI', {
   showMainWindow: () => ipcRenderer.invoke('app:show-main'),
 
   /**
+   * 系统托盘通知（20261011_模块0_视觉语音融合与主动回复）：AI 主动搭话时由
+   * 渲染层发起（title/body 截断由主进程兜底），点击通知唤起主窗口。
+   * 非 Electron 环境不会被调用；能力缺失主进程返回 false。
+   */
+  notifyTray: (title, body) => ipcRenderer.invoke('app:notify', { title, body }),
+
+  /**
    * 订阅托盘桌宠开关同步（20261004_模块0_托盘常驻）：托盘直控窗口显隐后，
    * 主进程经本通道通知渲染层对齐 localStorage 开关状态（单一真相源仍为渲染层）。
    * 返回去订阅函数。

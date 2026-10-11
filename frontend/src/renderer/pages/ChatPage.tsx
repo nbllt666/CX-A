@@ -48,6 +48,21 @@ export default function ChatPage() {
   const queueRef = useRef<string[]>([]);
   const playingRef = useRef(false);
   const streamDoneRef = useRef(false);
+  const mountedRef = useRef(true);
+  const recordingRequestedRef = useRef(false);
+  const recordingGenerationRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      recordingGenerationRef.current += 1;
+      recordingRequestedRef.current = false;
+      sessionRef.current?.cancel();
+      sessionRef.current = null;
+      stopSpeaking(false);
+    };
+  }, []);
 
   // F-7（第三轮体检批次6）：消息变化后自动滚动到底部——修复前 listRef 为
   // 死引用，消息超一屏后新气泡（尤其AI回复）出现在视口外。
@@ -69,6 +84,7 @@ export default function ChatPage() {
   const loadHistory = useCallback((force = false) => {
     fetchChatHistory()
       .then((entries) => {
+        if (!mountedRef.current) return;
         if (!force && historyStaleRef.current) return;
         setMessages(
           entries.map((entry, index) => ({
@@ -112,6 +128,7 @@ export default function ChatPage() {
 
     try {
       const data = await sendChatMessage({ message: text });
+      if (!mountedRef.current) return;
       const reply = extractReplyText(data);
       if (reply) {
         setChannel('connected');
@@ -140,12 +157,13 @@ export default function ChatPage() {
         markFailed(meId);
       }
     } catch (err) {
+      if (!mountedRef.current) return;
       // 不可达：标注该条消息未送达，不伪造任何回复文本
       console.error('[Chat] 消息发送失败:', err);
       setChannel('unavailable');
       markFailed(meId);
     } finally {
-      setSending(false);
+      if (mountedRef.current) setSending(false);
     }
   }
 
@@ -156,7 +174,7 @@ export default function ChatPage() {
   }
 
   /** 停止当前朗读（中断流式请求 + 清空队列 + 停当前播放器）。 */
-  function stopSpeaking() {
+  function stopSpeaking(updateState = true) {
     const abort = abortRef.current;
     abortRef.current = null;
     if (abort) {
@@ -171,7 +189,7 @@ export default function ChatPage() {
     streamDoneRef.current = false;
     const player = playerRef.current;
     playerRef.current = null;
-    setSpeakingId(null);
+    if (updateState && mountedRef.current) setSpeakingId(null);
     if (player) {
       try {
         player.onended = null;
@@ -184,10 +202,12 @@ export default function ChatPage() {
   }
 
   /** 播放队列中下一段音频（队列为空且流已结束则清 speakingId）。 */
-  function playNext() {
+  function playNext(controller: AbortController) {
+    if (!mountedRef.current || controller.signal.aborted || abortRef.current !== controller) return;
     const next = queueRef.current.shift();
     if (!next) {
       playingRef.current = false;
+      playerRef.current = null;
       if (streamDoneRef.current) {
         setSpeakingId(null);
       }
@@ -196,13 +216,22 @@ export default function ChatPage() {
     const player = new Audio(`data:audio/wav;base64,${next}`);
     playerRef.current = player;
     playingRef.current = true;
-    player.onended = () => playNext();
-    player.onerror = () => playNext();
-    void player.play().catch(() => playNext());
+    let advanced = false;
+    const advance = () => {
+      if (advanced) return;
+      advanced = true;
+      player.onended = null;
+      player.onerror = null;
+      playNext(controller);
+    };
+    player.onended = advance;
+    player.onerror = advance;
+    void player.play().catch(advance);
   }
 
   /** 朗读指定消息（流式：按标点切分逐句合成，收到首句即开始播放）。 */
   async function speak(messageId: string, text: string) {
+    if (!mountedRef.current) return;
     stopSpeaking();
     if (!text.trim()) return;
     setSpeakingId(messageId);
@@ -213,15 +242,17 @@ export default function ChatPage() {
       await synthesizeSpeechStream(
         text,
         (chunk) => {
+          if (!mountedRef.current || controller.signal.aborted || abortRef.current !== controller) return;
           if (chunk.audio_base64) {
             queueRef.current.push(chunk.audio_base64);
             if (!playingRef.current) {
-              playNext();
+              playNext(controller);
             }
           }
           // error 帧：忽略该句，继续等待后续帧
         },
         () => {
+          if (!mountedRef.current || controller.signal.aborted || abortRef.current !== controller) return;
           streamDoneRef.current = true;
           if (!playingRef.current && queueRef.current.length === 0) {
             setSpeakingId(null);
@@ -230,22 +261,26 @@ export default function ChatPage() {
         controller.signal,
       );
     } catch (err) {
-      if (controller.signal.aborted) return;
+      if (!mountedRef.current || controller.signal.aborted || abortRef.current !== controller) return;
       console.error('[Chat] 朗读失败:', err);
-      setSpeakingId(null);
+      stopSpeaking();
     }
   }
 
   /** 麦克风：点击开始录音，再点停止并把识别文本填入输入框。 */
   async function toggleMic() {
-    if (recording) {
+    if (recordingRequestedRef.current) {
+      recordingRequestedRef.current = false;
+      const generation = ++recordingGenerationRef.current;
       const session = sessionRef.current;
       sessionRef.current = null;
       setRecording(false);
       if (!session) return;
       try {
         const audio = await session.stop();
+        if (!mountedRef.current || generation !== recordingGenerationRef.current) return;
         const result = await transcribeAudio(audio.audioBase64, audio.sampleRate);
+        if (!mountedRef.current || generation !== recordingGenerationRef.current) return;
         if (result?.ok === true && typeof result.text === 'string') {
           setDraft(result.text);
         }
@@ -254,10 +289,20 @@ export default function ChatPage() {
       }
       return;
     }
+    recordingRequestedRef.current = true;
+    const generation = ++recordingGenerationRef.current;
+    setRecording(true);
     try {
-      sessionRef.current = await startRecording();
-      setRecording(true);
+      const session = await startRecording();
+      if (!mountedRef.current || generation !== recordingGenerationRef.current) {
+        session.cancel();
+        return;
+      }
+      sessionRef.current = session;
     } catch (err) {
+      if (!mountedRef.current || generation !== recordingGenerationRef.current) return;
+      recordingRequestedRef.current = false;
+      setRecording(false);
       console.error('[Chat] 麦克风不可用:', err);
     }
   }

@@ -328,6 +328,11 @@ export interface ContinuousRecordingHandlers {
   onUtterance: (audio: { audioBase64: string; sampleRate: number; durationSec: number }) => void;
   /** 每块能量回调（RMS 0~1；打断检测/可视化用）。 */
   onLevel?: (rms: number) => void;
+  /**
+   * 用户开口瞬间（能量 VAD speech-start；20261011 视觉语音融合）：
+   * 调用方在此触发截图预填充（fire-and-forget），使正式语音请求命中图像 KV 前缀。
+   */
+  onSpeechStart?: () => void;
   /** 采集错误（权限被拒等）。 */
   onError?: (err: Error) => void;
 }
@@ -381,6 +386,7 @@ export async function startContinuousRecording(
     const event0 = vad.feed(rms);
     if (event0 === 'speech-start') {
       speechChunks = [chunk];
+      handlers.onSpeechStart?.();
       return;
     }
     if (vad.inSpeech) {

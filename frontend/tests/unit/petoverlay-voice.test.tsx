@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react';
 import PetOverlay from '../../src/renderer/components/PetOverlay';
 
 /**
@@ -125,11 +125,16 @@ function openMenu() {
 
 describe('PetOverlay：悬浮窗语音闭环', () => {
   let playMock: ReturnType<typeof vi.fn>;
+  const players: Array<{ onended: (() => void) | null; onerror: (() => void) | null; pause: ReturnType<typeof vi.fn> }> = [];
 
   beforeEach(() => {
+    players.length = 0;
     vi.stubGlobal(
       'Audio',
       class {
+        constructor() {
+          players.push(this);
+        }
         onended: (() => void) | null = null;
         onerror: (() => void) | null = null;
         pause = vi.fn();
@@ -361,6 +366,84 @@ describe('PetOverlay：悬浮窗语音闭环', () => {
       expect.anything(),
     );
     expect(window.localStorage.getItem('cx-a.chatTick')).toBeNull();
+  });
+
+  it('连续流式句段 FIFO 播放，上一句自然结束前不发下一次合成，卸载停止音频', async () => {
+    let chatController!: ReadableStreamDefaultController<Uint8Array>;
+    const chatBody = new ReadableStream<Uint8Array>({ start(controller) { chatController = controller; } });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/settings')) return jsonResponse({ voice: { interaction_mode: 'vad' } });
+      if (url.includes('/computer/status')) return jsonResponse({ authorized: false });
+      if (url.includes('/voice/transcribe')) return jsonResponse({ ok: true, text: '你好' });
+      if (url.includes('/chat/message_stream')) return new Response(chatBody, { status: 200 });
+      if (url.includes('/voice/synthesize_stream')) return synthStreamResponse();
+      if (url.includes('/voice/warmup')) return jsonResponse({ ok: true });
+      throw new Error(`unexpected url: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const view = render(<PetOverlay />);
+    openMenu();
+    fireEvent.click(await screen.findByRole('button', { name: '麦克风' }));
+    await waitFor(() => expect(continuousMocks.start).toHaveBeenCalledTimes(1));
+    continuousMocks.captured[0].onUtterance({ audioBase64: 'AA==', sampleRate: 16000, durationSec: 1 });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/chat/message_stream'), expect.anything()));
+    chatController.enqueue(new TextEncoder().encode(JSON.stringify({ delta: '第一句。' }) + '\n'));
+    await waitFor(() => expect(playMock).toHaveBeenCalledTimes(1));
+    chatController.enqueue(new TextEncoder().encode(JSON.stringify({ delta: '第二句。' }) + '\n' + JSON.stringify({ done: true, clean_text: '第一句。第二句。' }) + '\n'));
+    chatController.close();
+    await act(async () => { for (let i = 0; i < 20; i += 1) await Promise.resolve(); });
+    expect(playMock).toHaveBeenCalledTimes(1);
+    expect(players[0].pause).not.toHaveBeenCalled();
+    expect(screen.getByTestId('pet-overlay-root')).toHaveAttribute('data-talking', 'true');
+    act(() => players[0].onended?.());
+    await waitFor(() => expect(playMock).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId('pet-overlay-root')).toHaveAttribute('data-talking', 'true');
+    view.unmount();
+    expect(players[1].pause).toHaveBeenCalledTimes(1);
+    expect(players[1].onended).toBeNull();
+  });
+
+  it('每次开启重新读取最新交互模式，取消等待授权的会话不会重新采麦', async () => {
+    let mode = 'vad';
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/settings')) return jsonResponse({ voice: { interaction_mode: mode } });
+      if (url.includes('/computer/status')) return jsonResponse({ authorized: false });
+      throw new Error(`unexpected url: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    let resolveRecorder!: (recorder: Awaited<ReturnType<typeof continuousMocks.start>>) => void;
+    continuousMocks.start.mockImplementationOnce((handlers) => {
+      continuousMocks.captured.push(handlers);
+      return new Promise((resolve) => { resolveRecorder = resolve; });
+    });
+    const stop = vi.fn();
+    render(<PetOverlay />);
+    openMenu();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/settings'), expect.anything()));
+    mode = 'duplex';
+    fireEvent.click(screen.getByRole('button', { name: '麦克风' }));
+    await waitFor(() => expect(continuousMocks.start).toHaveBeenCalledTimes(1));
+    expect(continuousMocks.start).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ silenceTimeoutSec: 0.45 }));
+    fireEvent.click(screen.getByRole('button', { name: '麦克风' }));
+    await act(async () => { resolveRecorder({ active: true, stop, clearBuffer: vi.fn() }); });
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: '麦克风' })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('菜单反复开关与卸载时移除相应 blur listener', () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ config: {} })));
+    const add = vi.spyOn(window, 'addEventListener');
+    const remove = vi.spyOn(window, 'removeEventListener');
+    const view = render(<PetOverlay />);
+    openMenu();
+    fireEvent.keyDown(window, { key: 'Escape' });
+    openMenu();
+    view.unmount();
+    const added = add.mock.calls.filter(([event]) => event === 'blur');
+    expect(added).toHaveLength(2);
+    for (const [, handler] of added) expect(remove).toHaveBeenCalledWith('blur', handler);
   });
 
   it('屏幕共享开关：点击热更新 vision.enabled（乐观更新 + 服务端回执）', async () => {

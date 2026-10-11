@@ -11,10 +11,13 @@ import json
 import logging
 import os
 import sqlite3
+from contextlib import nullcontext
+from threading import RLock
 from datetime import datetime
 
 from .decay import age_seconds_from_created as _age_seconds
 from .schema import COLUMNS, CREATE_INDEX_SQL, CREATE_TABLE_SQL, MEMORY_TYPES
+from ._locking import synchronized
 
 # 原生日志记录器（低-10：update 未知键告警留痕）
 LOGGER = logging.getLogger(__name__)
@@ -96,6 +99,7 @@ class MemoryStore:
     """记忆存储访问层（sqlite3 标准库）。"""
 
     def __init__(self, db_path=None):
+        self._lock = RLock()
         # 未显式提供 db_path 时，指向项目根目录下 data/memories.db（禁止相对路径）
         self.db_path = db_path or _default_db_path()
         self._conn = None
@@ -103,12 +107,13 @@ class MemoryStore:
         self._index_ready = False
 
     # ------------------------------------------------------------------ 连接管理
+    @synchronized
     def _connect(self) -> sqlite3.Connection:
         """惰性建立连接，必要时自动创建数据库所在目录。
 
         以 check_same_thread=False 建立连接：允许连接被创建线程之外的线程复用。
-        依赖方（lite/server/api_server.py 的轻量 REST 服务）为单线程串行访问，
-        不存在并发读写，此放宽是安全的。既有单线程调用行为不变。
+        Public operations hold the instance lock across statements and commit;
+        background vision writes cannot interleave transactions on this connection.
         """
         if self._conn is None:
             parent = os.path.dirname(self.db_path)
@@ -118,6 +123,7 @@ class MemoryStore:
             self._conn.row_factory = sqlite3.Row
         return self._conn
 
+    @synchronized
     def close(self):
         """关闭数据库连接。"""
         if self._conn is not None:
@@ -131,6 +137,7 @@ class MemoryStore:
         self.close()
 
     # ------------------------------------------------------------------ 建表
+    @synchronized
     def create_table(self) -> bool:
         """创建 memories 表，并确保检索组合索引存在（中-1a）。"""
         conn = self._connect()
@@ -170,6 +177,7 @@ class MemoryStore:
             raise ValueError("记忆内容 content 不能为空")
 
     # ------------------------------------------------------------------ 写
+    @synchronized
     def add(self, memory: dict) -> int:
         """新增一条记忆，返回新记录 id。
 
@@ -202,6 +210,7 @@ class MemoryStore:
         self._connect().commit()
         return cur.lastrowid
 
+    @synchronized
     def update(self, memory_id: int, fields: dict) -> int:
         """按 id 更新字段，自动刷新 updated_at。返回受影响行数。
 
@@ -216,6 +225,8 @@ class MemoryStore:
             return 0
         if "type" in fields:
             self._validate_type(fields["type"])
+        if "content" in fields:
+            self._validate_content(fields["content"])
         unknown_keys = [k for k in fields if k not in _INSERT_COLUMNS]
         if unknown_keys:
             LOGGER.warning("update 忽略未知字段 keys=%s（memory_id=%s）", unknown_keys, memory_id)
@@ -232,10 +243,16 @@ class MemoryStore:
         sets = ",".join(f"{k}=?" for k in updates)
         params = list(updates.values()) + [memory_id]
         self._ensure_table()
-        cur = self._connect().execute(f"UPDATE memories SET {sets} WHERE id=?", params)
-        self._connect().commit()
+        conn = self._connect()
+        try:
+            cur = conn.execute(f"UPDATE memories SET {sets} WHERE id=?", params)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return cur.rowcount
 
+    @synchronized
     def soft_delete(self, memory_id: int) -> bool:
         """软删除：置 is_deleted=1，同时刷新 updated_at。返回是否命中。"""
         self._ensure_table()
@@ -247,6 +264,7 @@ class MemoryStore:
         return cur.rowcount > 0
 
     # ------------------------------------------------------------------ 读
+    @synchronized
     def get(self, memory_id: int):
         """按 id 获取单条记忆（不区分是否已软删除），不存在返回 None。"""
         self._ensure_table()
@@ -255,6 +273,7 @@ class MemoryStore:
         ).fetchone()
         return _row_to_dict(row)
 
+    @synchronized
     def list(self, type=None, limit=None, include_deleted=False, agent_id=None) -> list:
         """查询记忆列表。
 
@@ -287,6 +306,7 @@ class MemoryStore:
         rows = self._connect().execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
 
+    @synchronized
     def list_recent(self, agent_id=None, limit=500, include_deleted=False) -> list:
         """按 id 降序返回最近 limit 条记忆（有界查询，中-1c）。
 
@@ -367,6 +387,7 @@ class MemoryStore:
         """判定一条记忆是否豁免衰减：permanent 标记或 type=='permanent'。"""
         return bool(mem.get("permanent")) or mem.get("type") == "permanent"
 
+    @synchronized
     def decay_stats(self, now=None, calculator=None) -> dict:
         """衰减统计：全量未删除记忆按衰减公式计算分数并汇总分布。
 
@@ -444,6 +465,17 @@ class MemoryStore:
         }
 
     def sync_decay(self, archive_threshold=None, now=None, calculator=None, deleter=None) -> dict:
+        """Apply decay with manager-before-storage ordering for bound callbacks."""
+        callback_lock = getattr(getattr(deleter, "__self__", None), "_lock", None)
+        # Bound manager callbacks must be acquired before the storage lock.
+        # Opaque callbacks run outside it; individual reads/writes remain locked.
+        if deleter is not None and callback_lock is None:
+            return self._sync_decay(archive_threshold, now, calculator, deleter)
+        with callback_lock if callback_lock is not None else nullcontext():
+            with self._lock:
+                return self._sync_decay(archive_threshold, now, calculator, deleter)
+
+    def _sync_decay(self, archive_threshold=None, now=None, calculator=None, deleter=None) -> dict:
         """执行衰减同步：衰减后分数低于阈值的非 permanent 记忆软删归档。
 
         Args:

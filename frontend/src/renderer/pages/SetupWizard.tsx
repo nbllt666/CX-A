@@ -171,12 +171,17 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
 
   const aliveRef = useRef(true);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollRequestRef = useRef<AbortController | null>(null);
+  const pollGenerationRef = useRef(0);
 
   // 卸载清理：定时器必须清掉（防测试泄漏与内存泄漏）
   useEffect(() => {
     aliveRef.current = true;
     return () => {
       aliveRef.current = false;
+      pollGenerationRef.current += 1;
+      pollRequestRef.current?.abort();
+      pollRequestRef.current = null;
       if (pollTimerRef.current !== null) {
         clearInterval(pollTimerRef.current);
         pollTimerRef.current = null;
@@ -234,6 +239,9 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
   const accelProfile: AccelProfile | null = rec?.accel ?? recommendation?.accel ?? null;
 
   const stopPolling = () => {
+    pollGenerationRef.current += 1;
+    pollRequestRef.current?.abort();
+    pollRequestRef.current = null;
     if (pollTimerRef.current !== null) {
       clearInterval(pollTimerRef.current);
       pollTimerRef.current = null;
@@ -242,34 +250,42 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
 
   /** 拉一次进度：完成 / 失败 / 取消时停表；失败保留上次进度，下个周期再试 */
   const refreshProgress = async () => {
+    if (!aliveRef.current || pollRequestRef.current) return;
+    const generation = pollGenerationRef.current;
+    const controller = new AbortController();
+    pollRequestRef.current = controller;
     try {
-      const p = await fetchModelProgress();
-      if (!aliveRef.current) return;
+      const p = await fetchModelProgress(controller.signal);
+      if (!aliveRef.current || generation !== pollGenerationRef.current) return;
       setProgress(p ?? null);
       if (p && (p.state === 'done' || p.state === 'failed' || p.state === 'canceled')) {
         stopPolling();
       }
     } catch {
       /* 单次查询失败不影响整体：保留上次进度，等下一次轮询 */
+    } finally {
+      if (pollRequestRef.current === controller) pollRequestRef.current = null;
     }
   };
 
   const handleStartDownload = async () => {
+    if (starting) return;
+    stopPolling();
+    const generation = pollGenerationRef.current;
     setDlError(null);
     setCanceled(false);
     setStarting(true);
     try {
       // 只传档位：模型从哪个站点拿由所选线路在服务端决定
       await startModelDownload({ tier: tier || undefined });
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || generation !== pollGenerationRef.current) return;
       setStarting(false);
     } catch {
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || generation !== pollGenerationRef.current) return;
       setStarting(false);
       setDlError('下载没能启动…待会儿再试一次吧');
       return;
     }
-    stopPolling();
     void refreshProgress(); // 先立即拉一次，进度马上可见
     pollTimerRef.current = setInterval(() => {
       void refreshProgress();
@@ -278,9 +294,10 @@ export default function SetupWizard({ onDone, initialStatus = null }: SetupWizar
 
   const handleCancelDownload = async () => {
     stopPolling();
+    const generation = pollGenerationRef.current;
     try {
       await cancelModelDownload();
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || generation !== pollGenerationRef.current) return;
       setProgress(null);
       setCanceled(true);
     } catch {
