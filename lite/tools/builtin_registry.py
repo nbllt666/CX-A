@@ -214,6 +214,63 @@ class BuiltinToolRegistry:
         }
 
     # ------------------------------------------------------------------ #
+    # 远端插件工具（20261017 CXFC 全量迁移：跨机插件进桌宠工具表）         #
+    # ------------------------------------------------------------------ #
+
+    #: 远端工具来源标识（list_tools 可见、call 可调；与 builtin 并存）
+    SOURCE_REMOTE = "remote"
+
+    def refresh_remote_tools(self, specs: List[Dict[str, Any]],
+                             caller: Callable[[str, str, str, Dict[str, Any]], Dict[str, Any]]) -> int:
+        """刷新远端插件工具表（先清旧 ``source=remote`` 条目再批量注册）。
+
+        供 CXFC 远端节点插件清单拉取后调用（api_server ``_handle_cxfc_remote_fetch``），
+        使桌宠聊天工具链与 ``GET /api/tools`` 可见并可直接调用远端插件工具。
+
+        :param specs: 工具描述列表，每项
+            ``{"node": 节点id, "plugin": 插件id, "tool": 工具名, "description": 说明}``；
+            description 缺省用工具名。
+        :param caller: 实际调用回调 ``caller(node_id, plugin_id, tool_name, arguments)``
+            ——返回完整外壳 dict（``{"success": ...}``）；由 api_server 侧注入
+            :meth:`CxfcRemoteClient.call_plugin`（含 X-API-Key 管理密钥链路）。
+        :return: 注册的工具数量
+        """
+        for stale in [tid for tid, entry in self._tools.items() if entry.get("source") == self.SOURCE_REMOTE]:
+            del self._tools[stale]
+        count = 0
+        for spec in specs or []:
+            node = str((spec or {}).get("node") or "").strip()
+            plugin = str((spec or {}).get("plugin") or "").strip()
+            tool = str((spec or {}).get("tool") or "").strip()
+            if not (node and plugin and tool):
+                continue
+            tool_id = f"remote_{node}_{plugin}_{tool}"[:120]
+            tool_name = tool.replace("_", " ")
+
+            def handler(arguments: Dict[str, Any], _node=node, _plugin=plugin,
+                        _tool=tool, _caller=caller) -> Dict[str, Any]:
+                try:
+                    result = _caller(_node, _plugin, _tool, dict(arguments or {}))
+                except Exception as exc:  # noqa: BLE001 - 远端失败包装为外壳
+                    return {"success": False, "tool": _tool, "error": str(exc), "result": None}
+                return result if isinstance(result, dict) else {
+                    "success": True, "tool": _tool, "result": result,
+                }
+
+            self._tools[tool_id] = {
+                "id": tool_id,
+                "name": tool_name,
+                "description": str((spec or {}).get("description") or tool_name),
+                "handler": handler,
+                "source": self.SOURCE_REMOTE,
+                "category": "remote_plugins",
+                "enabled": True,
+                "disabled_error": "远端插件不可用",
+            }
+            count += 1
+        return count
+
+    # ------------------------------------------------------------------ #
     # 内置工具注册                                                      #
     # ------------------------------------------------------------------ #
 

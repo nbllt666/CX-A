@@ -572,6 +572,16 @@ _RELAY_PENDING_DEFAULT_LIMIT = 50
 # 回环监听地址集合（中-4 启动安全闸判定口径，第四轮体检批次B）
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
+# ACP 开放协议接收面（20261017 CX-O 全量迁移批次 3）：豁免 Host/令牌闸——局域网
+# CX-O/CX-A 节点没有本机启动令牌，Host 也不是回环名。防护改为三层：
+# ① acp.enabled 闸（未启用这些端点一律 acp_disabled，默认关零暴露面）；
+# ② 可选共享令牌（config acp.auth_token 非空时要求同值 X-ACP-Key 头，对齐 CX-O）；
+# ③ 窄面：仅写消息槽 / 返回节点自述信息（读侧不开放——无记忆/聊天历史读取面），
+#   聊天自动回复经既有管线。
+_ACP_OPEN_PATHS = frozenset({
+    "/acp/message", "/acp/health", "/acp/info", "/api/acp/receive",
+})
+
 # ------------------------------------------------------------------ 配置写入锁
 # 配置落盘串行化（Task 7「并发配置写入串行化」）：本进程内**所有** ``config.save()``
 # 调用点（请求线程的 /api/settings、/api/setup/complete，以及下载线程的
@@ -674,8 +684,9 @@ class _BodyTooLarge(Exception):
 
 
 # settings PUT 已知只读顶层键：GET 视图可见但不在 PUT 白名单的 section
-# （收到时收集进 ignored 数组回显，消除静默丢弃——L2 收口）
-_SETTINGS_READONLY_TOP_KEYS = ("acp", "remote", "vector")
+# （收到时收集进 ignored 数组回显，消除静默丢弃——L2 收口）。
+# 20261017：acp 移出只读清单——节点互联开关联动热接线（enabled/auth_token 可写）
+_SETTINGS_READONLY_TOP_KEYS = ("remote", "vector")
 
 
 def _mask_api_key(value):
@@ -1668,6 +1679,46 @@ def make_handler(
     if _resolved_vision is not None:
         _resolved_vision_thread = start_vision_tick_thread(_resolved_vision)
 
+    # ACP 节点互联装配（20261017 CX-O 全量迁移批次 3）：enabled=True 时启动心跳
+    # 清扫与 UDP 发现（对局域网宣告本机节点）；**enabled=False（默认）零网络行为
+    # ——不建 socket、不广播（隐私红线，对齐 vision.enabled 惯例）**。装配失败仅
+    # 告警置 None（ACP 不阻断服务启动）。持久化目录跟随 handler 数据目录。
+    _resolved_acp = None
+    try:
+        from lite.acp.lite_acp import LiteACP  # 函数内延迟导入：ACP 依赖链不进顶层
+
+        _resolved_acp = LiteACP(config=config, data_dir=os.path.join(default_data_dir, "acp"))
+        acp_enabled = bool(config.get("acp", "enabled", False)) if config is not None else False
+        if acp_enabled:
+            _resolved_acp.initialize()
+            _resolved_acp.start_heartbeat()
+            _resolved_acp.start_discovery(
+                local_http_port=int(config.get("acp", "local_http_port", DEFAULT_PORT) or DEFAULT_PORT)
+            )
+    except Exception as exc:  # noqa: BLE001 - ACP 装配失败不阻断服务启动
+        LOGGER.warning("ACP 节点互联装配失败（%s）：%s", exc.__class__.__name__, exc)
+        _resolved_acp = None
+
+    # CXFC direct 传输 + 远端节点客户端装配（20261017 CX-O 全量迁移批次 5）：
+    # direct=「插件注册到 CX-A 宿主」（TOFU/心跳/持久化）；remote=「CX-A 调局域网
+    # CX-O 宿主上的插件」（跨机调用链，X-API-Key 管理密钥见 cxfc.remote_admin_key）。
+    # enabled=False（默认）时不启动心跳线程、不加载持久化（零网络行为）。
+    _resolved_cxfc_direct = None
+    _resolved_cxfc_remote = None
+    try:
+        from lite.cxfc.direct import CxfcDirectManager, CxfcRemoteClient
+
+        _resolved_cxfc_direct = CxfcDirectManager(config=config, data_dir=default_data_dir)
+        _resolved_cxfc_remote = CxfcRemoteClient(config=config, data_dir=default_data_dir)
+        if _resolved_cxfc_direct.enabled:
+            _resolved_cxfc_direct.load_persisted()
+            _resolved_cxfc_direct.start_heartbeat()
+            _resolved_cxfc_remote.load_persisted()
+    except Exception as exc:  # noqa: BLE001 - CXFC 装配失败不阻断服务启动
+        LOGGER.warning("CXFC direct 装配失败（%s）：%s", exc.__class__.__name__, exc)
+        _resolved_cxfc_direct = None
+        _resolved_cxfc_remote = None
+
     class ApiHandler(BaseHTTPRequestHandler):
         """Concurrent REST handler with resource-specific synchronization."""
 
@@ -1697,6 +1748,9 @@ def make_handler(
         _download_manager = download_manager
         _vision = _resolved_vision
         _vision_thread = _resolved_vision_thread
+        _acp = _resolved_acp
+        _cxfc_direct = _resolved_cxfc_direct
+        _cxfc_remote = _resolved_cxfc_remote
         _state_lock = state_lock
         _chat_lock = chat_lock
         _tts_lock = tts_lock
@@ -1830,6 +1884,8 @@ def make_handler(
             for key in (
                 "type", "agent_id", "limit", "offset", "q", "top_k", "enabled", "plugin_id",
                 "query", "w_importance", "w_time", "w_rel", "date",
+                # ACP 节点互联（20261017）：列表过滤 / 消息查询参数
+                "online_only", "group_id",
             ):
                 vals = qs.get(key)
                 if vals:
@@ -1907,7 +1963,21 @@ def make_handler(
                         self._config.get("voice", "interaction_mode", "vad") or "vad"
                     ),
                 },
-                "acp": {"enabled": bool(self._config.get("acp", "enabled", False))},
+                # ACP 节点互联（20261017）：开关回显；enabled 由装配/PUT 热接线
+                # （开启即心跳清扫 + UDP 发现，关闭即全部停止——零网络行为）
+                "acp": {
+                    "enabled": bool(self._config.get("acp", "enabled", False)),
+                    "agent_id": str(self._config.get("acp", "agent_id", "cxa-agent-001") or ""),
+                    "agent_name": str(self._config.get("acp", "agent_name", "CX-A") or ""),
+                    "auth_token": _mask_api_key(str(self._config.get("acp", "auth_token", "") or "")),
+                },
+                # CXFC（20261017 批次 5）：开关 + 远端调用管理密钥（脱敏回显）
+                "cxfc": {
+                    "enabled": bool(self._config.get("cxfc", "enabled", False)),
+                    "remote_admin_key": _mask_api_key(
+                        str(self._config.get("cxfc", "remote_admin_key", "") or "")
+                    ),
+                },
                 "remote": {"enabled": bool(self._config.get("remote", "enabled", False))},
                 # 聊天记忆注入开关（RAG 闭环，20261005）：设置页「聊天时自动回忆」回显
                 "memory": {
@@ -1973,7 +2043,7 @@ def make_handler(
                 return
             # 先做段类型校验——段存在但非 dict 一律 400，不做 .get() 取值
             invalid_sections = [
-                name for name in ("cloud", "tts", "local_llm", "accel", "vision", "download", "voice", "memory")
+                name for name in ("cloud", "tts", "local_llm", "accel", "vision", "download", "voice", "memory", "acp", "cxfc")
                 if name in body and not isinstance(body[name], dict)
             ]
             if invalid_sections:
@@ -2201,6 +2271,71 @@ def make_handler(
                         f"voice.interaction_mode={interaction_mode!r}"
                         f"（不在白名单 {list(_VOICE_INTERACTION_MODES)}）"
                     )
+
+            # ACP 节点互联（20261017 批次 3）：enabled 热接线（开启 → initialize +
+            # 心跳清扫 + UDP 发现；关闭 → 全部停止，零网络行为）；auth_token 为
+            # 开放协议共享令牌（空=开放），本地加密落盘、GET 视图脱敏回显。
+            acp_enabled = body.get("acp", {}).get("enabled")
+            if acp_enabled is not None:
+                if isinstance(acp_enabled, bool):
+                    self._config.set("acp", "enabled", acp_enabled)
+                    applied.append("acp.enabled")
+                    if self._acp is not None:
+                        if acp_enabled:
+                            try:
+                                self._acp.set_enabled(True)
+                                self._acp.initialize()
+                                self._acp.start_heartbeat()
+                                self._acp.start_discovery(
+                                    local_http_port=int(
+                                        self._config.get("acp", "local_http_port", DEFAULT_PORT) or DEFAULT_PORT
+                                    )
+                                )
+                            except Exception as exc:  # noqa: BLE001 - 热接线失败不 5xx
+                                LOGGER.warning("ACP 开启热接线失败：%s", exc)
+                        else:
+                            self._acp.stop_discovery()
+                            self._acp.stop_heartbeat()
+                            self._acp.set_enabled(False)
+                else:
+                    ignored.append("acp.enabled（必须为布尔）")
+
+            acp_token = body.get("acp", {}).get("auth_token")
+            if acp_token is not None:
+                if isinstance(acp_token, str):
+                    self._config.set("acp", "auth_token", acp_token.strip())
+                    applied.append("acp.auth_token")
+                else:
+                    ignored.append("acp.auth_token（必须为字符串）")
+
+            # CXFC（20261017 批次 5）：enabled 热接线（direct 心跳巡检启停）；
+            # remote_admin_key 为调远端 CX-O 插件的管理密钥（本地存储、GET 脱敏）。
+            cxfc_enabled = body.get("cxfc", {}).get("enabled")
+            if cxfc_enabled is not None:
+                if isinstance(cxfc_enabled, bool):
+                    self._config.set("cxfc", "enabled", cxfc_enabled)
+                    applied.append("cxfc.enabled")
+                    if self._cxfc_direct is not None:
+                        if cxfc_enabled:
+                            self._cxfc_direct.enabled = True
+                            self._cxfc_direct.load_persisted()
+                            self._cxfc_direct.start_heartbeat()
+                        else:
+                            self._cxfc_direct.enabled = False
+                            self._cxfc_direct.stop_heartbeat()
+                            self._cxfc_direct.stop_discovery()
+                else:
+                    ignored.append("cxfc.enabled（必须为布尔）")
+
+            cxfc_admin_key = body.get("cxfc", {}).get("remote_admin_key")
+            if cxfc_admin_key is not None:
+                if isinstance(cxfc_admin_key, str):
+                    self._config.set("cxfc", "remote_admin_key", cxfc_admin_key.strip())
+                    if self._cxfc_remote is not None:
+                        self._cxfc_remote._admin_key = cxfc_admin_key.strip()
+                    applied.append("cxfc.remote_admin_key")
+                else:
+                    ignored.append("cxfc.remote_admin_key（必须为字符串）")
 
             # 运行偏好（性能/节能双模式）：保存 accel.mode 时经唯一真相源 accel_plan
             # 展开全部组件落点（tts.accel / tts.accel_device / asr / local_llm /
@@ -3289,13 +3424,14 @@ def make_handler(
             GET /api/health 豁免令牌校验（供 main.js 健康探测与运维探针）；
             /api/pet/model 分发悬浮桌宠 VRM 原始字节（过 Host / 令牌闸，无豁免）。
             """
-            if not self._check_host():
-                self._deny_bad_host()
-                return
             path = urlparse(self.path).path
-            # N1：健康检查豁免令牌，其余 GET 一律先过启动令牌闸
-            if path != "/api/health" and not self._check_token():
-                return
+            if path not in _ACP_OPEN_PATHS:
+                if not self._check_host():
+                    self._deny_bad_host()
+                    return
+                # N1：健康检查豁免令牌，其余 GET 一律先过启动令牌闸
+                if path != "/api/health" and not self._check_token():
+                    return
             try:
                 query = self._parse_query()
 
@@ -3329,6 +3465,35 @@ def make_handler(
                 # 主动视觉回复轮询（20261011）：原子取空队列（at-most-once）
                 if path == "/api/chat/proactive":
                     self._handle_chat_proactive()
+                    return
+                # ACP 节点互联（20261017 批次 3）：节点/连接/消息/统计 + 开放接收面
+                if path == "/api/acp/agents":
+                    self._handle_acp_agents_list(query)
+                    return
+                if path == "/api/acp/connections":
+                    self._handle_acp_connections()
+                    return
+                if path == "/api/acp/messages":
+                    self._handle_acp_messages(query)
+                    return
+                if path == "/api/acp/stats":
+                    self._handle_acp_stats()
+                    return
+                if path == "/acp/health":
+                    self._handle_acp_health()
+                    return
+                if path == "/acp/info":
+                    self._handle_acp_info()
+                    return
+                # CXFC direct + 远端调用（20261017 批次 5）
+                if path == "/api/cxfc/plugins":
+                    self._handle_cxfc_plugins_list()
+                    return
+                if path == "/api/cxfc/discover":
+                    self._handle_cxfc_discover(query)
+                    return
+                if path == "/api/cxfc/remote/nodes":
+                    self._handle_cxfc_remote_nodes()
                     return
 
                 if path == "/api/remote/status":
@@ -3397,15 +3562,16 @@ def make_handler(
         @_serialize_request
         def do_POST(self):
             """处理 POST：chat 守卫/表情聊天、Agent/远端/电脑控制、tools/call、memory/distill、voice/*。"""
-            if not self._check_host():
-                self._deny_bad_host()
-                return
-            try:
-                path = urlparse(self.path).path
+            path = urlparse(self.path).path
+            if path not in _ACP_OPEN_PATHS:
+                if not self._check_host():
+                    self._deny_bad_host()
+                    return
                 # N1：POST 统一过启动令牌闸（与 do_GET 次序对齐）；唯一豁免
                 # /api/admin/register——CX-O 侧无 CX-A 令牌，回环来源校验在 handler 内执行
                 if path != "/api/admin/register" and not self._check_token():
                     return
+            try:
                 if path == "/api/chat/messages":
                     self._handle_chat_send_guard()
                     return
@@ -3486,6 +3652,49 @@ def make_handler(
                 if path == "/api/voice/visual_prefill":
                     self._handle_voice_visual_prefill()
                     return
+                # ACP 节点互联（20261017 批次 3）：发现/手动加节点/连接/发送 +
+                # 开放投递入口（/api/acp/receive 与 /acp/message 豁免令牌见闸处）
+                if path == "/api/acp/discover":
+                    self._handle_acp_discover()
+                    return
+                if path == "/api/acp/agents":
+                    self._handle_acp_agent_create()
+                    return
+                if path == "/api/acp/connect":
+                    self._handle_acp_connect()
+                    return
+                if path == "/api/acp/send":
+                    self._handle_acp_send()
+                    return
+                if path == "/api/acp/receive":
+                    self._handle_acp_receive()
+                    return
+                if path == "/acp/message":
+                    self._handle_acp_message_open()
+                    return
+                # CXFC direct + 远端调用（20261017 批次 5）
+                if path == "/api/cxfc/register":
+                    self._handle_cxfc_register()
+                    return
+                if path == "/api/cxfc/heartbeat":
+                    self._handle_cxfc_heartbeat()
+                    return
+                if path == "/api/cxfc/connect":
+                    self._handle_cxfc_connect()
+                    return
+                if path == "/api/cxfc/remote/nodes":
+                    self._handle_cxfc_remote_nodes()
+                    return
+                if path.startswith("/api/cxfc/remote/nodes/") and path.endswith("/fetch"):
+                    self._handle_cxfc_remote_fetch(
+                        path[len("/api/cxfc/remote/nodes/"):-len("/fetch")]
+                    )
+                    return
+                if path.startswith("/api/cxfc/remote/nodes/") and path.endswith("/call"):
+                    self._handle_cxfc_remote_call(
+                        path[len("/api/cxfc/remote/nodes/"):-len("/call")]
+                    )
+                    return
                 # 表情聊天流式版（语音低延迟）：LLM 增量 NDJSON 下发，前端句级
                 # 流水线提前启动 TTS——不等完整回复
                 if path == "/api/chat/message_stream":
@@ -3557,6 +3766,20 @@ def make_handler(
                 prefix = "/api/memories/"
                 if path.startswith(prefix):
                     self._delete_memory(path[len(prefix):])
+                    return
+                # ACP 节点互联（20261017 批次 3）：移除节点 / 删除连接条目
+                if path.startswith("/api/acp/agents/"):
+                    self._handle_acp_agent_delete(path[len("/api/acp/agents/"):])
+                    return
+                if path.startswith("/api/acp/connect/"):
+                    self._handle_acp_disconnect(path[len("/api/acp/connect/"):])
+                    return
+                # CXFC direct（20261017 批次 5）：删除插件记录 / 移除远端节点
+                if path.startswith("/api/cxfc/plugins/"):
+                    self._handle_cxfc_plugin_delete(path[len("/api/cxfc/plugins/"):])
+                    return
+                if path.startswith("/api/cxfc/remote/nodes/"):
+                    self._handle_cxfc_remote_node_delete(path[len("/api/cxfc/remote/nodes/"):])
                     return
                 agent_id = self._extract_agents_id(path)
                 if agent_id is not None:
@@ -4478,7 +4701,10 @@ def make_handler(
 
             按 BuiltinToolRegistry.list_tools() 实际提供的数据结构如实映射
             （id/name/description/source/category/enabled），不虚构参数 schema。
+            返回前先懒刷新远端插件工具（source=remote）——远端节点清单缓存变更
+            （重启恢复 / fetch 拉取）无需重启即可见（20261017 CXFC 接线）。
             """
+            self._refresh_remote_tool_registry()
             tools = [
                 {
                     "id": t["id"],
@@ -4846,6 +5072,539 @@ def make_handler(
                 items = list(_PROACTIVE_QUEUE)
                 _PROACTIVE_QUEUE.clear()
             self._send_json({"ok": True, "messages": items})
+
+        # ---------------------------------------------- ACP 节点互联（20261017 批次 3）
+        # 对齐 CX-O /api/acp/* 响应体结构（recon_acp.md §5）；本机多角色 CRUD /
+        # per-agent 资源隔离为 CX-O 特有概念已裁剪（用户裁决：CX-A 单角色节点互联）。
+
+        def _acp_ready(self):
+            """ACP 闸门：实例缺失或未启用 → 发 503 acp_disabled 并返回 False。"""
+            if self._acp is not None and self._acp._enabled:
+                return True
+            self._send_json(
+                {"ok": False, "error": "acp_disabled",
+                 "message": "ACP 未启用（设置页开启后可用）"},
+                503,
+            )
+            return False
+
+        def _check_acp_key(self):
+            """开放协议令牌校验（对齐 CX-O）：acp.auth_token 空=开放；非空要求同值 X-ACP-Key。"""
+            token = str(self._config.get("acp", "auth_token", "") or "").strip()
+            if not token:
+                return True
+            supplied = (self.headers.get("X-ACP-Key") or "").strip()
+            if supplied and hmac.compare_digest(supplied, token):
+                return True
+            self._send_json(
+                {"ok": False, "error": "acp_unauthorized", "message": "ACP 协议令牌校验失败"},
+                403,
+            )
+            return False
+
+        def _handle_acp_discover(self):
+            """POST /api/acp/discover：主动发现局域网节点（对齐 CX-O 端点语义）。
+
+            CX-A 采用「催促广播」形态（与 acp_node 双向加速发现同模式）：立即广播
+            一次本机 BEACON 催对端回应（对端信标周期到达后自动注册），随即返回当前
+            已发现的局域网节点。发现未启动时（enabled 但首次调用）自动拉起常驻发现。
+            """
+            if not self._acp_ready():
+                return
+            if self._acp._node_discovery is None:
+                self._acp.start_discovery(
+                    local_http_port=int(self._config.get("acp", "local_http_port", DEFAULT_PORT) or DEFAULT_PORT)
+                )
+            discovery = self._acp._node_discovery
+            if discovery is not None:
+                try:
+                    discovery.broadcast_presence(
+                        self._acp.agent_id,
+                        agent_name=self._acp.agent_name,
+                        capabilities=["chat", "memory", "tools"],
+                        port=self._acp._node_http_port or None,
+                        target_port=int(self._config.get("acp", "discovery_port", 9999) or 9999),
+                    )
+                except Exception as exc:  # noqa: BLE001 - 广播失败不阻断返回已知节点
+                    LOGGER.warning("ACP 主动发现广播失败：%s", exc)
+            else:
+                LOGGER.warning("ACP 常驻发现未就绪，仅返回当前已知节点")
+            agents = [n for n in self._acp.list_nodes(online_only=True) if n.get("id") != self._acp.agent_id]
+            self._send_json({
+                "status": "success",
+                "agents": agents,
+                "scanned_count": len(agents),
+                "message": "已广播本机存在，局域网节点将陆续出现在列表中",
+            })
+
+        def _handle_acp_agents_list(self, query):
+            """GET /api/acp/agents?online_only=：节点列表（本机置顶）。"""
+            if not self._acp_ready():
+                return
+            online_only = str(query.get("online_only") or "").lower() == "true"
+            agents = self._acp.list_nodes(online_only=online_only)
+            self._send_json({"status": "success", "agents": agents, "total": len(agents)})
+
+        def _handle_acp_agent_create(self):
+            """POST /api/acp/agents：手动添加节点（用户裁决：替代本机角色 CRUD）。
+
+            body {name?, host, port, agent_id?}——agent_id 缺省 manual_{host}_{port}
+            （人工添加必然已知 host:port，与发现节点的四元组语义一致）。
+            """
+            if not self._acp_ready():
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            host = str(body.get("host") or "").strip()
+            try:
+                port = int(body.get("port") or 0)
+            except (TypeError, ValueError):
+                port = 0
+            if not host or not (1 <= port <= 65535):
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "host 与 port（1~65535）为必填"},
+                    400,
+                )
+                return
+            agent_id = str(body.get("agent_id") or "").strip() or f"manual_{host}_{port}"
+            info, _changed = self._acp.register_node(
+                agent_id,
+                name=str(body.get("name") or f"{host}:{port}"),
+                host=host,
+                port=port,
+                source="manual",
+            )
+            self._send_json({"status": "success", "agent": info, "message": "节点已添加"})
+
+        def _handle_acp_agent_delete(self, agent_id):
+            """DELETE /api/acp/agents/{id}：移除节点（连带连接与消息槽）。"""
+            if not self._acp_ready():
+                return
+            if not self._acp.remove_node(agent_id):
+                self._send_json({"ok": False, "error": "agent_not_found", "message": "节点不存在"}, 404)
+                return
+            self._send_json({"status": "success", "message": "节点已移除"})
+
+        def _handle_acp_connect(self):
+            """POST /api/acp/connect：建立连接条目（通讯录语义，对齐 CX-O）。"""
+            if not self._acp_ready():
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            agent_id = str(body.get("agent_id") or "").strip()
+            node = self._acp.nodes.get(agent_id)
+            if node is None:
+                self._send_json({"ok": False, "error": "agent_not_found", "message": "节点不存在"}, 404)
+                return
+            conn = self._acp.upsert_connection(
+                agent_id,
+                host=str(body.get("host") or node.get("host") or ""),
+                port=int(body.get("port") or node.get("port") or 0),
+                remote_agent_name=str(node.get("name") or "Remote Agent"),
+            )
+            self._send_json({"status": "success", "connection": conn, "message": "连接请求已发送"})
+
+        def _handle_acp_disconnect(self, connection_id):
+            """DELETE /api/acp/connect/{id}：删除连接条目。"""
+            if not self._acp_ready():
+                return
+            if not self._acp.remove_connection(connection_id):
+                self._send_json({"ok": False, "error": "connection_not_found", "message": "连接不存在"}, 404)
+                return
+            self._send_json({"status": "success", "message": "连接已断开"})
+
+        def _handle_acp_connections(self):
+            """GET /api/acp/connections：连接条目列表。"""
+            if not self._acp_ready():
+                return
+            conns = self._acp.list_connections()
+            self._send_json({"status": "success", "connections": conns, "total": len(conns)})
+
+        def _handle_acp_send(self):
+            """POST /api/acp/send：向节点发送消息（对齐 CX-O 响应体）。"""
+            if not self._acp_ready():
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            to_agent_id = str(body.get("to_agent_id") or "").strip()
+            content = body.get("content")
+            text = ""
+            if isinstance(content, dict):
+                text = str(content.get("text") or "").strip()
+            elif isinstance(content, str):
+                text = content.strip()
+            if not to_agent_id or not text:
+                self._send_json(
+                    {"ok": False, "error": "bad_request",
+                     "message": "to_agent_id 与 content.text 为必填"},
+                    400,
+                )
+                return
+            msg = self._acp.send_message(to_agent_id, {"text": text},
+                                         msg_type=str(body.get("msg_type") or "chat"))
+            self._send_json({"status": "success", "message_id": msg["id"], "message": "消息已发送"})
+
+        def _handle_acp_receive(self):
+            """POST /api/acp/receive：外部节点标准投递入口（CX-O 主系统/独立节点同用）。
+
+            可选 X-ACP-Key 校验；收到后后台线程触发桌宠自动回复（CX-O 对齐语义：
+            「发消息触发对方自动回复」）。
+            """
+            if not self._acp_ready() or not self._check_acp_key():
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            msg = self._acp.receive_external_message(body)
+            if msg is None:
+                self._send_json({"ok": False, "error": "bad_request", "message": "消息结构非法"}, 400)
+                return
+            self._acp_auto_reply_async(msg)
+            self._send_json({"status": "success", "message": "消息已接收", "data": msg})
+
+        def _handle_acp_message_open(self):
+            """POST /acp/message：独立节点直投入口（无 /api 前缀，CX-O acp_node 契约）。"""
+            if not self._acp_ready() or not self._check_acp_key():
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            msg = self._acp.receive_external_message(body)
+            if msg is None:
+                self._send_json({"ok": False, "error": "bad_request", "message": "消息结构非法"}, 400)
+                return
+            self._acp_auto_reply_async(msg)
+            self._send_json({"status": "received"})
+
+        def _handle_acp_messages(self, query):
+            """GET /api/acp/messages?agent_id=&limit=：按节点查看消息历史。"""
+            if not self._acp_ready():
+                return
+            key = str(query.get("group_id") or query.get("agent_id") or "").strip()
+            if not key:
+                self._send_json(
+                    {"ok": False, "error": "bad_request", "message": "agent_id（或 group_id）为必填"},
+                    400,
+                )
+                return
+            try:
+                limit = int(query.get("limit") or 50)
+            except (TypeError, ValueError):
+                limit = 50
+            messages = self._acp.get_node_messages(key, limit=limit)
+            self._send_json({"status": "success", "messages": messages, "total": len(messages)})
+
+        def _handle_acp_stats(self):
+            """GET /api/acp/stats：互联层统计（statistics 字段对齐 CX-O）。"""
+            if not self._acp_ready():
+                return
+            self._send_json({"status": "success", "statistics": self._acp.node_stats()})
+
+        def _handle_acp_health(self):
+            """GET /acp/health：心跳探活判据（200 即存活，无 /api 前缀）。
+
+            GN-004 O1 修正：enabled=False（默认）时不回显 agent_id/name——探活
+            可达性成立（HTTP 200）但节点身份不暴露；开启后返回完整节点信息。
+            """
+            if self._acp is None or not self._acp._enabled:
+                self._send_json({"status": "ok", "mode": "disabled"})
+                return
+            self._send_json({
+                "status": "ok",
+                "mode": "enabled",
+                "agent_id": self._acp.agent_id,
+                "name": self._acp.agent_name,
+            })
+
+        def _handle_acp_info(self):
+            """GET /acp/info：本机节点信息（外部节点发现后的详情查询）。"""
+            if not self._acp_ready():
+                return
+            local = next(
+                (dict(n) for n in self._acp.list_nodes() if n.get("id") == self._acp.agent_id),
+                {},
+            )
+            self._send_json({"status": "success", "agent": local})
+
+        def _acp_auto_reply_async(self, incoming_msg):
+            """后台线程触发桌宠自动回复（对齐 CX-O「发消息触发对方自动回复」）。
+
+            复用主对话聊天管线（人设 + 历史 + 本地/云端路由，持 _chat_lock 串行）；
+            回复经 send_message 投回发送者；管线不可用/失败静默（消息已入槽）。
+            """
+            from_agent_id = str(incoming_msg.get("from_agent_id") or "")
+            content = incoming_msg.get("content")
+            text = ""
+            if isinstance(content, dict):
+                text = str(content.get("text") or "").strip()
+            elif isinstance(content, str):
+                text = content.strip()
+            if not from_agent_id or not text:
+                return
+
+            def _run():
+                try:
+                    prompt = f"[ACP 消息] 来自 {incoming_msg.get('from_agent_name') or from_agent_id}：{text}"
+                    with self._chat_lock:
+                        messages = self._build_chat_messages(prompt, "default")
+                        if self._chat_fallback is not None:
+                            reply = "".join(self._chat_fallback.chat(messages))
+                        else:
+                            reply = "".join(self._chat_cloud.chat(messages))
+                    reply = str(reply or "").strip()
+                    if not reply:
+                        return
+                    parsed = EmotionTagParser().parse(reply)
+                    self._acp.send_message(
+                        from_agent_id, {"text": parsed["clean_text"]},
+                        msg_type="chat", from_name=self._acp.agent_name,
+                    )
+                except Exception as exc:  # noqa: BLE001 - 自动回复失败静默
+                    LOGGER.warning("ACP 自动回复失败（%s）：%s", from_agent_id, exc)
+
+            threading.Thread(target=_run, name="acp-auto-reply", daemon=True).start()
+
+        # ---------------------------------------------- CXFC direct + 远端调用（批次 5）
+        # 对齐 CX-O /cxfc/* 端点语义（recon_cxfc.md §5）；数据网关（memory/physio）
+        # 与 ws 广播已裁剪（CX-O 域业务 / CX-A 用 relay 轮询替代）。
+
+        def _cxfc_direct_ready(self):
+            """CXFC direct 闸门：manager 缺失或未启用 → 503。"""
+            if self._cxfc_direct is not None and self._cxfc_direct.enabled:
+                return True
+            self._send_json(
+                {"ok": False, "error": "cxfc_disabled",
+                 "message": "CXFC 未启用（设置页开启后可用）"},
+                503,
+            )
+            return False
+
+        def _handle_cxfc_register(self):
+            """POST /api/cxfc/register：direct 插件注册（TOFU + 一次性访问令牌）。"""
+            if not self._cxfc_direct_ready():
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            try:
+                info, access_token = self._cxfc_direct.register_direct(
+                    body.get("host"), body.get("port"),
+                    name=str(body.get("name") or ""),
+                    tools=list(body.get("tools") or []),
+                    capabilities=list(body.get("capabilities") or []),
+                    token=str(body.get("token")) if body.get("token") else None,
+                    tls_cert_fingerprint=body.get("tls_cert_fingerprint"),
+                    tls_cert_pem=body.get("tls_cert_pem"),
+                )
+            except Exception as exc:  # noqa: BLE001 - 校验失败 400（TOFU/参数）
+                self._send_json({"ok": False, "error": "register_failed", "message": str(exc)}, 400)
+                return
+            payload = {"status": "ok", "plugin_id": info["plugin_id"]}
+            if access_token:
+                payload["plugin_access_token"] = access_token  # 明文仅此一次
+            self._send_json(payload)
+
+        def _handle_cxfc_heartbeat(self):
+            """POST /api/cxfc/heartbeat：插件心跳上行（plugin_id 空则按 port 反查）。"""
+            if not self._cxfc_direct_ready():
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            try:
+                port = int(body.get("port") or 0)
+            except (TypeError, ValueError):
+                port = 0
+            if not self._cxfc_direct.heartbeat(
+                plugin_id=str(body.get("plugin_id") or "") or None,
+                port=port or None,
+            ):
+                self._send_json({"ok": False, "error": "plugin_not_found", "message": "插件未注册"}, 404)
+                return
+            self._send_json({"status": "alive"})
+
+        def _handle_cxfc_discover(self, query):
+            """GET /api/cxfc/discover?scan=：本机插件 + 局域网 CXFC 节点（对齐 CX-O 双段）。"""
+            if not self._cxfc_direct_ready():
+                return
+            network_nodes = self._cxfc_direct.discovered_nodes()
+            if str(query.get("scan") or "").lower() == "true":
+                # scan=true：确保发现器在跑并立即广播一次（催促对端信标）
+                if self._cxfc_direct._discovery is None:
+                    self._cxfc_direct.start_discovery()
+                try:
+                    self._cxfc_direct._discovery.broadcast()
+                except Exception as exc:  # noqa: BLE001 - 广播失败返回已有列表
+                    LOGGER.warning("CXFC 主动发现广播失败：%s", exc)
+                network_nodes = self._cxfc_direct.discovered_nodes()
+            self._send_json({
+                "plugins": self._cxfc_direct.list_plugins(),
+                "network_plugins": network_nodes,
+            })
+
+        def _handle_cxfc_plugins_list(self):
+            """GET /api/cxfc/plugins：本机 direct 插件列表。"""
+            if not self._cxfc_direct_ready():
+                return
+            self._send_json({"plugins": self._cxfc_direct.list_plugins()})
+
+        def _handle_cxfc_connect(self):
+            """POST /api/cxfc/connect：主动连接插件（/health 探活拉清单）。"""
+            if not self._cxfc_direct_ready():
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            try:
+                info = self._cxfc_direct.connect_plugin(body.get("host"), body.get("port"))
+            except Exception as exc:  # noqa: BLE001 - 不可达 503（对齐 CX-O）
+                self._send_json({"ok": False, "error": "connect_failed", "message": str(exc)}, 503)
+                return
+            self._send_json({"status": "ok", "plugin": info})
+
+        def _handle_cxfc_plugin_disconnect(self, plugin_id):
+            """POST /api/cxfc/plugins/{id}/disconnect：保留记录置离线。"""
+            if not self._cxfc_direct_ready():
+                return
+            with self._cxfc_direct._lock:
+                info = self._cxfc_direct._plugins.get(plugin_id)
+                if info is not None:
+                    info["status"] = "disconnected"
+                    self._cxfc_direct._persist_locked()
+            self._send_json({"status": "ok"})
+
+        def _handle_cxfc_plugin_delete(self, plugin_id):
+            """DELETE /api/cxfc/plugins/{id}：删除注册记录（持久化同步移除）。"""
+            if not self._cxfc_direct_ready():
+                return
+            with self._cxfc_direct._lock:
+                existed = self._cxfc_direct._plugins.pop(plugin_id, None) is not None
+                self._cxfc_direct._tokens.pop(plugin_id, None)
+                if existed:
+                    self._cxfc_direct._persist_locked()
+            if not existed:
+                self._send_json({"ok": False, "error": "plugin_not_found", "message": "插件未注册"}, 404)
+                return
+            self._send_json({"status": "ok"})
+
+        def _handle_cxfc_remote_nodes(self):
+            """GET/POST /api/cxfc/remote/nodes：远端 CX-O 节点列表 / 手动添加。"""
+            if not self._cxfc_direct_ready():
+                return
+            if self.command == "GET":
+                self._send_json({"nodes": self._cxfc_remote.list_nodes()})
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            try:
+                node = self._cxfc_remote.add_node(
+                    body.get("host"), body.get("port"), name=str(body.get("name") or "")
+                )
+            except Exception as exc:  # noqa: BLE001 - 参数非法 400
+                self._send_json({"ok": False, "error": "bad_request", "message": str(exc)}, 400)
+                return
+            self._send_json({"status": "ok", "node": node})
+
+        def _handle_cxfc_remote_node_delete(self, node_id):
+            """DELETE /api/cxfc/remote/nodes/{id}：移除远端节点。"""
+            if not self._cxfc_direct_ready():
+                return
+            if not self._cxfc_remote.remove_node(node_id):
+                self._send_json({"ok": False, "error": "node_not_found", "message": "节点不存在"}, 404)
+                return
+            self._send_json({"status": "ok"})
+
+        def _handle_cxfc_remote_fetch(self, node_id):
+            """POST /api/cxfc/remote/nodes/{id}/fetch：拉取远端插件清单（缓存）。"""
+            if not self._cxfc_direct_ready():
+                return
+            try:
+                plugins, node = self._cxfc_remote.fetch_plugins(node_id)
+            except Exception as exc:  # noqa: BLE001 - 拉取失败 503（远端不可达）
+                self._send_json({"ok": False, "error": "fetch_failed", "message": str(exc)}, 503)
+                return
+            # 远端插件进桌宠工具表（20261017 批次 6 接线）：清单缓存刷新后同步
+            # registry（source=remote），聊天工具链 / GET /api-tools 可见可调用
+            self._refresh_remote_tool_registry()
+            self._send_json({"status": "ok", "plugins": plugins, "node": node})
+
+        def _refresh_remote_tool_registry(self):
+            """把各远端节点缓存清单里的插件工具登记进 BuiltinToolRegistry。
+
+            工具 id 形态 ``remote_{node}_{plugin}_{tool}``；handler 经
+            CxfcRemoteClient.call_plugin 跨机调用（X-API-Key 管理密钥链路）。
+            registry 未装配（make_handler 无 registry 场景）时静默跳过。
+            """
+            if self._cxfc_remote is None or self._registry is None:
+                return
+            specs = []
+            for node in self._cxfc_remote.list_nodes():
+                for plugin in node.get("plugins") or []:
+                    if not isinstance(plugin, dict):
+                        continue
+                    plugin_id = str(plugin.get("plugin_id") or "").strip()
+                    if not plugin_id:
+                        continue
+                    for tool in plugin.get("tools") or []:
+                        if isinstance(tool, str):
+                            tool_name, desc = tool, ""
+                        elif isinstance(tool, dict):
+                            tool_name = str(tool.get("name") or "").strip()
+                            desc = str(tool.get("description") or "")
+                        else:
+                            continue
+                        if not tool_name:
+                            continue
+                        specs.append({
+                            "node": node.get("id"),
+                            "plugin": plugin_id,
+                            "tool": tool_name,
+                            "description": desc,
+                        })
+            try:
+                count = self._registry.refresh_remote_tools(
+                    specs,
+                    lambda node_id, plugin_id, tool, arguments: self._cxfc_remote.call_plugin(
+                        node_id, plugin_id, tool, arguments=arguments,
+                    ),
+                )
+                if count:
+                    LOGGER.info("远端插件工具已登记进桌宠工具表：%s 个", count)
+            except Exception as exc:  # noqa: BLE001 - 登记失败不影响清单返回
+                LOGGER.warning("远端插件工具登记失败：%s", exc)
+
+        def _handle_cxfc_remote_call(self, node_id):
+            """POST /api/cxfc/remote/nodes/{id}/call：跨机调用远端插件（X-API-Key 透传）。"""
+            if not self._cxfc_direct_ready():
+                return
+            body = self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            tool = str(body.get("tool") or "").strip()
+            if not tool:
+                self._send_json({"ok": False, "error": "bad_request", "message": "tool 为必填"}, 400)
+                return
+            result = self._cxfc_remote.call_plugin(
+                node_id,
+                str(body.get("plugin_id") or ""),
+                tool,
+                arguments=body.get("arguments") or {},
+            )
+            self._send_json({"status": "ok", "result": result})
 
         def _handle_voice_synthesize_stream(self):
             """POST /api/voice/synthesize_stream：按标点切分后逐句合成，chunked NDJSON 流式下发。

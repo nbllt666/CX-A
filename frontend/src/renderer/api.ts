@@ -658,6 +658,210 @@ export async function fetchProactiveMessages(): Promise<ProactiveMessage[]> {
   }
 }
 
+// ------------------------------------------------------------------
+// ACP 节点互联（20261017 CX-O 全量迁移）：多智能体局域网互通
+// ------------------------------------------------------------------
+
+/** ACP 节点（对齐后端 AgentInfo wire 形态） */
+export interface AcpAgent {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  status: string;
+  version: string;
+  capabilities: string[];
+  last_seen: string;
+  metadata: Record<string, unknown>;
+}
+
+/** ACP 消息（对齐后端 ACPMessageInfo wire 形态；content 兼容 string/object） */
+export interface AcpNodeMessage {
+  id: string;
+  type: string;
+  from_agent_id: string;
+  from_agent_name: string;
+  to_agent_id: string | null;
+  to_group_id: string | null;
+  content: Record<string, unknown> | string;
+  timestamp: string;
+  is_read: boolean;
+  is_sent: boolean;
+  metadata: Record<string, unknown>;
+}
+
+/** ACP 互联统计（对齐后端 statistics） */
+export interface AcpNodeStats {
+  total_agents: number;
+  online_agents: number;
+  total_connections: number;
+  total_messages: number;
+  local_agent_id: string;
+  local_agent_name: string;
+}
+
+const ACP_API = `${API_BASE}/acp`;
+
+/** 主动发现局域网节点（广播催促 + 返回当前已发现列表） */
+export async function discoverAcpNodes(): Promise<AcpAgent[]> {
+  const data = await requestJson<{ status?: string; agents?: AcpAgent[] }>(
+    `${ACP_API}/discover`,
+    { method: 'POST' },
+    8000,
+  );
+  return Array.isArray(data?.agents) ? data.agents : [];
+}
+
+/** 节点列表（本机置顶；onlineOnly 过滤在线） */
+export async function listAcpAgents(onlineOnly = false): Promise<AcpAgent[]> {
+  const data = await requestJson<{ status?: string; agents?: AcpAgent[] }>(
+    `${ACP_API}/agents${onlineOnly ? '?online_only=true' : ''}`,
+    { method: 'GET' },
+    5000,
+  );
+  return Array.isArray(data?.agents) ? data.agents : [];
+}
+
+/** 手动添加节点（host+port；agent_id 由后端派生 manual_{host}_{port}） */
+export async function addAcpNode(payload: {
+  name?: string;
+  host: string;
+  port: number;
+}): Promise<AcpAgent> {
+  const data = await requestJson<{ status?: string; agent?: AcpAgent }>(
+    `${ACP_API}/agents`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) },
+    5000,
+  );
+  return data?.agent as AcpAgent;
+}
+
+/** 移除节点（连带连接与消息槽） */
+export async function removeAcpAgent(agentId: string): Promise<void> {
+  await requestJson(`${ACP_API}/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' }, 5000);
+}
+
+/** 建立连接条目（通讯录语义） */
+export async function connectAcpAgent(agentId: string): Promise<void> {
+  await requestJson(
+    `${ACP_API}/connect`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_id: agentId }),
+    },
+    5000,
+  );
+}
+
+/** 向节点发送消息（返回消息 id） */
+export async function sendAcpNodeMessage(toAgentId: string, text: string): Promise<string> {
+  const data = await requestJson<{ status?: string; message_id?: string }>(
+    `${ACP_API}/send`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to_agent_id: toAgentId, msg_type: 'chat', content: { text } }),
+    },
+    8000,
+  );
+  return String(data?.message_id ?? '');
+}
+
+/** 读取与某节点的消息历史（时间正序） */
+export async function fetchAcpNodeMessages(agentId: string, limit = 50): Promise<AcpNodeMessage[]> {
+  const data = await requestJson<{ status?: string; messages?: AcpNodeMessage[] }>(
+    `${ACP_API}/messages?agent_id=${encodeURIComponent(agentId)}&limit=${limit}`,
+    { method: 'GET' },
+    5000,
+  );
+  return Array.isArray(data?.messages) ? data.messages : [];
+}
+
+/** 互联统计 */
+export async function fetchAcpStats(): Promise<AcpNodeStats | null> {
+  try {
+    const data = await requestJson<{ status?: string; statistics?: AcpNodeStats }>(
+      `${ACP_API}/stats`,
+      { method: 'GET' },
+      5000,
+    );
+    return data?.statistics ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ------------------------------------------------------------------
+// CXFC 远端插件调用（20261017 CX-O 全量迁移批次 5）
+// ------------------------------------------------------------------
+
+/** 远端 CX-O 节点（含最近一次拉取的插件清单缓存） */
+export interface CxfcRemoteNode {
+  id: string;
+  host: string;
+  port: number;
+  name: string;
+  plugins: Array<Record<string, unknown>>;
+  plugins_fetched_at: string;
+}
+
+/** 远端节点列表 */
+export async function listCxfcRemoteNodes(): Promise<CxfcRemoteNode[]> {
+  const data = await requestJson<{ nodes?: CxfcRemoteNode[] }>(
+    `${API_BASE}/cxfc/remote/nodes`,
+    { method: 'GET' },
+    5000,
+  );
+  return Array.isArray(data?.nodes) ? data.nodes : [];
+}
+
+/** 手动添加远端 CX-O 节点 */
+export async function addCxfcRemoteNode(payload: {
+  host: string;
+  port: number;
+  name?: string;
+}): Promise<CxfcRemoteNode> {
+  const data = await requestJson<{ status?: string; node?: CxfcRemoteNode }>(
+    `${API_BASE}/cxfc/remote/nodes`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) },
+    5000,
+  );
+  return data?.node as CxfcRemoteNode;
+}
+
+/** 移除远端节点 */
+export async function removeCxfcRemoteNode(nodeId: string): Promise<void> {
+  await requestJson(
+    `${API_BASE}/cxfc/remote/nodes/${encodeURIComponent(nodeId)}`,
+    { method: 'DELETE' },
+    5000,
+  );
+}
+
+/** 拉取远端节点插件清单（缓存进节点条目） */
+export async function fetchCxfcRemotePlugins(nodeId: string): Promise<CxfcRemoteNode> {
+  const data = await requestJson<{ status?: string; node?: CxfcRemoteNode }>(
+    `${API_BASE}/cxfc/remote/nodes/${encodeURIComponent(nodeId)}/fetch`,
+    { method: 'POST' },
+    10000,
+  );
+  return data?.node as CxfcRemoteNode;
+}
+
+/** 跨机调用远端插件（X-API-Key 管理密钥由后端注入） */
+export async function callCxfcRemotePlugin(
+  nodeId: string,
+  payload: { plugin_id: string; tool: string; arguments?: Record<string, unknown> },
+): Promise<Record<string, unknown>> {
+  const data = await requestJson<{ status?: string; result?: Record<string, unknown> }>(
+    `${API_BASE}/cxfc/remote/nodes/${encodeURIComponent(nodeId)}/call`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) },
+    45000,
+  );
+  return (data?.result ?? {}) as Record<string, unknown>;
+}
+
 /** 话轮判定结果（对齐 CX-O agent_interrupt_user 三态；CX-A 场景 IGNORE=丢弃不回复）。 */
 export type VoiceTurnVerdict = 'CONTINUE' | 'SEND' | 'IGNORE';
 
@@ -1142,7 +1346,6 @@ export interface SettingsView {
    * gpu_preference = LLM 显卡偏好（"" 自动 / igpu 核显 / dgpu 独显；20261006，旧后端缺失时前端按自动处理）
    */
   local_llm: { enabled: boolean; ready?: boolean; model_path?: string; gpu_preference?: string };
-  acp: { enabled: boolean };
   remote: { enabled: boolean };
   /**
    * 主动视觉：enabled=采样开关（旧后端缺失时前端按关闭处理）；
@@ -1156,6 +1359,21 @@ export interface SettingsView {
     proactive_enabled?: boolean;
     image_window?: number;
     image_max_tokens?: number;
+  };
+  /**
+   * ACP 节点互联（20261017）：enabled 开关（热接线）+ 本机节点标识 +
+   * 开放协议令牌（脱敏回显；旧后端缺失时按关闭处理）
+   */
+  acp?: {
+    enabled: boolean;
+    agent_id?: string;
+    agent_name?: string;
+    auth_token?: string;
+  };
+  /** CXFC 插件协议（20261017）：enabled 开关 + 远端调用管理密钥（脱敏回显） */
+  cxfc?: {
+    enabled: boolean;
+    remote_admin_key?: string;
   };
   /** 聊天记忆注入开关（RAG 闭环，20261005；旧后端缺失时前端按开启处理） */
   memory?: { context_inject: boolean };

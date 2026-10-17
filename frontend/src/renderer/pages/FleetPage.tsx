@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   ListChecks,
+  Network,
   Plus,
   RefreshCw,
   Send,
@@ -18,6 +19,7 @@ import {
   sendFleetControl,
   type FleetInstance,
 } from '../api';
+import { useRouterOptional } from '../App';
 
 /**
  * 管理面（CX-A 管理 CX-O 实例群）——隐藏页面。
@@ -122,6 +124,7 @@ const INPUT =
   'h-9 w-full rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-2 text-sm outline-none transition focus:ring-2 focus:ring-[var(--color-accent)]';
 
 export default function FleetPage() {
+  const router = useRouterOptional();
   const [instances, setInstances] = useState<FleetInstance[]>([]);
   const [loadState, setLoadState] = useState<'loading' | 'ok' | 'error'>('loading');
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -285,6 +288,15 @@ export default function FleetPage() {
         <p className="text-sm text-[var(--text-secondary)]">
           CX-A 在这里打理 CX-O 实例群：登记、体检、下发指令。隐藏页面，日常使用不需要它。
         </p>
+        {/* 节点互联入口（20261017）：ACP 多智能体局域网互通 + CXFC 远端插件调用 */}
+        <button
+          type="button"
+          onClick={() => router?.navigate('nodes')}
+          className="mt-1 inline-flex w-fit items-center gap-2 rounded-full border border-[var(--stroke)] px-3 py-1.5 text-xs text-[var(--text-primary)] hover:border-[var(--pink-300)]"
+          aria-label="打开节点互联"
+        >
+          <Network size={14} aria-hidden /> 节点互联（局域网多智能体）
+        </button>
       </div>
 
       {/* 台账 */}

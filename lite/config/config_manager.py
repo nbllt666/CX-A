@@ -122,19 +122,41 @@ DEFAULTS = {
     "acp": {
         "enabled": False,
         "agent_id": "cxa-agent-001",
+        # 20261017 节点互联（CX-O 全量迁移批次 1）：本机节点名 + 心跳/投递参数
+        # （对齐 CX-O acp.connection.timeout=30 与 5s 投递超时；discovery 端口
+        # 9999 与 CX-O BEACON 协议互通，批次 2 接线）
+        "agent_name": "CX-A",
+        "heartbeat_timeout": 30,
+        "delivery_timeout_s": 5,
+        "discovery_interval": 30,
+        "discovery_port": 9999,
         "heartbeat_interval": 10,
+        # 开放协议令牌（对齐 CX-O acp.auth_token）：空=不校验；配置后外部投递
+        # （/api/acp/receive、/acp/message）须带同值 X-ACP-Key 头
+        "auth_token": "",
+        # BEACON 宣告的本机 HTTP 端口（对端据此投递 /acp/message 回联）
+        "local_http_port": 8600,
         "lan_discovery": False,
         "group_enabled": False,
         "cloud_relay": True,
         "cloud_relay_endpoint": "",
     },
-    #: 轻量版 CXFC（补充文档 §6.2 + Task H1 relay）：embedded-only 默认关；
-    #: relay_timeout_s = relay 调用回报等待窗口（秒）；replay_window_s = 防重放时间窗（秒）
+    #: 轻量版 CXFC（补充文档 §6.2 + Task H1 relay + 20261017 全量迁移批次 4）：
+    #: relay_timeout_s = relay 调用回报等待窗口（秒，对齐 CX-O 30s 需显式配置）；
+    #: replay_window_s = 防重放时间窗（秒）；remote_admin_key = 调远端 CX-O 插件
+    #: 的管理密钥（本地存储，调 /cxfc/plugins/{id}/call 时作 X-API-Key）；
+    #: heartbeat_* = direct 插件心跳巡检（对齐 CX-O 30s 超时 / 10s 巡检）；
+    #: local_name / local_http_port = 本机 CXFC 信标字段。
     "cxfc": {
         "enabled": False,
         "embedded_only": True,
         "relay_timeout_s": 10.0,
         "replay_window_s": 60.0,
+        "remote_admin_key": "",
+        "heartbeat_timeout_s": 30.0,
+        "heartbeat_check_interval_s": 10.0,
+        "local_name": "CX-A",
+        "local_http_port": 8600,
     },
     #: 内置工具系统（补充文档 §6.3）：电脑控制 / 记忆读写 / 系统信息
     "tools": {"computer_control": False, "memory_tools": True, "system_tools": True},

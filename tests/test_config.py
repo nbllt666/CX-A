@@ -98,10 +98,19 @@ def test_defaults_values():
     assert DEFAULTS["sync"] == {"enabled": False}
     assert DEFAULTS["remote"] == {"endpoint": "", "enabled": False}
     # 轻量版扩展段（批次E补齐：对照 config_manager.DEFAULTS acp/cxfc/tools）
+    # 20261017 节点互联：acp 段 + 本机节点/心跳/发现/协议令牌键；cxfc 段 + 远端
+    # 调用密钥 / 心跳巡检 / 本机信标键（与 test_lite_acp 契约断言同口径）
     assert DEFAULTS["acp"] == {
         "enabled": False,
         "agent_id": "cxa-agent-001",
+        "agent_name": "CX-A",
+        "heartbeat_timeout": 30,
+        "delivery_timeout_s": 5,
+        "discovery_interval": 30,
+        "discovery_port": 9999,
         "heartbeat_interval": 10,
+        "auth_token": "",
+        "local_http_port": 8600,
         "lan_discovery": False,
         "group_enabled": False,
         "cloud_relay": True,
@@ -113,6 +122,11 @@ def test_defaults_values():
         "embedded_only": True,
         "relay_timeout_s": 10.0,
         "replay_window_s": 60.0,
+        "remote_admin_key": "",
+        "heartbeat_timeout_s": 30.0,
+        "heartbeat_check_interval_s": 10.0,
+        "local_name": "CX-A",
+        "local_http_port": 8600,
     }
     assert DEFAULTS["tools"] == {
         "computer_control": False,

@@ -17,14 +17,50 @@
 
 路径规范：本项目一律基于 ``os.path.dirname(os.path.abspath(__file__))`` 推导，
 不使用相对路径。
+
+------------------------------------------------------------------------------
+节点互联层（20261017 CX-O 全量迁移批次 1，recon_acp.md §9）
+------------------------------------------------------------------------------
+以 CX-O ``ACPManager`` 语义为准新增的**节点互联**能力（CX-A 本机单角色，ACP
+用途 = 与局域网内 CX-O/CX-A 节点互发消息）：
+
+- **独立注册表** ``self.nodes`` / ``self.connections`` / ``self.node_messages``
+  （CX-O AgentInfo/ConnectionInfo/wire 消息形态，:mod:`lite.acp.wire` 冻结契约）
+  ——与上方 lite 旧注册表 ``self.agents``（信箱路由语义，既有测试基线）**并存
+  不混用**；旧方法零改动。
+- 持久化：``<app_root>/data/acp/nodes.json`` / ``connections.json``——
+  ``metadata.source`` 属 :data:`lite.acp.wire.LOCAL_AGENT_SOURCES` 的本机动态
+  节点不落盘（对齐 CX-O）；
+- 消息投递：外部节点 urllib POST（port==9999 视为 CX-O 主系统，改投其
+  ``/api/acp/receive``；其余 POST ``/acp/message``）；消息槽按对端分键
+  （500 条/键 FIFO，仅内存）；
+- 心跳清扫扩展：对 nodes 中 online 的外部节点，last_seen 超时先 GET
+  ``/health`` 探活（port==9999 的主系统节点不可知其 HTTP 端口，仅按信标
+  新鲜度判定）再决定刷新或置 offline。
 """
 
+import json
 import logging
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
+from datetime import datetime
 
+from lite.config.paths import app_root
+
+from .wire import (
+    LOCAL_AGENT_SOURCES,
+    MAX_MESSAGES_PER_KEY,
+    agent_info_from_beacon,
+    make_agent_info,
+    make_connection_info,
+    make_message,
+    message_from_wire,
+    now_iso,
+)
 from .cloud_relay import CloudRelay
 from .discovery import LiteLanDiscovery
 
@@ -42,6 +78,16 @@ MAX_MAILBOX = 256
 def _now():
     """当前单调时钟（可测试注入点）。"""
     return time.monotonic()
+
+
+def _elapsed_since(iso_ts, now_wall=None):
+    """ISO8601 时间戳距 now_wall（墙钟秒）的秒数；解析失败返回 None。"""
+    try:
+        past = datetime.fromisoformat(str(iso_ts))
+    except (ValueError, TypeError):
+        return None
+    now_wall = time.time() if now_wall is None else now_wall
+    return max(0.0, now_wall - past.timestamp())
 
 
 class AcpDisabled(RuntimeError):
@@ -66,19 +112,26 @@ class LiteACP:
     构造时从配置 ``acp`` 段读取开关与默认参数。
     """
 
-    def __init__(self, config=None, relay_transport=None):
+    def __init__(self, config=None, relay_transport=None, data_dir=None):
         """构造轻量 ACP。
 
         :param config: 配置源。可为 ``ConfigManager`` 实例（用其 ``get(section,key)``）
             或 ``{section: {key: value}}`` 映射；缺省内部创建现实 ConfigManager。
         :param relay_transport: 可选注入的云端中转 transport（含 ``send()`` /
             ``is_reachable()``），缺省在 ``relay_via_cloud`` 时按配置创建 :class:`CloudRelay`。
+        :param data_dir: 节点互联层持久化目录（nodes.json / connections.json 所在）；
+            缺省 ``<app_root>/data/acp``（frozen-aware）；测试注入 tmp_path 隔离。
         """
         #: 配置源（ConfigManager 或 dict，均可经 _get 读取）
         self._cfg = config
         self._enabled = bool(self._get("acp", "enabled", False))
         self.agent_id = self._get("acp", "agent_id", "cxa-agent-001")
+        self.agent_name = str(self._get("acp", "agent_name", "CX-A") or "CX-A")
         self.heartbeat_interval = float(self._get("acp", "heartbeat_interval", 10))
+        #: 外部节点离线判定阈值（秒；对齐 CX-O acp.connection.timeout=30）
+        self.heartbeat_timeout = float(self._get("acp", "heartbeat_timeout", 30))
+        #: 跨节点消息投递 / 健康探活超时（秒；对齐 CX-O 5s）
+        self.delivery_timeout = float(self._get("acp", "delivery_timeout_s", 5))
         self._lan_discovery_enabled = bool(self._get("acp", "lan_discovery", False))
         self._group_enabled = bool(self._get("acp", "group_enabled", False))
         self._cloud_relay_enabled = bool(self._get("acp", "cloud_relay", True))
@@ -99,6 +152,23 @@ class LiteACP:
         #: 后台心跳清扫线程（daemon，可选启动）
         self._heartbeat_thread = None
         self._stop_evt = threading.Event()
+
+        # ---------------- 节点互联层状态（20261017，与上方 lite 旧语义并存） ----------------
+        #: 节点注册表：{agent_id: AgentInfo dict}（wire 契约形态，见 lite.acp.wire）
+        self.nodes = {}
+        #: 连接表（通讯录条目）：{connection_id: ConnectionInfo dict}
+        self.connections = {}
+        #: 节点消息槽：{对端 agent_id: [wire 消息,...]}（仅内存，500 条/键 FIFO）
+        self.node_messages = {}
+        #: 互联层共享锁（心跳线程 / HTTP 线程 / 发现线程并发接入）
+        self._store_lock = threading.RLock()
+        #: 持久化目录（测试注入 tmp_path；缺省 <app_root>/data/acp）
+        self._data_dir = data_dir or os.path.join(app_root(), "data", "acp")
+        #: 常驻 UDP 发现（批次 2）：发现器实例 / 广播线程 / 停止哨兵 / 宣告端口
+        self._node_discovery = None
+        self._discovery_thread = None
+        self._discovery_stop = threading.Event()
+        self._node_http_port = 0
 
     # ------------------------------------------------------------------ #
     # 内部：配置读取 / 启用闸门                                           #
@@ -124,6 +194,18 @@ class LiteACP:
         """核心操作前置闸门：ACP 关闭时抛 :class:`AcpDisabled`。"""
         if not self._enabled:
             raise AcpDisabled("ACP 未启用（config.acp.enabled=False）")
+
+    def set_enabled(self, enabled):
+        """热切换总开关（PUT /api/settings acp.enabled 热接线专用）。
+
+        实例的 ``_enabled`` 是构造时快照；配置热更后须经本方法同步，否则
+        initialize 等闸门方法仍按旧值拒绝（20261017 批次 3 实测）。
+
+        :param enabled: True 开启 / False 关闭
+        :return: 切换后的开关值
+        """
+        self._enabled = bool(enabled)
+        return self._enabled
 
     # ------------------------------------------------------------------ #
     # 保留核心：注册 / 注销 / 心跳 / 状态                                  #
@@ -246,6 +328,11 @@ class LiteACP:
                 record["status"] = "offline"
                 LOGGER.info("ACP Agent %s 心跳超时，已置为 offline", agent_id)
                 self.handle("offline", {"agent_id": agent_id})
+        # 节点互联层清扫（20261017）：外部节点 last_seen 超时 → 探活或置 offline
+        try:
+            self._sweep_nodes()
+        except Exception as exc:  # noqa: BLE001 - 节点清扫失败不 kill 心跳线程
+            LOGGER.warning("ACP 节点清扫失败：%s", exc)
 
     # ------------------------------------------------------------------ #
     # 保留核心：消息路由                                                   #
@@ -450,3 +537,422 @@ class LiteACP:
         if not self._cloud_relay_enabled:
             raise AcpDisabled("ACP 云端中转已关闭（config.acp.cloud_relay=False）")
         return self._resolve_relay().send(payload)
+
+    # ------------------------------------------------------------------ #
+    # 节点互联层（20261017 CX-O 全量迁移批次 1）                            #
+    # ------------------------------------------------------------------ #
+
+    def initialize(self, agent_id=None, agent_name=None):
+        """注册本机节点（节点互联层入口，对齐 CX-O ``ACPManager.initialize``）。
+
+        本机节点 ``metadata.source="cxa_main"``（属 :data:`LOCAL_AGENT_SOURCES`，
+        不落盘）；同时加载持久化的外部节点与连接表。
+
+        :param agent_id: 覆盖本机节点标识（缺省用 config.acp.agent_id）
+        :param agent_name: 覆盖本机节点名称（缺省用 config.acp.agent_name）
+        :return: 本机 AgentInfo dict（副本）
+        :raises AcpDisabled: ACP 未启用
+        """
+        self._require_enabled()
+        if agent_id:
+            self.agent_id = str(agent_id)
+        if agent_name:
+            self.agent_name = str(agent_name)
+        self._load_persisted()
+        info = make_agent_info(
+            self.agent_id,
+            name=self.agent_name,
+            host="127.0.0.1",
+            port=0,
+            status="online",
+            capabilities=["chat", "memory", "tools"],
+            last_seen=now_iso(),
+            metadata={"source": "cxa_main", "description": "CX-A 桌宠本机节点"},
+        )
+        with self._store_lock:
+            self.nodes[self.agent_id] = info
+        return dict(info)
+
+    def register_node(self, agent_id, name="", host="", port=0, version="1.0.0",
+                      capabilities=None, metadata=None, source="manual"):
+        """注册/更新一个外部节点（发现即注册；手动添加 source="manual"）。
+
+        四元组去重（对齐 CX-O M-C 修复）：同 id 且 host/port/version 与已注册
+        完全一致 → 仅刷新 last_seen（status 恢复 online），不触发落盘；
+        任一变化 → 整体更新并持久化。
+
+        :return: (AgentInfo dict, changed: bool)
+        :raises AcpDisabled: ACP 未启用
+        """
+        self._require_enabled()
+        if not agent_id:
+            return None, False
+        meta = dict(metadata or {})
+        meta.setdefault("source", source)
+        with self._store_lock:
+            existing = self.nodes.get(agent_id)
+            if (
+                existing is not None
+                and existing.get("host") == str(host or "")
+                and int(existing.get("port") or 0) == int(port or 0)
+                and existing.get("version") == str(version or "1.0.0")
+            ):
+                existing["last_seen"] = now_iso()
+                existing["status"] = "online"
+                if name:
+                    existing["name"] = str(name)
+                return dict(existing), False
+            info = make_agent_info(
+                agent_id, name=name, host=host, port=port, status="online",
+                version=version, capabilities=capabilities, last_seen=now_iso(),
+                metadata=meta,
+            )
+            self.nodes[agent_id] = info
+            self._persist_nodes_locked()
+            return dict(info), True
+
+    def remove_node(self, agent_id):
+        """移除节点（连带其连接条目与消息槽；本机节点不可移除）。"""
+        self._require_enabled()
+        if not agent_id or agent_id == self.agent_id:
+            return False
+        with self._store_lock:
+            existed = self.nodes.pop(agent_id, None) is not None
+            if existed:
+                self.connections = {
+                    cid: c for cid, c in self.connections.items()
+                    if c.get("remote_agent_id") != agent_id
+                }
+                self.node_messages.pop(agent_id, None)
+                self._persist_nodes_locked()
+            return existed
+
+    def list_nodes(self, online_only=False):
+        """列出节点（本机置顶；online_only 过滤；返回副本列表）。"""
+        self._require_enabled()
+        with self._store_lock:
+            nodes = [dict(v) for v in self.nodes.values()]
+        nodes.sort(key=lambda n: 0 if n.get("id") == self.agent_id else 1)
+        if online_only:
+            nodes = [n for n in nodes if n.get("status") == "online"]
+        return nodes
+
+    def upsert_connection(self, remote_agent_id, host="", port=0,
+                          remote_agent_name="Remote Agent"):
+        """建立连接条目（CX-O 语义：通讯录记录，无握手；同远端复用更新）。"""
+        self._require_enabled()
+        with self._store_lock:
+            for conn in self.connections.values():
+                if conn.get("remote_agent_id") == remote_agent_id:
+                    conn["host"] = str(host or "")
+                    conn["port"] = int(port or 0)
+                    conn["status"] = "connecting"
+                    conn["last_activity"] = now_iso()
+                    self._persist_connections_locked()
+                    return dict(conn)
+            conn = make_connection_info(
+                self.agent_id, remote_agent_id, host=host, port=port,
+                remote_agent_name=remote_agent_name,
+            )
+            self.connections[conn["id"]] = conn
+            self._persist_connections_locked()
+            return dict(conn)
+
+    def remove_connection(self, connection_id):
+        """删除连接条目（对齐 CX-O DELETE /connect/{id}；幂等返回是否删除）。"""
+        self._require_enabled()
+        with self._store_lock:
+            existed = self.connections.pop(connection_id, None) is not None
+            if existed:
+                self._persist_connections_locked()
+            return existed
+
+    def list_connections(self):
+        """列出连接条目（副本列表）。"""
+        self._require_enabled()
+        with self._store_lock:
+            return [dict(c) for c in self.connections.values()]
+
+    def send_message(self, to_agent_id, content, msg_type="chat", from_name=None):
+        """向节点发送一条消息（存本地槽 + 外部投递；对齐 CX-O send_message）。
+
+        投递路径：目标 port>0 且 !=9999 → POST ``/acp/message``；port==9999
+        （CX-O 主系统，不可直接投递）→ POST ``/api/acp/receive``；目标未知或
+        port==0（本地形态）→ 仅存本地槽（静默，对齐 CX-O）。
+
+        :return: wire 消息 dict（含分配的 id/timestamp）
+        :raises AcpDisabled: ACP 未启用
+        """
+        self._require_enabled()
+        node = self.nodes.get(to_agent_id)
+        msg = make_message(
+            msg_type=msg_type,
+            from_agent_id=self.agent_id,
+            from_agent_name=from_name or self.agent_name,
+            to_agent_id=to_agent_id,
+            content=content,
+            is_sent=True,
+        )
+        self._append_slot(to_agent_id, msg)
+        if node is not None and int(node.get("port") or 0) > 0:
+            self._deliver(node, msg)
+        return msg
+
+    def receive_external_message(self, payload):
+        """接收外部投递（POST /api/acp/receive 与 /acp/message 共用入口）。
+
+        归一化（type/msg_type 双键兼容）→ 按发送者分键存槽 → 返回归一化 dict；
+        非法载荷返回 None（HTTP 层据此回 400）。
+
+        :raises AcpDisabled: ACP 未启用
+        """
+        self._require_enabled()
+        msg = message_from_wire(payload)
+        if msg is None:
+            return None
+        self._append_slot(str(msg.get("from_agent_id") or ""), msg)
+        return msg
+
+    def get_node_messages(self, key, limit=50):
+        """读取与某节点/群组的消息槽（最近 limit 条，时间正序）。"""
+        self._require_enabled()
+        with self._store_lock:
+            slot = list(self.node_messages.get(str(key or ""), []))
+        return slot[-max(1, int(limit or 50)):]
+
+    def node_stats(self):
+        """互联层统计（字段对齐 CX-O GET /api/acp/stats 的 statistics）。"""
+        self._require_enabled()
+        with self._store_lock:
+            nodes = list(self.nodes.values())
+            conns = list(self.connections.values())
+            total_messages = sum(len(v) for v in self.node_messages.values())
+        online = sum(1 for n in nodes if n.get("status") == "online")
+        return {
+            "total_agents": len(nodes),
+            "online_agents": online,
+            "total_connections": len(conns),
+            "active_connections": sum(1 for c in conns if c.get("status") == "connected"),
+            "total_groups": 0,  # 群组本轮裁剪（recon_acp.md §9.1）
+            "total_messages": total_messages,
+            "unread_messages": 0,
+            "local_agent_id": self.agent_id,
+            "local_agent_name": self.agent_name,
+            "local_http_port": int(self._get("acp", "local_http_port", 0) or 0),
+        }
+
+    # ---------------- 节点互联层内部：投递 / 槽 / 持久化 / 清扫 ---------------- #
+
+    def _append_slot(self, key, msg):
+        """按对端分键追加消息槽（500 条/键 FIFO 截断；对齐 CX-O M-E 语义）。"""
+        slot_key = str(key or "")
+        with self._store_lock:
+            slot = self.node_messages.setdefault(slot_key, [])
+            slot.append(msg)
+            if len(slot) > MAX_MESSAGES_PER_KEY:
+                del slot[: len(slot) - MAX_MESSAGES_PER_KEY]
+
+    def _deliver(self, node, msg):
+        """把 wire 消息投递到外部节点（尽力而为：失败仅告警，不重试不回滚）。
+
+        端口双轨（recon_acp.md §3.4）：port==9999 为 CX-O 主系统 → 投其
+        ``/api/acp/receive``（主系统标准入口）；其余 POST ``/acp/message``。
+        """
+        host = str(node.get("host") or "")
+        port = int(node.get("port") or 0)
+        if not host or port <= 0:
+            return
+        if port == 9999:
+            url = f"http://{host}:{port}/api/acp/receive"
+        else:
+            url = f"http://{host}:{port}/acp/message"
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(msg).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self.delivery_timeout) as resp:
+                if int(resp.status) >= 300:
+                    LOGGER.warning("ACP 消息投递非 2xx（%s → %s）：%s", node.get("id"), url, resp.status)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            LOGGER.warning("ACP 消息投递失败（%s → %s）：%s", node.get("id"), url, exc)
+
+    def _probe_health(self, node):
+        """GET http://{host}:{port}/health 探活（5s 超时；200 即存活）。"""
+        host = str(node.get("host") or "")
+        port = int(node.get("port") or 0)
+        if not host or port <= 0:
+            return False
+        try:
+            with urllib.request.urlopen(
+                f"http://{host}:{port}/health", timeout=self.delivery_timeout
+            ) as resp:
+                return int(resp.status) == 200
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+
+    def _sweep_nodes(self):
+        """节点清扫：last_seen 超时的 online 外部节点 → 探活刷新或置 offline。
+
+        port==9999 的主系统节点不可知其 HTTP 端口（双轨语义），/health 探活
+        必然失败——改按**信标新鲜度**判定：last_seen 超过 2×discovery 间隔
+        （默认 60s）仍未见新信标才置 offline（偏差已在规划文档注记）。
+        """
+        now_wall = time.time()
+        with self._store_lock:
+            snapshot = [(nid, dict(n)) for nid, n in self.nodes.items()]
+        for node_id, node in snapshot:
+            if node_id == self.agent_id:
+                continue
+            meta = node.get("metadata") or {}
+            if meta.get("source") in LOCAL_AGENT_SOURCES:
+                continue
+            if node.get("status") != "online":
+                continue
+            last_seen = str(node.get("last_seen") or "")
+            elapsed = _elapsed_since(last_seen, now_wall)
+            if elapsed is None or elapsed <= self.heartbeat_timeout:
+                continue
+            if int(node.get("port") or 0) == 9999:
+                if elapsed <= 2.0 * float(self._get("acp", "discovery_interval", 30)):
+                    continue  # 主系统节点：信标新鲜度内视为在线
+                probe_ok = False
+            else:
+                probe_ok = self._probe_health(node)
+            with self._store_lock:
+                current = self.nodes.get(node_id)
+                if current is None or current.get("status") != "online":
+                    continue  # 已被并发修改（新信标刷新），不覆盖
+                if probe_ok:
+                    current["last_seen"] = now_iso()
+                else:
+                    current["status"] = "offline"
+                    LOGGER.info("ACP 节点 %s 探活失败，已置为 offline", node_id)
+
+    def _persist_nodes_locked(self):
+        """落盘节点注册表（须持 _store_lock；本机动态来源不落盘）。"""
+        self._write_json(
+            "nodes.json",
+            {
+                nid: n for nid, n in self.nodes.items()
+                if (n.get("metadata") or {}).get("source") not in LOCAL_AGENT_SOURCES
+            },
+        )
+
+    def _persist_connections_locked(self):
+        """落盘连接表（须持 _store_lock）。"""
+        self._write_json("connections.json", self.connections)
+
+    def _write_json(self, filename, obj):
+        """原子写 JSON（tmp + os.replace；失败仅告警不抛——持久化尽力而为）。"""
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            target = os.path.join(self._data_dir, filename)
+            tmp = target + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(obj, fh, ensure_ascii=False)
+            os.replace(tmp, target)
+        except OSError as exc:
+            LOGGER.warning("ACP 持久化写盘失败（%s）：%s", filename, exc)
+
+    def _load_persisted(self):
+        """启动加载持久化的外部节点与连接表（本机节点由 initialize 重新注册）。"""
+        for filename, attr in (("nodes.json", "nodes"), ("connections.json", "connections")):
+            target = os.path.join(self._data_dir, filename)
+            try:
+                with open(target, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict):
+                getattr(self, attr).update(data)
+
+    # ---------------- 节点互联层：UDP 发现常驻循环（批次 2） ---------------- #
+
+    def start_discovery(self, local_http_port=0, discovery_factory=None):
+        """启动常驻 UDP 发现（幂等；对齐 CX-O ``ACPManager.start`` 发现分支）。
+
+        - 监听 ``config.acp.discovery_port``（默认 9999，CX-O BEACON 协议互通）；
+        - 每 ``discovery_interval`` 秒广播一次本机 BEACON（六字段齐全，宣告
+          ``local_http_port``——对端据此 POST /acp/message 回联；广播目标固定
+          discovery_port）；
+        - 收到的新节点信标经回调 ``register_node(source="lan")`` 注册（发现即
+          注册，四元组去重）；
+        - ``enabled`` 闸门：关闭时抛 :class:`AcpDisabled`（未开启绝不建 socket）。
+
+        :param local_http_port: 本机 HTTP 服务端口（BEACON port 字段；0=未宣告）
+        :param discovery_factory: 测试注入（fake 发现器工厂）
+        :return: True 已启动 / 已在运行
+        :raises AcpDisabled: ACP 未启用
+        """
+        self._require_enabled()
+        if self._node_discovery is not None and self._discovery_thread is not None \
+                and self._discovery_thread.is_alive():
+            return True
+        discovery = (discovery_factory or LiteLanDiscovery)(
+            on_beacon=self._on_node_beacon,
+        )
+        discovery.start(port=int(self._get("acp", "discovery_port", 9999) or 9999))
+        self._node_discovery = discovery
+        self._node_http_port = int(local_http_port or 0)
+        self._discovery_stop.clear()
+        thread = threading.Thread(
+            target=self._discovery_loop, name="cxa-acp-discovery", daemon=True
+        )
+        self._discovery_thread = thread
+        thread.start()
+        LOGGER.info(
+            "ACP 节点发现已启动（bind=%s announce_port=%s interval=%ss）",
+            self._get("acp", "discovery_port", 9999), self._node_http_port,
+            self._get("acp", "discovery_interval", 30),
+        )
+        return True
+
+    def stop_discovery(self):
+        """停止常驻发现（幂等：停广播线程 + 关 socket）。"""
+        self._discovery_stop.set()
+        thread = self._discovery_thread
+        self._discovery_thread = None
+        discovery = self._node_discovery
+        self._node_discovery = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3.0)
+        if discovery is not None:
+            discovery.stop()
+
+    def _discovery_loop(self):
+        """常驻循环：每 discovery_interval 秒广播一次本机存在 + 清理过期记录。"""
+        interval = max(5.0, float(self._get("acp", "discovery_interval", 30) or 30))
+        while not self._discovery_stop.wait(interval):
+            discovery = self._node_discovery
+            if discovery is None:
+                break
+            try:
+                discovery.broadcast_presence(
+                    self.agent_id,
+                    agent_name=self.agent_name,
+                    capabilities=["chat", "memory", "tools"],
+                    port=self._node_http_port or None,
+                    target_port=int(self._get("acp", "discovery_port", 9999) or 9999),
+                    timestamp=now_iso(),
+                )
+                discovery.prune_expired(max_age_seconds=2 * interval)
+            except Exception as exc:  # noqa: BLE001 - 广播失败不 kill 线程
+                LOGGER.warning("ACP 信标广播失败（下一周期重试）：%s", exc)
+
+    def _on_node_beacon(self, agent):
+        """发现回调：新节点信标 → 注册进 nodes（发现即注册，四元组去重在册）。"""
+        agent_id = str(agent.get("agent_id") or "")
+        if not agent_id or agent_id == self.agent_id:
+            return
+        self.register_node(
+            agent_id,
+            name=str(agent.get("agent_name") or ""),
+            host=str(agent.get("host") or ""),
+            port=int(agent.get("port") or 0),
+            version=str(agent.get("version") or "1.0.0"),
+            capabilities=list(agent.get("capabilities") or []),
+            source="lan",
+        )

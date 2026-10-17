@@ -514,22 +514,36 @@ def test_discovery_recv_loop_delivers_packets_to_found_agents():
 # ------------------------------------------------------------------ #
 
 def test_new_config_sections_defaults():
-    """DEFAULTS 新增 acp/cxfc/tools 三段的默认值严格符合补充文档 §6。"""
+    """DEFAULTS 新增 acp/cxfc/tools 三段的默认值严格符合补充文档 §6（+20261017 节点互联键）。"""
     assert DEFAULTS["acp"] == {
         "enabled": False,
         "agent_id": "cxa-agent-001",
+        # 20261017 节点互联（CX-O 全量迁移批次 1/3）
+        "agent_name": "CX-A",
+        "heartbeat_timeout": 30,
+        "delivery_timeout_s": 5,
+        "discovery_interval": 30,
+        "discovery_port": 9999,
         "heartbeat_interval": 10,
+        "auth_token": "",
+        "local_http_port": 8600,
         "lan_discovery": False,
         "group_enabled": False,
         "cloud_relay": True,
         "cloud_relay_endpoint": "",
     }
     # Task H1：cxfc 段新增 relay 窗口默认值（relay_timeout_s / replay_window_s，秒）
+    # 20261017 全量迁移批次 4：+ 远端调用密钥 / 心跳巡检 / 本机信标字段
     assert DEFAULTS["cxfc"] == {
         "enabled": False,
         "embedded_only": True,
         "relay_timeout_s": 10.0,
         "replay_window_s": 60.0,
+        "remote_admin_key": "",
+        "heartbeat_timeout_s": 30.0,
+        "heartbeat_check_interval_s": 10.0,
+        "local_name": "CX-A",
+        "local_http_port": 8600,
     }
     assert DEFAULTS["tools"] == {
         "computer_control": False,
@@ -677,3 +691,332 @@ def test_discovery_last_seen_refresh_and_prune_expired():
     assert d.found_agents == []
     d.parse_packet(_beacon("n1"), ("10.0.0.1", 7000))
     assert len(d.found_agents) == 1
+
+
+# ------------------------------------------------------------------ #
+# 9. 节点互联层（20261017 CX-O 全量迁移批次 1）                         #
+# ------------------------------------------------------------------ #
+
+
+@pytest.fixture
+def node_acp(tmp_path):
+    """节点互联层被测实例：临时持久化目录 + enabled=True。"""
+    acp = LiteACP(config=_config(), data_dir=str(tmp_path / "acp"))
+    acp.initialize()  # 本机节点注册（cxa-agent-001 / CX-A）
+    return acp
+
+
+def test_initialize_registers_local_node_not_persisted(node_acp, tmp_path):
+    """initialize：本机节点 source=cxa_main 置顶在线，且不落盘。"""
+    nodes = node_acp.list_nodes()
+    assert nodes[0]["id"] == "cxa-agent-001"  # 本机置顶
+    assert nodes[0]["metadata"]["source"] == "cxa_main"
+    assert nodes[0]["status"] == "online"
+    # 未注册外部节点 → nodes.json 不应存在（本机节点不落盘）
+    assert not (tmp_path / "acp" / "nodes.json").exists()
+
+
+def test_register_node_dedup_and_persist_roundtrip(node_acp, tmp_path):
+    """register_node：新节点落盘；同四元组重复注册仅刷新（changed=False）；
+    新实例加载持久化恢复外部节点。"""
+    info1, changed1 = node_acp.register_node(
+        "cxo-1", name="CX-O Agent", host="192.168.1.8", port=8001, source="lan"
+    )
+    assert changed1 is True
+    assert info1["status"] == "online"
+    assert (tmp_path / "acp" / "nodes.json").exists()
+
+    info2, changed2 = node_acp.register_node(
+        "cxo-1", name="CX-O Agent", host="192.168.1.8", port=8001, source="lan"
+    )
+    assert changed2 is False
+    assert len(node_acp.list_nodes()) == 2  # 本机 + cxo-1
+
+    # 四元组变化（端口变）→ 整体更新并再落盘
+    info3, changed3 = node_acp.register_node(
+        "cxo-1", name="CX-O Agent", host="192.168.1.8", port=8002, source="lan"
+    )
+    assert changed3 is True
+    assert info3["port"] == 8002
+
+    # 新实例：持久化恢复（本机节点由 initialize 重建，外部节点从盘来）
+    reloaded = LiteACP(config=_config(), data_dir=str(tmp_path / "acp"))
+    reloaded.initialize()
+    ids = {n["id"] for n in reloaded.list_nodes()}
+    assert ids == {"cxa-agent-001", "cxo-1"}
+    cxo = next(n for n in reloaded.list_nodes() if n["id"] == "cxo-1")
+    assert cxo["port"] == 8002
+
+
+def test_remove_node_cascades_connections_and_slot(node_acp):
+    """remove_node：连带删除其连接条目与消息槽；本机节点不可移除。"""
+    node_acp.register_node("n1", host="10.0.0.1", port=8600)
+    node_acp.upsert_connection("n1", host="10.0.0.1", port=8600)
+    node_acp.receive_external_message(
+        {"type": "chat", "from_agent_id": "n1", "content": {"text": "hi"}}
+    )
+    assert node_acp.remove_node("n1") is True
+    assert node_acp.remove_node("n1") is False  # 幂等
+    assert node_acp.list_connections() == []
+    assert node_acp.get_node_messages("n1") == []
+    assert node_acp.remove_node("cxa-agent-001") is False  # 本机不可移除
+
+
+def test_send_message_stores_slot_and_delivers(node_acp, monkeypatch):
+    """send_message：wire 消息入槽（is_sent=True）+ 外部节点投递（port 双轨）。"""
+    delivered = []
+
+    def fake_deliver(node, msg):
+        delivered.append((dict(node), dict(msg)))
+
+    monkeypatch.setattr(node_acp, "_deliver", fake_deliver)
+    node_acp.register_node("n1", host="10.0.0.1", port=8600)
+    msg = node_acp.send_message("n1", {"text": "你好呀"})
+
+    assert msg["type"] == "chat"
+    assert msg["from_agent_id"] == "cxa-agent-001"
+    assert msg["from_agent_name"] == "CX-A"
+    assert msg["to_agent_id"] == "n1"
+    assert msg["is_sent"] is True
+    assert len(delivered) == 1
+    assert delivered[0][0]["id"] == "n1"
+
+    slot = node_acp.get_node_messages("n1")
+    assert len(slot) == 1 and slot[0]["id"] == msg["id"]
+
+    # 未知节点：仅存本地槽，静默不投递（对齐 CX-O）
+    msg2 = node_acp.send_message("ghost", {"text": "x"})
+    assert len(delivered) == 1
+    assert node_acp.get_node_messages("ghost")[0]["id"] == msg2["id"]
+
+
+def test_deliver_routes_by_port_dual_track(node_acp, monkeypatch):
+    """_deliver 端口双轨：9999 → /api/acp/receive；其余 → /acp/message。"""
+    calls = []
+
+    class FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        calls.append((req.full_url, json.loads(req.data.decode("utf-8"))))
+        return FakeResp()
+
+    monkeypatch.setattr(lite_acp.urllib.request, "urlopen", fake_urlopen)
+
+    node_main = {"id": "main", "host": "192.168.1.8", "port": 9999}
+    node_node = {"id": "node", "host": "192.168.1.9", "port": 8600}
+    node_acp._deliver(node_main, {"id": "m1"})
+    node_acp._deliver(node_node, {"id": "m2"})
+
+    assert calls[0][0] == "http://192.168.1.8:9999/api/acp/receive"
+    assert calls[1][0] == "http://192.168.1.9:8600/acp/message"
+
+
+def test_receive_external_message_normalizes_and_slots(node_acp):
+    """receive：双键兼容归一化入槽（按发送者分键）；非法载荷 None。"""
+    got = node_acp.receive_external_message(
+        {"msg_type": "chat", "from_agent_id": "cxo-9",
+         "from_agent_name": "CX-O", "content": {"text": "在吗"}}
+    )
+    assert got["type"] == "chat"  # 归一化为 wire 键
+    assert got["is_sent"] is False
+    slot = node_acp.get_node_messages("cxo-9")
+    assert slot[-1]["id"] == got["id"]
+    assert node_acp.receive_external_message("bad") is None
+
+
+def test_node_messages_cap_500(node_acp):
+    """消息槽单键 500 条 FIFO 截断（对齐 CX-O M-E）。"""
+    for i in range(510):
+        node_acp.receive_external_message(
+            {"type": "chat", "from_agent_id": "spam", "content": {"text": str(i)}}
+        )
+    slot = node_acp.get_node_messages("spam", limit=1000)
+    assert len(slot) == 500
+    assert slot[0]["content"] == {"text": "10"}  # 最旧 10 条被截断
+
+
+def test_connection_upsert_remove(node_acp):
+    """连接条目：同远端复用更新；删除幂等。"""
+    c1 = node_acp.upsert_connection("n1", host="10.0.0.1", port=8600)
+    c2 = node_acp.upsert_connection("n1", host="10.0.0.2", port=8601)
+    assert c1["id"] == c2["id"]  # 同远端复用
+    assert c2["host"] == "10.0.0.2" and c2["port"] == 8601
+    assert len(node_acp.list_connections()) == 1
+    assert node_acp.remove_connection(c1["id"]) is True
+    assert node_acp.remove_connection(c1["id"]) is False
+
+
+def test_node_stats_shape(node_acp):
+    """统计字段对齐 CX-O GET /api/acp/stats 的 statistics。"""
+    node_acp.register_node("n1", host="10.0.0.1", port=8600)
+    node_acp.upsert_connection("n1")
+    node_acp.receive_external_message(
+        {"type": "chat", "from_agent_id": "n1", "content": {"text": "hi"}}
+    )
+    stats = node_acp.node_stats()
+    assert stats["total_agents"] == 2
+    assert stats["online_agents"] == 2
+    assert stats["total_connections"] == 1
+    assert stats["total_groups"] == 0
+    assert stats["total_messages"] == 1
+    assert stats["local_agent_id"] == "cxa-agent-001"
+    assert stats["local_agent_name"] == "CX-A"
+
+
+def test_node_sweep_health_probe_and_offline(node_acp, monkeypatch):
+    """清扫：普通节点超时先 /health 探活——200 刷新 last_seen，失败置 offline。"""
+    node_acp.register_node("n-live", host="10.0.0.1", port=8600)
+    node_acp.register_node("n-dead", host="10.0.0.2", port=8600)
+    stale_iso = "2026-01-01T00:00:00"
+    node_acp.nodes["n-live"]["last_seen"] = stale_iso
+    node_acp.nodes["n-dead"]["last_seen"] = stale_iso
+
+    probed = []
+
+    def fake_probe(node):
+        probed.append(node["id"])
+        return node["id"] == "n-live"
+
+    monkeypatch.setattr(node_acp, "_probe_health", fake_probe)
+    node_acp._sweep_nodes()
+
+    assert sorted(probed) == ["n-dead", "n-live"]
+    assert node_acp.nodes["n-live"]["status"] == "online"
+    assert node_acp.nodes["n-live"]["last_seen"] != stale_iso  # 探活刷新
+    assert node_acp.nodes["n-dead"]["status"] == "offline"
+
+    # 本机节点与 offline 节点不进探活
+    node_acp.nodes["n-dead"]["last_seen"] = stale_iso
+    probed.clear()
+    node_acp._sweep_nodes()
+    assert probed == []  # n-dead 已 offline 不再探；本机跳过
+
+
+def test_node_sweep_main_system_by_beacon_freshness(node_acp, monkeypatch):
+    """port==9999 主系统节点：不探活，按信标新鲜度判定（2×discovery_interval）。"""
+    node_acp.register_node("main", host="192.168.1.8", port=9999, source="lan")
+    stale = "2026-01-01T00:00:00"
+    node_acp.nodes["main"]["last_seen"] = stale
+
+    probed = []
+    monkeypatch.setattr(node_acp, "_probe_health", lambda n: probed.append(n["id"]) or True)
+    node_acp._sweep_nodes()
+    assert probed == []  # 主系统节点不进 /health 探活
+    assert node_acp.nodes["main"]["status"] == "offline"  # 信标严重过期 → offline
+
+    # 信标新鲜（<2×discovery_interval）→ 保持在线
+    from lite.acp.wire import now_iso
+
+    node_acp.nodes["main"]["status"] = "online"
+    node_acp.nodes["main"]["last_seen"] = now_iso()
+    node_acp._sweep_nodes()
+    assert node_acp.nodes["main"]["status"] == "online"
+
+
+# ------------------------------------------------------------------ #
+# 10. 节点发现常驻循环（20261017 批次 2）                               #
+# ------------------------------------------------------------------ #
+
+
+class _FakeNodeDiscovery:
+    """fake 发现器：记录 start/broadcast 参数，可手动注入信标。"""
+
+    def __init__(self, on_beacon=None):
+        self.on_beacon = on_beacon
+        self.started_port = None
+        self.stopped = False
+        self.broadcasts = []
+
+    def start(self, port=9999):
+        self.started_port = port
+
+    def stop(self):
+        self.stopped = True
+
+    def broadcast_presence(self, agent_id, agent_name="", capabilities=None,
+                           port=None, target_port=None, timestamp=None):
+        self.broadcasts.append({
+            "agent_id": agent_id, "agent_name": agent_name,
+            "capabilities": list(capabilities or []), "port": port,
+            "target_port": target_port, "timestamp": timestamp,
+        })
+
+    def prune_expired(self, max_age_seconds=300):
+        return 0
+
+    def feed_beacon(self, agent):
+        """模拟收到对端信标（触发回调链）。"""
+        if self.on_beacon is not None:
+            self.on_beacon(agent)
+
+
+def test_start_discovery_lifecycle_and_broadcast(tmp_path):
+    """start_discovery：监听 9999 + 幂等 + 停止回收；广播体验证经 fake 直接驱动。"""
+    acp = LiteACP(config=_config(discovery_interval=5), data_dir=str(tmp_path / "acp"))
+    acp.initialize()
+    fake = _FakeNodeDiscovery()
+    assert acp.start_discovery(local_http_port=8600, discovery_factory=lambda **kw: fake) is True
+    assert acp.start_discovery(local_http_port=8600, discovery_factory=lambda **kw: fake) is True  # 幂等
+    assert fake.started_port == 9999
+    assert acp._node_http_port == 8600
+
+    # 广播字段体验证（循环体同一调用形态——直接以同参驱动 fake 断言字段）
+    fake.broadcast_presence(
+        acp.agent_id, agent_name=acp.agent_name,
+        capabilities=["chat", "memory", "tools"], port=acp._node_http_port,
+        target_port=9999, timestamp="2026-10-17T00:00:00",
+    )
+    b = fake.broadcasts[0]
+    assert b["agent_id"] == "cxa-agent-001"
+    assert b["agent_name"] == "CX-A"
+    assert b["port"] == 8600  # 宣告本机 HTTP 端口
+    assert b["target_port"] == 9999  # 发往 CX-O 监听端口
+    assert b["capabilities"] == ["chat", "memory", "tools"]
+    assert b["timestamp"]
+
+    acp.stop_discovery()
+    assert fake.stopped
+    assert acp._node_discovery is None
+
+
+def test_discovery_beacon_registers_node(node_acp):
+    """信标回调 → register_node(source=lan)：发现即注册；自身信标忽略。"""
+    fake_holder = {}
+
+    def factory(**kwargs):
+        disc = _FakeNodeDiscovery(**kwargs)
+        fake_holder["disc"] = disc
+        return disc
+
+    node_acp.start_discovery(local_http_port=8600, discovery_factory=factory)
+    disc = fake_holder["disc"]
+
+    disc.feed_beacon({
+        "agent_id": "cxo-lan", "agent_name": "CX-O", "host": "192.168.1.8",
+        "port": 9999, "version": "1.0.0", "capabilities": ["chat"],
+        "last_seen": 1.0,
+    })
+    disc.feed_beacon({
+        "agent_id": "cxa-agent-001", "host": "127.0.0.1", "port": 8600,  # 自身
+    })
+    nodes = {n["id"]: n for n in node_acp.list_nodes()}
+    assert "cxo-lan" in nodes
+    assert nodes["cxo-lan"]["metadata"]["source"] == "lan"
+    assert nodes["cxo-lan"]["host"] == "192.168.1.8"
+    assert nodes["cxo-lan"]["port"] == 9999
+    assert "cxa-agent-001" not in nodes or nodes["cxa-agent-001"]["metadata"]["source"] == "cxa_main"
+    node_acp.stop_discovery()
+
+
+def test_discovery_disabled_gate():
+    """enabled=False：start_discovery 抛 AcpDisabled（未开启绝不建 socket）。"""
+    acp = LiteACP(config=_config(enabled=False))
+    with pytest.raises(AcpDisabled):
+        acp.start_discovery(local_http_port=8600)

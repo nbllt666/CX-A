@@ -541,7 +541,11 @@ def test_agents_update_malformed_json_returns_bad_json(api_server):
 
 
 def test_settings_readonly_known_keys_echo_in_ignored(api_server):
-    """L2：GET 可见但白名单只读键（acp/remote section、cloud.base_url）进 ignored 回显。"""
+    """L2：GET 可见但白名单只读键（remote/vector section、cloud.base_url）进 ignored 回显。
+
+    20261017：acp 移出只读清单（节点互联开关联动热接线，可写）——改用 remote/vector
+    断言只读回显；acp.enabled 现在正常生效（applied 含 acp.enabled）。
+    """
     _store, _pipeline, base = api_server
     status, body = http_post(
         f"{base}/api/settings",
@@ -555,9 +559,8 @@ def test_settings_readonly_known_keys_echo_in_ignored(api_server):
     )
     assert status == 200
     assert body["ok"] is True
-    assert body["applied"] == ["cloud.provider"]
+    assert body["applied"] == ["cloud.provider", "acp.enabled"]
     ignored_text = "\n".join(body["ignored"])
-    assert "acp" in ignored_text
     assert "remote" in ignored_text
     assert "vector" in ignored_text
     assert "cloud.base_url" in ignored_text

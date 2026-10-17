@@ -57,15 +57,21 @@ class LiteLanDiscovery:
     （``[(agent_dict, (host, port)), ...]``），由 ``parse_packet`` 命中时追加。
     """
 
-    def __init__(self, broadcast_address="255.255.255.255", socket_factory=None):
+    def __init__(self, broadcast_address="255.255.255.255", socket_factory=None,
+                 on_beacon=None):
         """构造发现器。
 
         :param broadcast_address: UDP 广播地址，默认广播域全地址
         :param socket_factory: 可注入的 socket 工厂；测试传入 fake 工厂以隔离网络，
             缺省使用真实 ``socket.socket``
+        :param on_beacon: 可选信标回调（20261017 节点互联）：新登记合法信标时以
+            归一化 agent dict 调用（重复信标去重命中不回调，刷新保鲜照旧）——
+            常驻发现循环经此把发现的节点注册进管理器
         """
         self.broadcast_address = broadcast_address
         self._socket_factory = socket_factory or socket.socket
+        #: 信标回调（新登记时调用；None = 不回调，仅累积 found_agents）
+        self.on_beacon = on_beacon
         #: 发现到的 agent 事件列表（[(agent_dict, addr), ...]）
         self.found_agents = []
         #: 已见 (agent_id, addr) 集合（N9：重复信标不再重复登记）
@@ -171,13 +177,18 @@ class LiteLanDiscovery:
             except Exception:  # noqa: BLE001 - 单包解析失败不影响整体接收
                 continue
 
-    def broadcast_presence(self, agent_id, agent_name="", capabilities=None, port=None):
+    def broadcast_presence(self, agent_id, agent_name="", capabilities=None, port=None,
+                           target_port=None, timestamp=None):
         """向局域网广播一条 ACP_BEACON 报文，宣告本机 Agent 存在。
 
         :param agent_id: 本机节点标识（config.acp.agent_id）
         :param agent_name: 节点名称
         :param capabilities: 能力列表（如 [\"chat\", \"memory\"]）
-        :param port: 信标中宣告的端口；缺省用 start 时的 port
+        :param port: 信标中宣告的端口（本机 HTTP 消息端口，对端据此投递 /acp/message）；
+            缺省用 start 时的 port
+        :param target_port: 广播目标端口（对端监听端口，对齐 CX-O 发往 discovery_port=9999）；
+            缺省 = 宣告端口（旧语义：announce_port 与发送目标一致）
+        :param timestamp: 信标时间戳（ISO 字符串）；缺省 None（轻量版不强制）
         """
         if self._socket is None:
             raise AcpDiscoveryError("局域网发现未启动，无法广播（先调用 start()）")
@@ -186,16 +197,18 @@ class LiteLanDiscovery:
             "type": MSG_TYPE,
             "agent_id": agent_id,
             "agent_name": agent_name,
-            "timestamp": None,  # 由调用方按需填充；轻量版不强制 ISO 时间
+            "timestamp": timestamp,
             "version": "1.0.0",
             "capabilities": list(capabilities or []),
             "port": announce_port,
         }
         # L-11（第三轮体检批次5）：sendto 目标与宣告端口一致——修复前报文
-        # 宣告 announce_port 却固定发往 self.port，语义分裂
+        # 宣告 announce_port 却固定发往 self.port，语义分裂。
+        # 20261017 节点互联：显式传 target_port 时以对端监听端口为准（CX-O 全量
+        # 对齐——其主系统监听 9999，广播固定发 9999）。
         self._socket.sendto(
             json.dumps(message).encode("utf-8"),
-            (self.broadcast_address, announce_port),
+            (self.broadcast_address, target_port or announce_port),
         )
 
     def parse_packet(self, data, addr):
@@ -258,6 +271,17 @@ class LiteLanDiscovery:
             self._seen_agents.add(key)
             self._agent_records[key] = agent
             self.found_agents.append((agent, addr))
+            # 节点互联（20261017）：新登记节点回调管理器（发现即注册；重复信标
+            # 去重命中不回调，避免每 30s 重复注册）
+            callback = self.on_beacon
+            if callback is not None:
+                try:
+                    callback(agent)
+                except Exception as exc:  # noqa: BLE001 - 回调失败不影响接收循环
+                    print(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [WARNING] "
+                        f"信标回调失败：{exc}"
+                    )
         return agent
 
     def prune_expired(self, max_age_seconds=300):

@@ -276,6 +276,9 @@ export default function SettingsPage() {
   const [visionEnabled, setVisionEnabled] = useState(false);
   // 主动搭话开关（20261011：vision.proactive_enabled——画面值得回应时 AI 主动开口）
   const [proactiveEnabled, setProactiveEnabled] = useState(true);
+  // ACP 节点互联 / CXFC 插件协议开关（20261017，开启后局域网互通）
+  const [acpEnabled, setAcpEnabled] = useState(false);
+  const [cxfcEnabled, setCxfcEnabled] = useState(false);
   // 主动视觉上下文管理（20261011）：保留图像数量（1~8，热更）与单图 token 预算（256~4096，重启生效）
   const [visionWindow, setVisionWindow] = useState(3);
   const [visionBudget, setVisionBudget] = useState(1024);
@@ -368,6 +371,8 @@ export default function SettingsPage() {
           setLocalReady(Boolean(st?.local_llm?.ready ?? false));
           setVisionEnabled(Boolean(st?.vision?.enabled ?? false));
           setProactiveEnabled(Boolean(st?.vision?.proactive_enabled ?? true));
+          setAcpEnabled(Boolean(st?.acp?.enabled ?? false));
+          setCxfcEnabled(Boolean(st?.cxfc?.enabled ?? false));
           setVisionWindow(Number(st?.vision?.image_window ?? 3) || 3);
           setVisionBudget(Number(st?.vision?.image_max_tokens ?? 1024) || 1024);
           setContextInject(Boolean(st?.memory?.context_inject ?? true));
@@ -500,6 +505,28 @@ export default function SettingsPage() {
     void updateSettings({ vision: { proactive_enabled: next } }).catch(() => {
       if (seq !== settingsSeqRef.current) return; // 已有更新的操作接管，丢弃迟到失败
       setSaveError('主动搭话开关没保存上…待会儿再拨一次就好啦');
+    });
+  };
+  // ACP 节点互联开关（20261017）：开启即局域网宣告本机 + 心跳（热接线即时生效）
+  const handleAcpChange = (next: boolean) => {
+    setAcpEnabled(next);
+    const seq = ++settingsSeqRef.current;
+    setSaveError(null);
+    setCustomHint(null);
+    void updateSettings({ acp: { enabled: next } }).catch(() => {
+      if (seq !== settingsSeqRef.current) return;
+      setSaveError('节点互联开关没保存上…待会儿再拨一次就好啦');
+    });
+  };
+  // CXFC 插件协议开关（20261017）：跨机插件调用前置
+  const handleCxfcChange = (next: boolean) => {
+    setCxfcEnabled(next);
+    const seq = ++settingsSeqRef.current;
+    setSaveError(null);
+    setCustomHint(null);
+    void updateSettings({ cxfc: { enabled: next } }).catch(() => {
+      if (seq !== settingsSeqRef.current) return;
+      setSaveError('插件协议开关没保存上…待会儿再拨一次就好啦');
     });
   };
   // 主动视觉上下文管理（20261011）：保留图像数量（热更即时）与单图预算（重启生效）
@@ -1087,6 +1114,22 @@ export default function SettingsPage() {
             <Toggle checked={proactiveEnabled} onChange={handleProactiveChange} label="主动搭话" />
           </SettingRow>
         ) : null}
+
+        {/* ACP 节点互联（20261017）：局域网多智能体互通 */}
+        <SettingRow
+          title="节点互联"
+          desc="让局域网里的其他 CX-O / CX-A 发现你、互相聊天（开启后会向局域网宣告本机）"
+        >
+          <Toggle checked={acpEnabled} onChange={handleAcpChange} label="节点互联" />
+        </SettingRow>
+
+        {/* CXFC 插件协议（20261017）：跨机插件调用前置 */}
+        <SettingRow
+          title="插件协议"
+          desc="允许接收局域网插件注册，并调用其他 CX-O 机器上的插件工具"
+        >
+          <Toggle checked={cxfcEnabled} onChange={handleCxfcChange} label="插件协议" />
+        </SettingRow>
 
         {/* 聊天时自动回忆（RAG 记忆注入，20261005） */}
         <SettingRow

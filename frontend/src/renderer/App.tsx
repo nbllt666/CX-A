@@ -11,6 +11,7 @@ import MemoriesPage from './pages/MemoriesPage';
 import SettingsPage from './pages/SettingsPage';
 import SetupWizard from './pages/SetupWizard';
 import FleetPage from './pages/FleetPage';
+import AcpNodePage from './pages/AcpNodePage';
 import { usePetEnabled } from './hooks/usePetEnabled';
 
 /**
@@ -23,9 +24,9 @@ import { usePetEnabled } from './hooks/usePetEnabled';
  *
  * `setup` = 首启向导（首次启动覆盖主界面，或从设置页 / `#/setup` 深链重入）。
  */
-export type View = 'chat' | 'pet' | 'memories' | 'settings' | 'setup' | 'fleet';
+export type View = 'chat' | 'pet' | 'memories' | 'settings' | 'setup' | 'fleet' | 'nodes';
 
-const VIEWS: View[] = ['chat', 'pet', 'memories', 'settings', 'setup', 'fleet'];
+const VIEWS: View[] = ['chat', 'pet', 'memories', 'settings', 'setup', 'fleet', 'nodes'];
 
 /**
  * 首启门控状态：
@@ -244,6 +245,9 @@ function ViewRenderer({ view, onSetupDone }: { view: View; onSetupDone: () => vo
     case 'fleet':
       // 管理面（隐藏入口：连点侧栏 logo 5 次或深链 #/fleet）
       return <FleetPage />;
+    case 'nodes':
+      // ACP 节点互联（隐藏管理能力：FleetPage 内按钮或深链 #/nodes）
+      return <AcpNodePage />;
     case 'setup':
       return <SetupWizard onDone={onSetupDone} />;
     default:
