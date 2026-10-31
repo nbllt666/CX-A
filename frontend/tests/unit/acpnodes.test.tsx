@@ -109,4 +109,24 @@ describe('AcpNodePage：节点互联视图', () => {
     expect(screen.getByText('请填写有效的主机地址与端口（1~65535）')).toBeTruthy();
     expect(fetchMock.mock.calls.some(([u, i]) => String(u).includes('/api/acp/agents') && (i?.method ?? '') === 'POST')).toBe(false);
   });
+
+  it('远端列表加载失败：展示后端错误提示而非静默空列表（Issue1）', async () => {
+    stubFetch([
+      (url) => {
+        if (url.includes('/api/acp/agents')) return { body: { status: 'success', agents: [LOCAL_AGENT], total: 1 } };
+        if (url.includes('/api/acp/stats')) return { body: { statistics: {} } };
+        if (url.includes('/api/cxfc/remote/nodes')) {
+          // CXFC 未启用：后端 503 + 中文 message（requestJson 拼进 Error message）
+          return {
+            status: 503,
+            body: { ok: false, error: 'cxfc_disabled', message: 'CXFC 未启用（设置页开启后可用）' },
+          };
+        }
+        return undefined;
+      },
+    ]);
+    render(<AcpNodePage />);
+    // 失败提示可见（含后端 message 关键词），而非静默空列表
+    await waitFor(() => expect(screen.getByText(/CXFC 未启用/)).toBeTruthy());
+  });
 });

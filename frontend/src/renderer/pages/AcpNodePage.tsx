@@ -78,12 +78,20 @@ export default function AcpNodePage() {
     if (seq === msgSeq.current) setMessages(list);
   }, []);
 
+  /** 远端节点列表加载（挂载 / 添加后共用）：失败给用户明确提示而非静默空列表
+   *  （Issue1 修复——CXFC 未启用时后端 503 中文 message 直达用户） */
+  const reloadRemoteNodes = useCallback(async () => {
+    try {
+      setRemoteNodes(await listCxfcRemoteNodes());
+    } catch (err) {
+      setHint(err instanceof Error ? err.message : '远端插件节点加载失败，请确认已开启插件协议');
+    }
+  }, []);
+
   useEffect(() => {
     void reload();
-    void listCxfcRemoteNodes()
-      .then(setRemoteNodes)
-      .catch(() => undefined);
-  }, [reload]);
+    void reloadRemoteNodes();
+  }, [reload, reloadRemoteNodes]);
 
   useEffect(() => {
     if (!selected) return;
@@ -167,7 +175,7 @@ export default function AcpNodePage() {
     setRemoteBusy(true);
     try {
       const node = await addCxfcRemoteNode({ host: remoteHost.trim(), port });
-      await listCxfcRemoteNodes().then(setRemoteNodes).catch(() => undefined);
+      await reloadRemoteNodes();
       setRemoteHost('');
       setRemotePort('');
       setHint(`远端节点已添加：${node.name}`);

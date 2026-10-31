@@ -39,10 +39,10 @@
     {
       "name": "MeloTTS + CX-OPEN 音色",
       "key": "melotts",
-      "size_estimate": "约 160 MB",
+      "size_estimate": "约 594 MB",
       "status": "builtin",
       "install_target": "data/voices/cx-open",
-      "notes": "语音合成默认音色 CX-OPEN（对齐 config.tts.voice）。"
+      "notes": "语音合成默认音色 CX-OPEN（对齐 config.tts.voice）。20261031 换装 auto_DS-008 训练产物（G_727.pth 594MB → bundled/melotts/ckpt.txt + config.json），替代官方默认权重（其存在 melo decoder 合成塌陷问题，见 .trae/documents/20261031_模块0_替换默认TTS模型.md）；落位后合成走「音色目录本地权重」分支（tts.py/voice_bridge.py 同口径），ORT 加速按设计自动跳过。bundled/melotts 缺失时源缺失跳过（运行时回退官方 HF 权重，需联网）。"
     },
     {
       "name": "SenseVoice",
