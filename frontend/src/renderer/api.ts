@@ -862,8 +862,8 @@ export async function callCxfcRemotePlugin(
   return (data?.result ?? {}) as Record<string, unknown>;
 }
 
-/** 话轮判定结果（对齐 CX-O agent_interrupt_user 三态；CX-A 场景 IGNORE=丢弃不回复）。 */
-export type VoiceTurnVerdict = 'CONTINUE' | 'SEND' | 'IGNORE';
+/** 话轮判定结果（对齐 CX-O agent_interrupt_user 语义；20261107 扩展五枚举）。 */
+export type VoiceTurnVerdict = 'CONTINUE' | 'SEND' | 'IGNORE' | 'INTERRUPT' | 'SILENT';
 
 /**
  * 主模型话轮判定（20261010_模块0_语音交互延迟优化）：POST /api/voice/turn_check。
@@ -880,7 +880,14 @@ export async function checkVoiceTurn(text: string): Promise<VoiceTurnVerdict> {
       1500,
     );
     const decision = data?.decision;
-    if (decision === 'CONTINUE' || decision === 'IGNORE') return decision;
+    if (
+      decision === 'CONTINUE' ||
+      decision === 'IGNORE' ||
+      decision === 'INTERRUPT' ||
+      decision === 'SILENT'
+    ) {
+      return decision;
+    }
     return 'SEND';
   } catch {
     return 'SEND'; // 超时/失败兜底：固定静音断句的行为

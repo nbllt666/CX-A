@@ -937,6 +937,28 @@ def test_voice_turn_check_local_llm_not_ready_sends(api_server):
     assert body["reason"] == "local_llm_not_ready"
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("CONTINUE", "CONTINUE"),
+        ("INTERRUPT", "INTERRUPT"),
+        ("SILENT", "SILENT"),
+        ("IGNORE", "IGNORE"),
+        ("SEND", "SEND"),
+        ("嗯CONTINUE吧", "CONTINUE"),  # 容忍整句/噪声：关键词包含
+        ("INTERRUPT优先于SILENT与IGNORE", "INTERRUPT"),  # 安全侧排序：INTERRUPT > SILENT > IGNORE
+        ("说完了SILENT还是IGNORE？", "SILENT"),
+        ("乱七八糟", "SEND"),  # 不可解析 → SEND 兜底（宁误发不吞话）
+        ("", "SEND"),
+    ],
+)
+def test_parse_turn_verdict_keyword_priority(raw, expected):
+    """_parse_turn_verdict：五枚举关键词解析 + 安全侧排序 + 不可解析 SEND 兜底。"""
+    from lite.server.api_server import _parse_turn_verdict
+
+    assert _parse_turn_verdict(raw) == expected
+
+
 def test_voice_transcribe_returns_text(api_server):
     """POST /api/voice/transcribe：MockASR 返回占位文本 → 200 {ok:true, text}。"""
     _store, _pipeline, base = api_server

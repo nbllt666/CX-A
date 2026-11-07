@@ -350,6 +350,26 @@ def _vision_section_of(config):
     return {"image_max_tokens": 1024}
 
 
+def _parse_turn_verdict(raw):
+    """话轮判定关键词解析（20261107 五枚举；安全侧排序，纯函数可单测）。
+
+    :param raw: 主模型原始输出（期望只含一个枚举词，但容忍整句/噪声）。
+    :return: CONTINUE / INTERRUPT / SEND / IGNORE / SILENT 之一。
+        CONTINUE 优先（安全侧——宁可多等不吞话的合并语义）；INTERRUPT 次之
+        （AI 插话是主动决策，优先于说完了的判定）；不可解析一律 SEND
+        （宁误发不吞话兜底，绝不因判定失败吞掉用户的话）。
+    """
+    if "CONTINUE" in raw:
+        return "CONTINUE"
+    if "INTERRUPT" in raw:
+        return "INTERRUPT"
+    if "SILENT" in raw:
+        return "SILENT"
+    if "IGNORE" in raw:
+        return "IGNORE"
+    return "SEND"
+
+
 def build_local_chat_runtime(config):
     """按 local_llm 配置段组装本地小 LLM 运行时（供离线聊天兜底）。
 
@@ -4954,11 +4974,15 @@ def make_handler(
             """POST /api/voice/turn_check：主模型话轮判定（对齐 CX-O agent_interrupt_user 语义）。
 
             全双工「说完没有」不再只靠固定静音时长——ASR 文本到手后由**主对话模型**
-            快速三态判定（20261010_模块0_语音交互延迟优化·主模型判定模式）：
+            快速判定（20261010_模块0_语音交互延迟优化·主模型判定模式；20261107
+            扩展为五枚举）：
 
             - **CONTINUE**：用户还在组织语言（半截话）→ 前端挂起合并下一句再发；
+            - **INTERRUPT**：该 AI 插话打断用户话轮（如用户重复啰嗦/跑偏）→ 前端
+              立即发送挂起文本触发回复；
             - **SEND**：完整一句 → 立即发送回复；
-            - **IGNORE**：无意义音节/自言自语 → 丢弃。
+            - **IGNORE**：无意义音节/自言自语 → 丢弃该段（此前挂起的半截话保留等后续）；
+            - **SILENT**：说完了但无需回复（如「好的就这样」）→ 整轮作废，AI 沉默。
 
             **主模型判定模式的缓存红利**（用户裁决：只有主模型判定才吃投机预填充）：
             判定请求经 ``_build_chat_messages`` 复用主对话的 system（人设）+ 会话
@@ -4987,8 +5011,9 @@ def make_handler(
             # 判定输出只要**一个枚举词**（非 JSON）——生成 1~3 token，CPU 上 <0.1s；
             # JSON+reason 形态的 32 token 生成在 CPU 上要 0.8s+（实测），判定延迟大头
             judge_text = (
-                "（话轮判定，非聊天）判断用户语音是否完整说了一句。只回一个词："
-                "CONTINUE（话没说完）/ SEND（完整一句）/ IGNORE（无意义音节）。\n"
+                "（话轮判定，非聊天）判断用户语音的话轮状态。只回一个词："
+                "CONTINUE（话没说完）/ INTERRUPT（该我插话打断用户）/ SEND（完整一句）/"
+                "IGNORE（无意义音节）/ SILENT（说完了但无需回复）。\n"
                 f"【用户语音】{text}"
             )
             try:
@@ -4999,13 +5024,8 @@ def make_handler(
                 LOGGER.info("话轮判定失败（%s）：%s", exc.__class__.__name__, str(exc)[:120])
                 self._send_json({"ok": True, "decision": "SEND", "reason": "judge_error"})
                 return
-            decision = "SEND"
+            decision = _parse_turn_verdict(raw)
             reason = ""
-            # 关键词兜底解析：CONTINUE 优先（安全侧——宁可多等不吞话的合并语义）
-            if "CONTINUE" in raw:
-                decision = "CONTINUE"
-            elif "IGNORE" in raw:
-                decision = "IGNORE"
             self._send_json({"ok": True, "decision": decision, "reason": reason})
 
         def _handle_voice_visual_prefill(self):

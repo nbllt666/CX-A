@@ -9,6 +9,10 @@
  *   下一句即可发出；TTS 播放与下一句请求重叠）；**AI 播放期间能量检测持续，
  *   用户开口（高门限 + 300ms 保护窗）→ 打断**：停播、清队、丢弃采集缓冲
  *   （AI 扬声器残留不得进入识别链路，无 AEC 的缓解见 spec）。
+ *   SEND 确认闸门（20261106 并行慢速 VAD 判停）：话轮判定 SEND 后查采集层
+ *   实时静音（getSilenceSec），未达确认阈值（confirmSilenceSec，默认 1.0s）则
+ *   挂起并启动补足确认定时器（开口即清 / 新语音段合并 / stop 清除）——排除
+ *   换气、犹豫停顿被快 VAD + 标点快筛误判成句的抢话。
  *
  * 上下文延续：/api/chat/message 的会话历史由后端持有，逐句串行发送即自然
  * 延续上下文（前端不重复维护 messages 数组）。
@@ -69,14 +73,36 @@ export interface VoiceSessionDeps {
    */
   onSpeechStart?: () => void;
   /**
-   * 话轮判定（20261010 主模型判定模式，对齐 CX-O agent_interrupt_user 语义）：
-   * 判断 ASR 文本是完整一句（SEND）/ 还在说（CONTINUE，挂起合并下一句）/
-   * 无意义（IGNORE，丢弃）。注入后 duplex 模式对**无终端标点**的识别文本
-   * 先判定再发送；未注入或判定异常一律 SEND（宁误发不吞话）。
+   * 话轮判定（20261010 主模型判定模式，对齐 CX-O agent_interrupt_user 语义；
+   * 20261107 扩展五枚举）：判断 ASR 文本——SEND 完整一句（发送回复）/
+   * CONTINUE 还在说（挂起合并）/ INTERRUPT 该 AI 插话打断用户（立即发送）/
+   * IGNORE 无意义（丢弃本段，池子保留）/ SILENT 说完了但无需回复（整轮作废）。
+   * 注入后 duplex 模式对**无终端标点**的识别文本先判定再发送；
+   * 未注入或判定异常一律 SEND（宁误发不吞话）。
    */
-  turnCheck?: (text: string) => Promise<'CONTINUE' | 'SEND' | 'IGNORE'>;
+  turnCheck?: (
+    text: string,
+  ) => Promise<'CONTINUE' | 'SEND' | 'IGNORE' | 'INTERRUPT' | 'SILENT'>;
   /** CONTINUE 后没有新语音时，最多等待的毫秒数。默认 2000。 */
   turnWaitMs?: number;
+  /**
+   * 实时连续静音秒数查询（20261106 并行慢速 VAD 判停，duplex SEND 确认闸门用）：
+   * 采集层 ContinuousRecordingSession.getSilenceSec 透传注入（语音态=0，静音态=
+   * 自最近超门限块起算的连续静音秒数）。未注入时闸门直通（现状行为，测试/降级
+   * 环境兼容）。
+   */
+  getSilenceSec?: () => number;
+  /**
+   * SEND 确认阈值（秒）。默认 1.0；≤0 视为禁用闸门直通；>10 clamp 至 10
+   * （防配置错误永久沉默）。不进 config/设置页（最小实现，调参留后续）。
+   */
+  confirmSilenceSec?: number;
+  /**
+   * CONTINUE 长静音兜底窗口（秒，20261107）。默认 3.0；≤0 视为禁用兜底；
+   * >30 clamp 至 30。CONTINUE 挂起后静音持续达此值照发挂起池（VAD 证据驱动，
+   * 解决 LLM 误判 CONTINUE 的悬挂：用户说完 AI 不应答）。不进 config/设置页。
+   */
+  continueSilenceSec?: number;
   /**
    * 流式合成并播放一段回复；返回句柄——abort() 停播停合成（打断用）、
    * done 在播放自然结束后 resolve（打断时 reject 或挂起均可，会话不再等待）。
@@ -102,6 +128,18 @@ export interface VoiceSessionDeps {
 const INTERRUPT_THRESHOLD_DEFAULT = 0.09;
 const INTERRUPT_GUARD_MS_DEFAULT = 300;
 
+/** SEND 确认闸门默认阈值（秒）与 clamp 上限（20261106 并行慢速 VAD 判停） */
+const CONFIRM_SILENCE_DEFAULT = 1.0;
+const CONFIRM_SILENCE_MAX = 10;
+/** 补足确认定时器时长下限（毫秒）：静音仅差毫厘时不做 0~数 ms 的抖动定时 */
+const CONFIRM_TIMER_MIN_MS = 200;
+/** INTERRUPT 插话后的人类不可打断窗（毫秒，20261107）：给用户反应停止说话的时间 */
+const INTERRUPT_HUMAN_GUARD_MS = 300;
+/** CONTINUE 长静音兜底窗口（秒，20261107）：静音持续达此值照发挂起池（VAD 证据驱动） */
+const CONTINUE_SILENCE_DEFAULT = 3.0;
+/** 长静音兜底窗口 clamp 上限（秒）：防配置错误导致超长沉默 */
+const CONTINUE_SILENCE_MAX = 30;
+
 /**
  * 断句尾静音时长按交互模式区分（20261010_模块0_全双工节奏优化）：
  *
@@ -126,6 +164,10 @@ export class VoiceSession {
   /** 半截话连续挂起次数（>=2 强制 SEND——防「永不发送」死循环） */
   private pendingTurnCount = 0;
   private pendingTurnTimer: ReturnType<typeof setTimeout> | null = null;
+  /** SEND 确认阈值（构造时 clamp；0 = 闸门禁用直通） */
+  private readonly confirmSilenceSec: number;
+  /** SEND 挂起的补足确认定时器（独立于 pendingTurnTimer，两定时器互不重入） */
+  private confirmTimer: ReturnType<typeof setTimeout> | null = null;
   /** 队列泵忙标记（一句 chat 进行中） */
   private pumping = false;
   /** 播放中的句柄集（打断时统一 abort） */
@@ -133,6 +175,17 @@ export class VoiceSession {
   private speechQueue: string[] = [];
   /** 流式对话的取消控制器集（打断时统一 abort 中止 LLM 流） */
   private readonly activeStreams = new Set<AbortController>();
+  /** 正在处理中的用户句文本（撤回窗口用：interrupt 时回合并池，防止用户已说文本丢失） */
+  private inflightSentence: string | null = null;
+  /**
+   * INTERRUPT 插话的人类不可打断窗截止时刻（20261107）：插话发送后 300ms 内
+   * 撤回窗口抑制——给人反应停止说话的时间；窗后恢复撤回（持续说话=否决插话）。
+   */
+  private interruptGuardUntilTs = 0;
+  /** CONTINUE 长静音兜底定时器（与 confirmTimer/pendingTurnTimer 互不重入） */
+  private continueTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 长静音兜底窗口（秒，构造期 clamp：≤0 禁用存 0；>30 clamp 30） */
+  private readonly continueSilenceSec: number;
   /**
    * 待消费的视觉标记（20261011 视觉语音融合）：开口瞬间置 true，随下一句
    * 发送透传 visual（后端一次性消费 pending 截图），发出后即复位——duplex
@@ -153,6 +206,12 @@ export class VoiceSession {
     this.deps = deps;
     this.interruptThreshold = deps.interrupt?.threshold ?? INTERRUPT_THRESHOLD_DEFAULT;
     this.interruptGuardMs = deps.interrupt?.guardMs ?? INTERRUPT_GUARD_MS_DEFAULT;
+    const confirmSilenceRaw = deps.confirmSilenceSec ?? CONFIRM_SILENCE_DEFAULT;
+    // ≤0 视为禁用（存 0 → 闸门直通）；>10 clamp 至 10（防配置错误永久沉默）
+    this.confirmSilenceSec = confirmSilenceRaw <= 0 ? 0 : Math.min(confirmSilenceRaw, CONFIRM_SILENCE_MAX);
+    const continueSilenceRaw = deps.continueSilenceSec ?? CONTINUE_SILENCE_DEFAULT;
+    // ≤0 视为禁用兜底（存 0 → 不调度）；>30 clamp 至 30（防配置错误超长沉默）
+    this.continueSilenceSec = continueSilenceRaw <= 0 ? 0 : Math.min(continueSilenceRaw, CONTINUE_SILENCE_MAX);
   }
 
   /** 当前会话状态。 */
@@ -215,6 +274,8 @@ export class VoiceSession {
     this.pendingTurnCount = 0;
     this.pendingVisual = false;
     this.clearPendingTurnTimer();
+    this.clearConfirmTimer();
+    this.clearContinueTimer();
     this.interruptAccumMs = 0;
     this.lastLevelTs = 0;
     for (const handle of this.activeSpeaks) handle.abort();
@@ -251,22 +312,41 @@ export class VoiceSession {
   }
 
   /**
-   * 每块能量：duplex + speaking 态下做打断检测——能量连续超过播放期门限
-   * 达到保护窗（guardMs）即打断（无 AEC 的自触发缓解：高门限 + 保护窗）。
+   * 每块能量：duplex 下仅在「未出声撤回窗口」做打断/撤回检测（20261107 出声阻断）：
+   * - TTS 出声后（activeSpeaks>0）**直接阻断**——说完比撤回好：AI 回采不再可能
+   *   误触发打断/撤回（20261006 播放期打断语义由本裁决推翻）；
+   * - 未出声在途期（SEND 后 LLM 计算/TTS 合成中）：AI 无声源，用正常聆听门限 →
+   *   interrupt 撤回模式（abort 流式请求不落盘 + 用户句文本回合并池继续）。
    */
   private handleLevel(rms: number): void {
     if (this.pendingTurnText && rms >= (this.deps.vad?.speechThreshold ?? 0.02)) {
-      this.schedulePendingTurn();
+      // SEND 确认闸门挂起（confirmTimer 活跃）：开口即清补足定时器（不等 0.45s
+      // 断句）——挂起文本保留，等新 utterance 合并。CONTINUE 挂起（confirmTimer
+      // 不活跃）什么都不做：LLM 判定未完不兜底强发（20261107），等 VAD 断句
+      // 产出新 utterance 走判定；撤回回池的 2s 兜底 timer 也不被重置
+      if (this.confirmTimer !== null) this.clearConfirmTimer();
     }
-    if (this.deps.mode !== 'duplex' || this.activeSpeaks.size === 0) return;
+    if (this.deps.mode !== 'duplex' || this.activeSpeaks.size > 0) return;
+    // INTERRUPT 插话的人类不可打断窗（20261107）：300ms 内能量块忽略——给用户
+    // 反应停止说话的时间，窗后恢复撤回（持续说话=否决插话）
+    if (Date.now() < this.interruptGuardUntilTs) return;
+    // 未出声在途期才有撤回对象；纯 listening（无在途工作）无事可做
+    const pendingWork =
+      this.activeStreams.size > 0 ||
+      this.queue.length > 0 ||
+      this.pumping ||
+      this.inflightSentence !== null;
+    if (!pendingWork) return;
+    const gate = this.deps.vad?.speechThreshold ?? 0.02;
     const now = Date.now();
     const elapsed = this.lastLevelTs ? now - this.lastLevelTs : 0;
     this.lastLevelTs = now;
-    if (rms >= this.interruptThreshold) {
+    if (rms >= gate) {
       this.interruptAccumMs += Math.min(elapsed || 32, 120);
       if (this.interruptAccumMs >= this.interruptGuardMs) {
         this.interruptAccumMs = 0;
         this.interrupt();
+        return;
       }
     } else {
       this.interruptAccumMs = 0;
@@ -281,8 +361,15 @@ export class VoiceSession {
     if (this.stopped) return;
     const generation = this.turnGeneration;
     this.clearPendingTurnTimer();
-    // vad 模式播放期间不检测打断（spec 冻结：单轮交互）——播放中到达的语音段丢弃
-    if (this.deps.mode === 'vad' && this.state === 'speaking') return;
+    // 新语音段到达（20261106 SEND 确认闸门）：清补足确认定时器，挂起文本走
+    // 既有合并/判定流程（新判定 SEND 时与挂起文本合并后再过闸门）
+    this.clearConfirmTimer();
+    // 新语音段到达（20261107 CONTINUE 长静音兜底）：清长静音 timer——用户有
+    // 下文，重新走判定（再 CONTINUE 则重新调度兜底）
+    this.clearContinueTimer();
+    // 出声阻断（20261107）：speaking 态到达的语音段一律丢弃——AI 扬声器回采
+    // 不得进入识别链路（vad/duplex 同则；说完比撤回好，播放期不再打断）
+    if (this.state === 'speaking') return;
     if (this.activeSpeaks.size === 0) this.setState('processing');
     let text = '';
     try {
@@ -298,30 +385,48 @@ export class VoiceSession {
       return;
     }
     if (this.deps.mode === 'duplex') {
-      // 话轮判定（20261010 主模型判定模式）：CONTINUE 挂起合并下一句，不发送
+      // 话轮判定（20261010 主模型判定模式；20261107 五枚举）
       const verdict = await this.resolveTurn(text);
       if (this.stopped || generation !== this.turnGeneration) return;
       if (verdict === 'IGNORE') {
-        this.schedulePendingTurn();
+        // 无意义音节（20261107 语义修正）：丢弃本段，此前挂起的半截话保留
+        // 挂起等后续（不兜底强发，与 CONTINUE 语义一致）
+        this.settleIfIdle();
+        return;
+      }
+      if (verdict === 'SILENT') {
+        // 说完了但无需回复（如「好的就这样」）：仅对本段沉默（20261107 精修：
+        // 此前挂起的半截话**保留**——与 IGNORE 同构，后续语音 SEND 时合并发出）
         this.settleIfIdle();
         return;
       }
       if (verdict === 'CONTINUE') {
+        // LLM 判定话轮被打断/未说完（20261107）：挂起合并但**不固定强发**——
+        // 出口 = 用户后续语音段（SEND 合并发出）、count≥2 强制 SEND（死循环
+        // 保护）或**长静音 VAD 兜底**（静音持续达长窗照发，20261107 用户三裁决：
+        // VAD 证据驱动，解决 LLM 误判 CONTINUE 的悬挂）
         this.pendingTurnText = this.pendingTurnText
           ? `${this.pendingTurnText}${text}`
           : text;
         this.pendingTurnCount += 1;
-        this.schedulePendingTurn();
+        this.scheduleContinueFallback();
         this.settleIfIdle();
         return;
       }
-      // SEND：带上挂起的半截话一起发（可能为空）
+      // SEND / INTERRUPT（该 AI 插话打断用户）：带上挂起的半截话一起发（可能为
+      // 空）；确认闸门未放行时挂起，由补足确认定时器承载发送（不叠加 2s 兜底）。
+      // INTERRUPT 与 SEND 同发送路径——撤回窗口照常（300ms 人类不可打断窗除外）
+      if (verdict === 'INTERRUPT') {
+        this.interruptGuardUntilTs = Date.now() + INTERRUPT_HUMAN_GUARD_MS;
+      }
       const merged = this.pendingTurnText ? `${this.pendingTurnText}${text}` : text;
       this.pendingTurnText = '';
       this.pendingTurnCount = 0;
       this.clearPendingTurnTimer();
-      this.queue.push(...splitSentences(merged));
-      this.pump();
+      if (this.passSendConfirmGate(merged)) {
+        this.queue.push(...splitSentences(merged));
+        this.pump();
+      }
       return;
     }
     // vad 模式：整段一句话处理
@@ -348,6 +453,101 @@ export class VoiceSession {
     }, Math.max(1, this.deps.turnWaitMs ?? 2000));
   }
 
+  /** 清除 SEND 挂起的补足确认定时器（幂等；stop/打断/新 utterance/开口能量均先行清除）。 */
+  private clearConfirmTimer(): void {
+    if (this.confirmTimer !== null) clearTimeout(this.confirmTimer);
+    this.confirmTimer = null;
+  }
+
+  /** 实时静音秒数（查询异常按静音充分处理——宁误发不吞话，与 turnCheck 异常一律 SEND 同则）。 */
+  private currentSilenceSec(): number {
+    try {
+      return this.deps.getSilenceSec?.() ?? 0;
+    } catch {
+      return Number.MAX_SAFE_INTEGER;
+    }
+  }
+
+  /**
+   * SEND 确认闸门（20261106 并行慢速 VAD 判停，duplex 专用）：话轮判定 SEND 后
+   * 查询采集层实时静音——≥ 确认阈值立即放行（turnCheck 耗时通常已吸收大半确认窗，
+   * 多数场景零额外延迟）；未达标挂起进合并池（复用 pendingTurnText，闸门降级
+   * **不计** pendingTurnCount——该计数仅服务 turnCheck CONTINUE 死循环保护），并
+   * 启动补足确认定时器（时长 = 阈值 − 当前静音，下限 0.2s）到点无条件发送。
+   * 降级环境（未注入 getSilenceSec / clamp 后阈值 ≤0）直通，行为与闸门前逐字一致。
+   *
+   * @param merged 本轮 SEND 待发的合并文本
+   * @returns true=已放行（调用方入队发送）；false=已挂起（补足定时器承载发送）
+   */
+  private passSendConfirmGate(merged: string): boolean {
+    if (!(this.confirmSilenceSec > 0 && typeof this.deps.getSilenceSec === 'function')) return true;
+    const silence = this.currentSilenceSec();
+    if (silence >= this.confirmSilenceSec) return true;
+    this.pendingTurnText = merged;
+    this.scheduleConfirmTimer(silence);
+    this.settleIfIdle();
+    return false;
+  }
+
+  /**
+   * 补足确认定时器（SEND 挂起路径**唯一**发送承载，不叠加 turnWaitMs 兜底）：
+   * 时长 = clamp 后阈值 − 挂起时刻静音（下限 0.2s），到点无条件发送挂起文本
+   * （splitSentences 入队 → 泵）；正常路径一次性定时无重试循环，不存在永久沉默。
+   */
+  private scheduleConfirmTimer(silenceSec: number): void {
+    this.clearConfirmTimer();
+    if (this.stopped || !this.pendingTurnText) return;
+    const generation = this.turnGeneration;
+    const waitMs = Math.max(
+      CONFIRM_TIMER_MIN_MS,
+      Math.round((this.confirmSilenceSec - silenceSec) * 1000),
+    );
+    this.confirmTimer = setTimeout(() => {
+      this.confirmTimer = null;
+      if (this.stopped || generation !== this.turnGeneration) return;
+      const text = this.pendingTurnText;
+      this.pendingTurnText = '';
+      this.pendingTurnCount = 0;
+      this.queue.push(...splitSentences(text));
+      this.pump();
+    }, waitMs);
+  }
+
+  /** 清除 CONTINUE 长静音兜底定时器（幂等；stop/打断/新 utterance 均先行清除）。 */
+  private clearContinueTimer(): void {
+    if (this.continueTimer !== null) clearTimeout(this.continueTimer);
+    this.continueTimer = null;
+  }
+
+  /**
+   * CONTINUE 长静音 VAD 兜底（20261107 用户三裁决）：挂起池在静音持续达长窗
+   * （默认 3s，远大于确认闸门 1.0s）时照发——VAD 证据驱动的条件兜底，与已移除
+   * 的「固定 2s 盲等」本质不同：用户继续说则新 utterance 清 timer 重判，不违背
+   * LLM「未说完」判定；仅解决 LLM 误判 CONTINUE 的悬挂。未注入 getSilenceSec
+   * 或 ≤0 禁用时不调度（保持悬挂，等后续语音解锁）。静音 3s 远超确认闸门 1.0s，
+   * 兜底发送直接入队（静音证据充分，不再过闸门）。
+   */
+  private scheduleContinueFallback(): void {
+    this.clearContinueTimer();
+    if (this.stopped || !this.pendingTurnText) return;
+    if (!(this.continueSilenceSec > 0 && typeof this.deps.getSilenceSec === 'function')) return;
+    const silence = this.currentSilenceSec();
+    const waitMs = Math.max(
+      CONFIRM_TIMER_MIN_MS,
+      Math.round((this.continueSilenceSec - silence) * 1000),
+    );
+    const generation = this.turnGeneration;
+    this.continueTimer = setTimeout(() => {
+      this.continueTimer = null;
+      if (this.stopped || generation !== this.turnGeneration) return;
+      const text = this.pendingTurnText;
+      this.pendingTurnText = '';
+      this.pendingTurnCount = 0;
+      this.queue.push(...splitSentences(text));
+      this.pump();
+    }, waitMs);
+  }
+
   /**
    * 话轮判定（duplex 专用）：**规则快筛优先**——识别文本以终端标点结尾即视为
    * 完整句（零成本，多数句命中）；无终端标点且注入了 turnCheck 才走主模型判定
@@ -355,14 +555,12 @@ export class VoiceSession {
    */
   private async resolveTurn(
     text: string,
-  ): Promise<'SEND' | 'CONTINUE' | 'IGNORE'> {
+  ): Promise<'SEND' | 'CONTINUE' | 'IGNORE' | 'INTERRUPT' | 'SILENT'> {
     if (/[。！？；…]["」』）】]?\s*$/.test(text)) return 'SEND';
     if (this.pendingTurnCount >= 2) return 'SEND';
     if (!this.deps.turnCheck) return 'SEND';
     try {
-      const verdict = await this.deps.turnCheck(text);
-      if (verdict === 'CONTINUE' || verdict === 'IGNORE') return verdict;
-      return 'SEND';
+      return await this.deps.turnCheck(text);
     } catch {
       return 'SEND';
     }
@@ -390,6 +588,17 @@ export class VoiceSession {
 
   /** 处理一句话：发送 LLM → 回复入历史（后端）→ 流式合成播放。 */
   private async processSentence(sentence: string): Promise<void> {
+    if (this.activeSpeaks.size === 0) this.setState('processing');
+    // 撤回窗口记录（20261106）：interrupt 在 TTS 出声前触发时按序回合并池
+    this.inflightSentence = sentence;
+    try {
+      return await this.processSentenceInner(sentence);
+    } finally {
+      if (this.inflightSentence === sentence) this.inflightSentence = null;
+    }
+  }
+
+  private async processSentenceInner(sentence: string): Promise<void> {
     const generation = this.turnGeneration;
     if (this.activeSpeaks.size === 0) this.setState('processing');
     // 视觉标记一次性消费：开口后首句带图（duplex 多句轮询仅首句 visual=true）。
@@ -519,25 +728,36 @@ export class VoiceSession {
     this.settleIfIdle();
   }
 
-  /** 播放中用户开口（duplex）：停播、中止流式请求、清队、丢弃采集缓冲、回聆听。 */
+  /**
+   * 撤回（duplex，20261106 撤回窗口 + 20261107 出声阻断）：仅在 **TTS 出声前**
+   * 可达（handleLevel 播放期已阻断）——abort 在途流式请求（后端断开不落盘=
+   * 撤回该轮判定），正在处理/排队中的**用户句文本按序回合并池**（不清采集
+   * 缓冲：无残留声源，保住用户正在说的话），回聆听等新语音段合并重判再发
+   * （pendingTurn 2s 兜底防沉默）。
+   */
   private interrupt(): void {
     if (this.stopped) return;
     this.turnGeneration += 1;
+    // 撤回集合：排队中剩余句（先入先拼）+ 正在处理中的句子文本
+    const reclaim: string[] = [...this.queue];
+    if (this.inflightSentence) reclaim.unshift(this.inflightSentence);
     this.queue = [];
     this.speechQueue = [];
     this.pumping = false;
     this.pendingTurnText = '';
     this.pendingTurnCount = 0;
     this.clearPendingTurnTimer();
+    this.clearConfirmTimer();
+    this.clearContinueTimer();
     this.interruptAccumMs = 0;
     this.lastLevelTs = 0;
-    for (const handle of this.activeSpeaks) handle.abort();
-    this.activeSpeaks.clear();
     // 中止在途流式对话请求（LLM 生成同步停止；后端检测断开不落盘该轮历史）
     for (const controller of this.activeStreams) controller.abort();
     this.activeStreams.clear();
-    // 丢弃采集缓冲：AI 扬声器残留混入的音频不得进入识别链路（spec 冻结段）
-    this.recorder?.clearBuffer();
+    this.inflightSentence = null;
+    // 用户已说文本回合并池（新语音段合并重判；2s 兜底防沉默）
+    this.pendingTurnText = reclaim.join('');
+    if (this.pendingTurnText) this.schedulePendingTurn();
     this.setState('listening');
   }
 

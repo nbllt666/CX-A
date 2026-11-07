@@ -147,3 +147,55 @@ Task 0 完成（变更文档 + 本 note 已创建）；Task 1-6 未开始。
 **终态处理**：文档已回填最终结果并标记已完成；CX-A 已重启运行（新 token 落盘 logs/api_token.json）。
 
 **打包分发追加（同日）**：新模型已进安装程序——installer/bundled/melotts/（config.json + ckpt.txt）+ manifest size_estimate 更新（160MB→594MB），重打包（复用前端/壳/后端产物）产出 Setup 2810.0MB。全新安装即内置新默认音色（不再联网下载官方权重）；重装对已有 cx-open 数据目录按 HP1 跳过覆盖。此前 30.1MB 残留 Setup 已被本次产物覆盖。
+
+## 追加变更：并行 VAD 排除全双工错误判停（add-parallel-vad-stop-guard，20261106）
+
+**做到哪了**：spec 三件套（GN-004 两轮审查：首轮阻断→修正→复审警示放行，S1 已采纳）→ 实施完成。改动：①audioRecorder.ts EnergyVad 静音态持续累计（speech-end 不归零，跨态连续）+ 只读 silenceSec + ContinuousRecordingSession.getSilenceSec()；②voiceSession.ts duplex SEND 确认闸门（passSendConfirmGate：静音 ≥ confirmSilenceSec 默认 1.0s 立即发送；未达标挂起 + 补足确认定时器到点发送；开口即清 confirmTimer；闸门降级不计 pendingTurnCount；stop/打断清定时器）；③单测 audiorecorder 6 新例 + voicesession 11 新例。Task1/2 并行双 subagent（agent 3ca367d0 / 86aa8c78）按文件所有权分区零撕裂。
+
+**为什么**：duplex 判停链 SEND 放行不确认用户真的停了——换气/犹豫停顿叠加 ASR 自动补句号或 turnCheck 误判时半截话抢发；并行慢速 VAD 判停通道（宁迟勿断）排除误切，未注入 getSilenceSec 直通保证既有行为零回归。
+
+**未闭合项**：真机听感验证（确认延迟 ≤0.55s 是否可感知、换气场景实际体验）留用户日常使用反馈；确认阈值调参如需暴露到设置页另立变更。
+
+**接续入口**：无代码接续。调参入口 = VoiceSessionDeps.confirmSilenceSec（默认 1.0、≤0 直通、>10 clamp 10）；打包分发时按既有 build.py 流程即可（前端产物已更新需全量重打包）。
+
+**终态处理**：留痕 .trae/documents/20261106_模块0_并行VAD排除全双工错误判停.md（status=已完成）；spec 三件套 .trae/specs/add-parallel-vad-stop-guard/（台账 agent id 已回填）；验证 vitest 310/310 + tsc 0。
+
+## 追加变更：撤回窗口延伸至 TTS 出声（20261106_模块0_撤回窗口延伸至TTS出声）
+
+**做到哪了**：用户对并行 VAD 闸门的关键修正——确认静音的语义终点是「TTS 出声」而非「SEND 放行」。voiceSession.ts：①handleLevel 打断检测窗口扩展（播放期高门限 + 未出声在途期正常门限双窗口）②interrupt 双模式分流——出声前（LLM 计算/TTS 合成中）用户开口 = **撤回**（abort 在途流式请求，后端断开不落盘=判定作废；inflightSentence + queue 剩余句文本回合并池；不清采集缓冲保用户在说的话）+ 2s 兜底防沉默；出声后回落现状打断（停播丢文本清缓冲）。单测 4 新例（撤回合并/兜底/门限区分/出声后现状）。
+
+**为什么**：闸门只延迟 SEND 到静音 1.0s，SEND 后 LLM 计算与 TTS 合成期间用户继续说话仍会被抢话（processing 期无打断检测）——「宁迟勿断」要贯彻到出声那一刻；撤回复用后端「断开不落盘」既有语义，零后端改动。
+
+**未闭合项**：真机听感验证（撤回后重发节奏、无自触发误撤回）留日常使用反馈。
+
+**接续入口**：无代码接续。撤回窗口门限 = deps.vad.speechThreshold（未出声期）/ deps.interrupt.threshold（播放期）；打包时前端产物已更新需全量重打包。
+
+**终态处理**：留痕 .trae/documents/20261106_模块0_撤回窗口延伸至TTS出声.md（status=已完成，含排障记录：合并重发断言口径=按句非整段）；验证 vitest 314/314 + tsc 0。
+
+## 追加变更：出声阻断 VAD 与 CONTINUE 不兜底（20261107_模块0_出声阻断VAD与CONTINUE不兜底）
+
+**做到哪了**：用户两点语义裁决落地。①**出声阻断**：TTS 出声后（activeSpeaks>0）handleLevel 直接 return——播放期打断语义（20261006 冻结）被推翻，说完比撤回好；speaking 态 utterance 丢弃扩展到 duplex（AI 回采切段不进识别）；interrupt 简化纯撤回。②**CONTINUE 不兜底**：turnCheck=CONTINUE（话轮被打断/未说完）移除 2s 兜底强发（连带删除 handleLevel 开口重启 pendingTurnTimer 的 else 分支），出口=用户后续语音 SEND 合并或 count≥2 强制 SEND（第 3 段语音触发）。撤回窗口（未出声）与撤回回池 2s 兜底保持不变。
+
+**为什么**：出声后回采误判风险 + 打断作废对话轮的体验差于让 AI 说完；CONTINUE 兜底强发违背 LLM「未说完」判定本身，是抢话源。
+
+**未闭合项**：真机听感（CONTINUE 静默悬挂的体感——用户说完 AI 不应答需再说一句解锁；AI 播放期不可插话）留日常使用反馈。
+
+**接续入口**：无代码接续。播放期高门限 interruptThreshold 已无消费方（仅 deps 兼容保留）；打包时前端产物需全量重打包。
+
+**终态处理**：留痕 .trae/documents/20261107_模块0_出声阻断VAD与CONTINUE不兜底.md（status=已完成，含语义变化对照表）；验证 vitest 313/313 + tsc 0。
+
+## 追加变更：话轮判定四值语义扩展（20261107_模块0_话轮判定四值语义扩展）
+
+**做到哪了**：turn_check 三值扩为五枚举（用户四值裁决 + 保留 IGNORE）：CONTINUE 继续等待 / **INTERRUPT**（新）LLM 打断人——AI 插话，挂起文本+本段立即发送（撤回窗口照常，用户强势可自然撤回）/ SEND 说完回复 / **SILENT**（新）说完不回复——清空挂起池整轮作废 AI 沉默 / IGNORE 无意义音节——行为修正为「丢弃本段、池子保留挂起不兜底」（原 2s 兜底发池子与 CONTINUE 语义冲突）。后端 judge_text prompt 五枚举 + 解析抽模块级纯函数 `_parse_turn_verdict`（安全侧排序，参数化 10 单测）；前端 api.ts VoiceTurnVerdict + voiceSession resolveTurn 透传五值 + 分支处理。
+
+**为什么**：三值枚举缺「AI 主动插话」与「说完无需回复」两个判定出口，LLM 只能在 SEND（抢话）与 CONTINUE（悬挂）间二选一；IGNORE 兜底发池子与「宁迟勿断」裁决不一致。
+
+**未闭合项**：真机听感——INTERRUPT 插话的 LLM 判定准确率依赖主模型对五枚举 prompt 的遵循度（Gemma 4 单词输出温度 0），留日常使用观察。
+
+**接续入口**：无代码接续。解析链 = lite/server/api_server.py `_parse_turn_verdict`（安全侧排序）；prompt 文案在 `_handle_voice_turn_check` 的 judge_text。打包时后端+前端均需重打包（非复用）。
+
+**终态处理**：留痕 .trae/documents/20261107_模块0_话轮判定四值语义扩展.md（status=已完成，含五值行为对照表与快筛短路排障记录）；验证后端 213 passed + 前端 316/316 + tsc 0。
+
+**精修追加（同日）**：①SILENT 保留挂起池（与 IGNORE 同构，仅本段沉默——后续 SEND 合并发出，上下文不丢）②INTERRUPT 加 300ms 人类不可打断窗（interruptGuardUntilTs，窗内撤回抑制给人反应停嘴时间，窗后持续说话=否决插话）。验证 vitest 317/317 + tsc 0；详见留痕文档第五章。
+
+**长静音兜底追加（同日三裁决）**：CONTINUE 误判悬挂用**长窗口 VAD 兜底**解决——scheduleContinueFallback：挂起后静音持续达 continueSilenceSec（默认 3.0s，≤0 禁用 >30 clamp，远大于确认闸门 1.0s）照发挂起池；新语音清 timer 重判（不违背 LLM「未说完」判定，与已移除的固定 2s 盲等本质不同=VAD 证据驱动）；仅 CONTINUE 分支调度（SILENT/IGNORE 池子定位「等后续 SEND 合并」不调度）；撤回回池 2s 兜底与 count≥2 保留。验证 vitest 320/320 + tsc 0；详见留痕文档第六章。

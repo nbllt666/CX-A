@@ -256,25 +256,38 @@ export type VadEvent = 'speech-start' | 'speech-end' | null;
  * - silent 态：RMS 超门限 → speech-start（进入 speech 态）；
  * - speech 态：连续静音块数折算时长超过 silenceTimeoutSec → speech-end（回 silent）；
  *   期间任何超门限块重置静音计数（滞回：短停顿不断句）。
+ * - 静音态持续累计（跨态连续静音时长，供慢速 VAD 判停确认通道查询）：speech-end
+ *   切段后 silentChunks 不归零继续累计，silenceSec = 累计静音块数 × 块时长
+ *   （语音态恒 0）；feed 返回的事件序列不受影响，reset() 归零。
  * 门限/超时的具体数值由调用方按场景给定（普通聆听与 AI 播放期防自触发用不同门限，
  * 见 voiceSession）。
  */
 export class EnergyVad {
   private readonly threshold: number;
   private readonly silenceChunksLimit: number;
+  /** 采集块时长（秒）：构造时给定，silenceSec 的折算口径。 */
+  private readonly chunkSec: number;
   private silentChunks = 0;
   private speaking = false;
 
   constructor(options?: EnergyVadOptions) {
     this.threshold = options?.speechThreshold ?? 0.02;
-    const silenceSec = options?.silenceTimeoutSec ?? 0.7;
-    const chunkSec = options?.chunkDurationSec ?? 0.256;
-    this.silenceChunksLimit = Math.max(1, Math.round(silenceSec / chunkSec));
+    this.chunkSec = options?.chunkDurationSec ?? 0.256;
+    const timeoutSec = options?.silenceTimeoutSec ?? 0.7;
+    this.silenceChunksLimit = Math.max(1, Math.round(timeoutSec / this.chunkSec));
   }
 
   /** 是否处于语音态。 */
   get inSpeech(): boolean {
     return this.speaking;
+  }
+
+  /**
+   * 实时连续静音时长（秒）：语音态恒 0；静音态 = 累计静音块数 × 块时长
+   * （跨态连续：speech-end 切段不归零，供慢速 VAD 判停确认通道查询）。
+   */
+  get silenceSec(): number {
+    return this.speaking ? 0 : this.silentChunks * this.chunkSec;
   }
 
   /**
@@ -292,17 +305,17 @@ export class EnergyVad {
       }
       return null;
     }
-    if (!this.speaking) return null;
+    // 静音块两态均持续累计（跨态连续静音时长）；仅语音态达限触发断句
     this.silentChunks += 1;
-    if (this.silentChunks >= this.silenceChunksLimit) {
+    if (this.speaking && this.silentChunks >= this.silenceChunksLimit) {
       this.speaking = false;
-      this.silentChunks = 0;
+      // 不归零：speech-end 后静音继续累计（跨态连续，供 silenceSec 查询）
       return 'speech-end';
     }
     return null;
   }
 
-  /** 重置状态（打断后丢弃缓冲复用）。 */
+  /** 重置状态（打断后丢弃缓冲复用；静音累计一并归零）。 */
   reset(): void {
     this.silentChunks = 0;
     this.speaking = false;
@@ -316,8 +329,14 @@ export interface ContinuousRecordingSession {
   /** 是否仍在采集。 */
   readonly active: boolean;
   /**
+   * 实时连续静音时长（秒）：自最近超门限块起算的连续静音；语音态为 0，
+   * speech-end 后跨态连续累计（SEND 确认闸门查询用，见 voiceSession）。
+   */
+  getSilenceSec(): number;
+  /**
    * 丢弃进行中的语音缓冲并重置 VAD（打断场景专用）：AI 播放残留混入的
-   * 音频不得进入识别链路，打断后调用方用本方法清缓冲再重新聆听。
+   * 音频不得进入识别链路，打断后调用方用本方法清缓冲再重新聆听
+   * （静音累计一并归零，getSilenceSec 回 0）。
    */
   clearBuffer(): void;
 }
@@ -439,8 +458,11 @@ export async function startContinuousRecording(
       teardown();
       speechChunks = [];
     },
+    getSilenceSec(): number {
+      return vad.silenceSec;
+    },
     clearBuffer(): void {
-      // 丢弃进行中的语音缓冲 + 重置 VAD 状态（含 speech 态归零：打断后重新聆听）
+      // 丢弃进行中的语音缓冲 + 重置 VAD 状态（含静音累计归零：打断后重新聆听，getSilenceSec 回 0）
       speechChunks = [];
       vad.reset();
     },
