@@ -330,6 +330,29 @@ def assemble(electron_dist, backend_dist, portable_root):
         _rmtree_retry(portable_root)
     os.makedirs(portable_root, exist_ok=True)
 
+    # 许可文件 -> 载荷根 LICENSE.txt（installer.iss 的 LicenseFile 来源；
+    # [Files] 的 PayloadDir\* 会把它一并装进 {app}）。缺失即阻断构建：
+    # 不允许产出无许可声明的安装包。
+    license_src = os.path.join(PROJECT_ROOT, "LICENSE")
+    if not os.path.isfile(license_src):
+        _die(
+            f"根 LICENSE 缺失，拒绝生成无许可载荷：{license_src}",
+            hint="在项目根新增 MIT 许可全文文件 LICENSE（版权行 Copyright (c) 2026 CX-A contributors）",
+        )
+    shutil.copy2(license_src, os.path.join(portable_root, "LICENSE.txt"))
+    _log_info("许可文件已落位：LICENSE.txt")
+
+    # 默认桌宠模型的自定义许可（PET_MODEL_LICENSE.md）必须随包分发：
+    # VRM 元数据 licenseName=Other 指向该文件；缺失则用户拿不到完整授权条款。
+    pet_license_src = os.path.join(PROJECT_ROOT, "PET_MODEL_LICENSE.md")
+    if not os.path.isfile(pet_license_src):
+        _die(
+            f"PET_MODEL_LICENSE.md 缺失，拒绝生成缺模型许可的载荷：{pet_license_src}",
+            hint="在项目根恢复 PET_MODEL_LICENSE.md（默认桌宠模型仅限随 CX-A 使用/分发的授权条款）",
+        )
+    shutil.copy2(pet_license_src, os.path.join(portable_root, "PET_MODEL_LICENSE.md"))
+    _log_info("桌宠模型许可已落位：PET_MODEL_LICENSE.md")
+
     # 壳产物内容平铺为载荷目录根（CX-A.exe 位于根）
     _copytree_contents(electron_dist, portable_root)
 

@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import asdict
 from typing import Any, Dict, List
 
@@ -232,9 +233,16 @@ class ToolBridge:
         """把 ToolResult（或其子类）的值全部转成 dict，便于 JSON 回填。
 
         :param result: ToolResult 或其子类实例
-        :return: 由 dataclasses.asdict 展开的普通 dict
+        :return: 由 dataclasses.asdict 展开的普通 dict；bytes 结果转 base64 字符串
         """
-        return asdict(result)
+        payload = asdict(result)
+        # 屏幕截图 result 为 PNG 字节：JSON 无法直接序列化 bytes（json.dumps
+        # default=str 会产出不可用的 "b'...'"），统一转 base64 并标注编码。
+        value = payload.get("result")
+        if isinstance(value, (bytes, bytearray)):
+            payload["result"] = base64.b64encode(bytes(value)).decode("ascii")
+            payload["result_encoding"] = "base64"
+        return payload
 
     @staticmethod
     def _result_summary(result: ToolResult) -> str:

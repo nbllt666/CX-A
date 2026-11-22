@@ -199,3 +199,20 @@ Task 0 完成（变更文档 + 本 note 已创建）；Task 1-6 未开始。
 **精修追加（同日）**：①SILENT 保留挂起池（与 IGNORE 同构，仅本段沉默——后续 SEND 合并发出，上下文不丢）②INTERRUPT 加 300ms 人类不可打断窗（interruptGuardUntilTs，窗内撤回抑制给人反应停嘴时间，窗后持续说话=否决插话）。验证 vitest 317/317 + tsc 0；详见留痕文档第五章。
 
 **长静音兜底追加（同日三裁决）**：CONTINUE 误判悬挂用**长窗口 VAD 兜底**解决——scheduleContinueFallback：挂起后静音持续达 continueSilenceSec（默认 3.0s，≤0 禁用 >30 clamp，远大于确认闸门 1.0s）照发挂起池；新语音清 timer 重判（不违背 LLM「未说完」判定，与已移除的固定 2s 盲等本质不同=VAD 证据驱动）；仅 CONTINUE 分支调度（SILENT/IGNORE 池子定位「等后续 SEND 合并」不调度）；撤回回池 2s 兜底与 count≥2 保留。验证 vitest 320/320 + tsc 0；详见留痕文档第六章。
+
+---
+
+## 新变更：发布前准备（prepare-public-release，20261121）
+
+**做到哪了**：Spec 三件套已写完并获人类批准；实现已推进到 **Task 6（全功能验收）进行中**。已完成：Task 0 变更留痕；Task 1 MIT/许可元数据 + 安装器 LicenseFile + `PET_MODEL_LICENSE.md`/VRM 元数据按用户裁决更新；Task 2 `THIRD_PARTY_NOTICES.md`；Task 3 `RELEASE_NOTES.md` + README 事实修正；Task 4 后端 1646 passed / 前端 321 passed / E2E 9 passed；Task 5 两次重建（最终 `CX-A-Setup-0.1.0.exe` 2,946,518,946B @23:11:48），打包态首启 E2E 2 passed。期间修复 3 个缺陷：衰减统计 permanent 分桶、pet-vrm 过时按钮名「说话」→「麦克风」、首启向导后端慢启动竞态（App 门控 10 秒有限重试）。
+
+**为什么**：用户要求发布前准备——MIT 协议、整理卖点、确保所有功能跑通；用户明确「全量测试不等于所有功能跑通并且符合预期」，故设计 F01–F14 真实功能验收矩阵；卖点产出形式选「独立发布说明」；第三方许可说明选「需要」。旧 Setup 为 2026-10-31，HEAD 为 2026-11-07，已重建。
+
+**GN-004 审查记录**：首轮 f36603a0（警示放行/含 SOFT_BLOCK，已按人类裁决全部修正）；第二轮 5d560b47（警示放行）；第三轮 abbe3e4f（警示放行，F06 `decision`/兜底假通过口/F03 口径/F09 证据路径已修正）。三轮均无阻断。
+
+**未闭合项**：
+- Task 6 进行中：F02/F07/F12/F13 基础 API 已过（`logs/api_acceptance_basic.json` 25/25）；F03 本地承接、F04 TTS、F05 ASR、F06 turn_check 五枚举/重启保持待跑；F01/F08/F09/F11/F12 UI 截图待补；F14 安装/卸载待跑；跨机 CXFC/主观听感待标「当前不可判定」。
+- **Task 6.5 电脑控制屏幕/键鼠后端**：验收发现打包版 `ComputerControl` 未注入 `screen_backend`/`keyboard_backend`，`computer_screen_control`/`computer_keyboard_control` 恒 500，只有命令执行可用；用户 2026-11-21 裁决「实现」，详见 `.trae/documents/20261121_模块0_电脑控制屏幕键鼠后端.md`，明天继续。
+- 当前 `release/portable` 保留验收 junction（embedding/SenseVoice/voice/llama/nltk）与验收 config；**任何重建前必须先移除 junction**，否则会把开发资产卷入载荷。
+
+**接续入口**：明天从 Task 6.5 开始（实现 win_backends + 注入 + 单测 + 重建 + F10 实机），随后跑 F03-F06、UI 验收、F14 安装/卸载，最后 Task 7 收口（GN-004 + 人类 [V]）。执行顺序与台账见 `tasks.md`，验收口径见 `spec.md`。

@@ -9,6 +9,7 @@
 - list_tools 返回三工具描述（参数 / 返回 Schema 简版）。
 """
 
+import base64
 import json
 import sys
 
@@ -104,7 +105,10 @@ def test_execute_screen_success_fills_result(tmp_path):
     assert payload["success"] is True
     assert payload["tool"] == TOOL_SCREEN
     assert payload["action"] == "screenshot"
-    assert payload["result"] == b"\x89PNG\r\n\x1a\nfake-image"
+    # bytes 结果在接线层转 base64（JSON 可序列化；避免 json.dumps default=str
+    # 产出不可用的 "b'...'" 字符串）
+    assert payload["result"] == base64.b64encode(b"\x89PNG\r\n\x1a\nfake-image").decode("ascii")
+    assert payload["result_encoding"] == "base64"
 
 
 def test_execute_keyboard_success_fills_result(tmp_path):

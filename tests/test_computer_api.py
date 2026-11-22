@@ -8,6 +8,7 @@
 - POST /api/computer/call        未授权 403；授权后 mock backend 返回回填结果。
 """
 
+import base64
 import json
 import sys
 import threading
@@ -180,6 +181,22 @@ def test_computer_call_authorized_returns_result(computer_server):
     # GET status 复核授权已开启
     status, status_body = http_request(f"{base}/api/computer/status")
     assert status_body["authorized"] is True
+
+
+def test_computer_call_screen_returns_base64(computer_server):
+    """授权后截图 bytes 经接线层转 base64，HTTP JSON 可序列化。"""
+    base, _authorizer, _kb = computer_server
+    http_request(f"{base}/api/computer/authorize", payload={"enabled": True}, method="POST")
+
+    status, body = http_request(
+        f"{base}/api/computer/call",
+        payload={"tool": "computer_screen_control", "arguments": {"action": "screenshot"}},
+        method="POST",
+    )
+    assert status == 200
+    assert body["success"] is True
+    assert body["result_encoding"] == "base64"
+    assert base64.b64decode(body["result"]).startswith(b"\x89PNG\r\n\x1a\n")
 
 
 def test_computer_call_command_returns_output(computer_server):

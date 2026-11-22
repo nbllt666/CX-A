@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react';
 
 /**
  * Test1 · 首启向导（Task 8）。
@@ -186,20 +186,43 @@ describe('首启向导（SetupWizard / App 门控）', () => {
     expect(screen.queryByText(/还没有聊天记录/)).not.toBeInTheDocument();
   });
 
-  it('App 门控降级：status 请求失败 → 本次会话放行主界面，且下次启动仍会重新询问', async () => {
+  it('App 门控重试：后端慢启动（前两次拒绝、第三次成功）→ 仍展示向导', async () => {
+    vi.useFakeTimers();
+    fetchSetupStatusMock
+      .mockRejectedValueOnce(new Error('ECONNREFUSED'))
+      .mockRejectedValueOnce(new Error('ECONNREFUSED'))
+      .mockResolvedValue(STATUS_REQUIRED);
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
+
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+
+    expect(screen.getByText('欢迎来到 CX-A')).toBeInTheDocument();
+    expect(fetchSetupStatusMock).toHaveBeenCalledTimes(3);
+    vi.useRealTimers();
+  });
+
+  it('App 门控降级：status 持续失败 → 10 秒后本次会话放行主界面，且下次启动仍会重新询问', async () => {
+    vi.useFakeTimers();
     fetchSetupStatusMock.mockRejectedValue(new Error('ECONNREFUSED: backend not running'));
     // 主界面 ChatPage 不主动联网；仍兜底 stub fetch，避免其它组件触发未 mock 网络
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
 
     render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_500);
+    });
 
     // 放行主界面：聊天页空态可见（无空白页 / 无永久 loading）
-    expect(await screen.findByText(/还没有聊天记录/)).toBeInTheDocument();
+    expect(screen.getByText(/还没有聊天记录/)).toBeInTheDocument();
     expect(screen.queryByText('欢迎来到 CX-A')).not.toBeInTheDocument();
     // 降级只作用于本次会话：不得持久化「已跳过」标记（否则后端慢一拍会让向导永久消失）
     expect(window.localStorage.getItem('cx-a.setup.skipped')).toBeNull();
-    // 且下次挂载仍会重新询问后端（后端恢复后向导照常出现）
-    expect(fetchSetupStatusMock).toHaveBeenCalledTimes(1);
+    expect(fetchSetupStatusMock).toHaveBeenCalledTimes(20);
+    vi.useRealTimers();
+    // 下次挂载仍会重新询问后端（后端恢复后向导照常出现）
     cleanup();
     fetchSetupStatusMock.mockResolvedValue(STATUS_REQUIRED);
     render(<App />);

@@ -102,30 +102,34 @@ export default function App() {
     };
   }, []);
 
-  // 首启门控：问一次「要不要初始化」
+  // 首启门控：问「要不要初始化」
   //   wizard_required → 覆盖主界面展示向导；
   //   其余（completed）→ 正常主界面；
-  //   请求失败（后端未就绪 / 浏览器 dev）→ 本次会话降级放行进主界面，
-  //   绝不出现空白页 / 死循环 / 永久 loading，也不持久化跳过标记
-  //   （否则首启时后端慢一拍就会让向导永久消失）。
+  //   请求失败（后端冷启动未就绪 / 浏览器 dev）→ 有限重试 10 秒，仍失败才本次
+  //   会话降级放行进主界面，绝不出现空白页 / 死循环 / 永久 loading，也不持久化
+  //   跳过标记（否则首启时后端慢一拍就会让向导永久消失）。
+  //   20261121 修复：窗口先创建、后端并行拉起，首帧请求可能早于后端监听，
+  //   单次失败即放行会让全新安装在冷启动时稳定跳过向导（packaged E2E 实证）。
   useEffect(() => {
     if (gate !== 'checking') return;
     let alive = true;
     (async () => {
-      try {
-        const st = await fetchSetupStatus();
-        if (!alive) return;
-        setSetupStatus(st ?? null);
-        if (st?.wizard_required) {
-          setGate('wizard');
-        } else {
-          setGate('main');
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try {
+          const st = await fetchSetupStatus();
+          if (!alive) return;
+          setSetupStatus(st ?? null);
+          setGate(st?.wizard_required ? 'wizard' : 'main');
+          return;
+        } catch {
+          if (!alive) return;
+          // 后端尚未监听：等待 500ms 后重试（最多 10 秒），期间保持 loading
+          await new Promise((resolve) => setTimeout(resolve, 500));
         }
-      } catch {
-        if (!alive) return;
-        // 接口不可达：本次会话降级放行（不写持久标记），下次启动重新询问后端
-        setGate('main');
       }
+      if (!alive) return;
+      // 10 秒仍不可达：本次会话降级放行（不写持久标记），下次启动重新询问后端
+      setGate('main');
     })();
     return () => {
       alive = false;

@@ -1417,7 +1417,27 @@ def build_computer_deps(data_dir=None):
     data_dir = _resolve_data_dir(data_dir)
     os.makedirs(data_dir, exist_ok=True)
     authorizer = ControlAuthorizer(data_dir=data_dir)
-    computer = ComputerControl(authorized=authorizer.is_authorized())
+    # Windows 真实屏幕/键鼠后端（20261121_模块0_电脑控制屏幕键鼠后端）：
+    # 生产装配此前未注入，三个工具里只有 run_command 可用。导入/初始化失败
+    # 仅告警并保留 ComputerControl 默认安全占位（不阻断服务，不误触本机）。
+    computer_kwargs = {}
+    if sys.platform == "win32":
+        try:
+            from lite.computer_control.win_backends import (
+                WinKeyboardBackend,
+                WinScreenBackend,
+            )
+
+            computer_kwargs["screen_backend"] = WinScreenBackend()
+            computer_kwargs["keyboard_backend"] = WinKeyboardBackend()
+        except Exception as exc:  # noqa: BLE001 - 装配失败降级，不阻断服务
+            LOGGER.warning(
+                "电脑控制真实屏幕/键鼠后端装配失败，保留安全占位：%s",
+                exc,
+            )
+    computer = ComputerControl(
+        authorized=authorizer.is_authorized(), **computer_kwargs
+    )
     bridge = ToolBridge(computer=computer, authorizer=authorizer)
     return computer, authorizer, bridge
 

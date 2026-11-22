@@ -568,6 +568,41 @@ def test_build_assemble(tmp_path):
     # bootstrap 初始化产物：数据目录 + 默认 config
     assert os.path.isdir(os.path.join(portable_root, "data", "lancedb"))
     assert os.path.isfile(os.path.join(portable_root, "config.json"))
+    # 许可文件落位载荷根（installer.iss LicenseFile 来源）
+    license_out = os.path.join(portable_root, "LICENSE.txt")
+    assert os.path.isfile(license_out)
+    content = (tmp_path / "portable" / "LICENSE.txt").read_text(encoding="utf-8")
+    assert ("MIT License" in content) or ("Permission is hereby granted" in content)
+    # 默认桌宠模型的自定义许可随包落位
+    pet_license = os.path.join(portable_root, "PET_MODEL_LICENSE.md")
+    assert os.path.isfile(pet_license)
+    assert "CX-A 项目使用者" in (tmp_path / "portable" / "PET_MODEL_LICENSE.md").read_text(encoding="utf-8")
+
+
+def test_build_assemble_rejects_missing_license(tmp_path, monkeypatch):
+    """根 LICENSE 缺失时 assemble 必须 SystemExit 阻断，不产出无许可载荷。"""
+    from installer import build as build_mod
+
+    # 伪造 Electron 壳产物 + 后端产物（使流程能走到 LICENSE 检查）
+    electron_dist = tmp_path / "win-unpacked"
+    (electron_dist / "resources").mkdir(parents=True)
+    (electron_dist / "CX-A.exe").write_bytes(b"fake-exe")
+    (electron_dist / "resources" / "app.asar").write_bytes(b"fake-asar")
+
+    backend_dist = tmp_path / "backend-dist"
+    (backend_dist / "_internal").mkdir(parents=True)
+    (backend_dist / "backend.exe").write_bytes(b"fake-backend")
+    (backend_dist / "_internal" / "lib.dll").write_bytes(b"fake-dll")
+
+    # PROJECT_ROOT 指向不含 LICENSE 的临时根（仅放壳/后端所需目录结构）
+    fake_root = tmp_path / "fake-root"
+    fake_root.mkdir()
+    monkeypatch.setattr(build_mod, "PROJECT_ROOT", str(fake_root))
+
+    portable_root = str(tmp_path / "portable")
+    with pytest.raises(SystemExit):
+        build_mod.assemble(str(electron_dist), str(backend_dist), portable_root)
+    assert not os.path.isfile(os.path.join(portable_root, "LICENSE.txt"))
 
 
 def test_build_skip_electron_rejects_incomplete_artifacts(tmp_path, monkeypatch):

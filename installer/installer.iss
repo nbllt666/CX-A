@@ -49,6 +49,8 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
+; 安装向导展示 MIT 许可（由 build.py 组装载荷时从项目根 LICENSE 复制而来）
+LicenseFile={#PayloadDir}\LICENSE.txt
 SetupLogging=yes
 
 [Languages]

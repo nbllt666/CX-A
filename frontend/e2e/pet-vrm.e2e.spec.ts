@@ -250,8 +250,9 @@ test.describe.serial('VRM 桌宠渲染链路 E2E', () => {
       // （录音→识别→发送→朗读→表情/历史同步）由组件级单测 petoverlay-voice 覆盖。
       await expect(overlay.locator('.pet-overlay')).toHaveAttribute('data-talking', 'false');
 
-      // 六项菜单齐全（打开主窗口/说话/屏幕共享/操作授权/大小/关闭）
-      for (const name of ['说话', '屏幕共享', '操作授权', '大小', '关闭']) {
+      // 六项菜单齐全（打开主窗口/麦克风/屏幕共享/操作授权/大小/关闭）
+      // 注：语音按钮已于 20261006 由「说话」改名为「麦克风」（会话总开关）
+      for (const name of ['麦克风', '屏幕共享', '操作授权', '大小', '关闭']) {
         await expect(overlay.getByRole('button', { name })).toBeVisible();
       }
 

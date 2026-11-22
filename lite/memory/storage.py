@@ -421,9 +421,9 @@ class MemoryStore:
                 reactivated_count += 1
                 reactivation_sum += reac
             if self._is_permanent(mem):
-                # permanent 豁免：不参与时间衰减均值（对齐 CX-O 统计口径）
+                # permanent 豁免：不参与时间衰减均值，也不进入 healthy/fading/faded 三桶
+                # （对齐 CX-O 统计口径；曾误计 healthy 导致分布虚高，见 20261121_模块0_修复衰减统计永久记忆分桶）
                 permanent_count += 1
-                distribution["healthy"] += 1
                 continue
             time_score = calc.score(
                 importance=importance,
