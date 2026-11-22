@@ -257,29 +257,60 @@ def test_install_voice_dependencies_cuda_chain(tmp_path):
         and "https://pypi.tuna.tsinghua.edu.cn/simple" in cmd
         for cmd in calls
     )
+    # 20261122 实装修复：setuptools>=81 移除 pkg_resources，librosa 0.9.1 导入即失败
+    assert any("setuptools<81" in cmd for cmd in calls)
     # 随包源码：--no-deps 安装 bundled/melotts_src
     src = os.path.join(conda_runtime.BUNDLED_DIR, conda_runtime.MELOTTS_SRC_DIR_NAME)
     assert any("--no-deps" in cmd and src in cmd for cmd in calls)
 
 
 def test_install_voice_dependencies_cpu_chain_and_failure_tolerated(tmp_path):
-    """cpu 结论：不使用 cuda 专用源；单条失败仅记录 errors 不抛（不阻断）。"""
+    """cpu 结论：不使用 cuda 专用源；非 torch 命令失败仅记录 errors 不抛（不阻断）。"""
     root = str(tmp_path)
     _touch(conda_runtime.voice_env_python(root))
     calls = []
 
     def fake_runner(cmd):
-        """首条失败、其余成功，验证失败容忍口径。"""
+        """funasr 失败、其余成功，验证失败容忍口径（torch 成功不触发回退）。"""
         calls.append(list(cmd))
-        return (-1 if len(calls) == 1 else 0), "boom"
+        joined = " ".join(cmd)
+        return (1 if "funasr==1.4.16" in joined else 0), "boom"
 
     result = conda_runtime.install_voice_dependencies(root, "cpu", runner=fake_runner)
 
     assert result["installed"] is False
     assert result["reason"] == "partial-failure"
     assert len(result["errors"]) == 1
+    assert "funasr==1.4.16" in result["errors"][0]["command"]
+    assert result["fallbacks"] == []
     joined = " ".join(calls[0])
     assert "https://download.pytorch.org/whl/cpu" in joined
+
+
+def test_install_voice_dependencies_cuda_falls_back_to_mirror(tmp_path):
+    """cuda 官方源 SSL 失败：自动回退清华镜像 CPU torch/torchaudio，并跳过后续官方源命令。"""
+    root = str(tmp_path)
+    _touch(conda_runtime.voice_env_python(root))
+    calls = []
+
+    def fake_runner(cmd):
+        calls.append(list(cmd))
+        joined = " ".join(cmd)
+        if "download.pytorch.org/whl/cu128" in joined and "torch" in joined:
+            return 1, "SSL: UNEXPECTED_EOF_WHILE_READING"
+        return 0, "ok"
+
+    result = conda_runtime.install_voice_dependencies(
+        root, "cuda", cuda_version="13.4", channel="mirror", runner=fake_runner
+    )
+
+    assert result["installed"] is True
+    assert result["errors"] == []
+    assert len(result["fallbacks"]) == 2
+    assert any("torch" in cmd and "pypi.tuna.tsinghua.edu.cn" in " ".join(cmd) for cmd in calls)
+    assert any("torchaudio" in cmd and "pypi.tuna.tsinghua.edu.cn" in " ".join(cmd) for cmd in calls)
+    # 官方源只执行了首条 torch（torchaudio 被回退标记跳过）
+    assert sum(1 for cmd in calls if "download.pytorch.org/whl/cu128" in " ".join(cmd)) == 1
 
 
 def test_install_voice_dependencies_env_missing_skips(tmp_path, capsys):

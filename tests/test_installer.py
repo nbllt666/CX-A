@@ -1357,6 +1357,24 @@ def test_build_installer_compiles_with_defines(tmp_path, monkeypatch):
     assert cmd[-1].endswith("installer.iss")
 
 
+def test_installer_iss_payload_excludes_root_config_only():
+    """载荷 [Files] 仅排除顶层 config.json（前导 \\ 锚定源根）。
+
+    20261122 回归：`Excludes: "config.json"` 是无分隔符的文件名模式，Inno 会递归
+    命中 `data\\voices\\cx-open\\config.json`，安装版音色缺配置 → TTS 权重加载
+    219 维不匹配（503）。本用例锁定锚定写法，防止再次退化。
+    """
+    iss_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "installer",
+        "installer.iss",
+    )
+    with open(iss_path, "r", encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    payload_line = next(line for line in lines if 'Source: "{#PayloadDir}\\*"' in line)
+    assert r'Excludes: "\config.json,data\memories.db,logs"' in payload_line
+
+
 # ------------------------------------------------------------------ #
 # Task 3：ORT 包分叉（四类机器）/ 方案落盘（保守读改）/ 预热固定 CPU     #
 # ------------------------------------------------------------------ #

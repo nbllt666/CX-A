@@ -110,7 +110,7 @@ describe('AcpNodePage：节点互联视图', () => {
     expect(fetchMock.mock.calls.some(([u, i]) => String(u).includes('/api/acp/agents') && (i?.method ?? '') === 'POST')).toBe(false);
   });
 
-  it('远端列表加载失败：展示后端错误提示而非静默空列表（Issue1）', async () => {
+  it('远端列表 503：只展示友好引导，不暴露后端技术错误条（20261122 收口）', async () => {
     stubFetch([
       (url) => {
         if (url.includes('/api/acp/agents')) return { body: { status: 'success', agents: [LOCAL_AGENT], total: 1 } };
@@ -126,7 +126,11 @@ describe('AcpNodePage：节点互联视图', () => {
       },
     ]);
     render(<AcpNodePage />);
-    // 失败提示可见（含后端 message 关键词），而非静默空列表
-    await waitFor(() => expect(screen.getByText(/CXFC 未启用/)).toBeTruthy());
+    // 友好引导可见，后端技术错误原文不可见
+    await waitFor(() =>
+      expect(screen.getByText(/节点互联未开启——请到 设置 → ACP 节点互联 打开开关。/)).toBeTruthy(),
+    );
+    expect(screen.queryByText(/后端请求失败/)).toBeNull();
+    expect(screen.queryByText(/CXFC 未启用（设置页开启后可用）/)).toBeNull();
   });
 });

@@ -78,13 +78,24 @@ export default function AcpNodePage() {
     if (seq === msgSeq.current) setMessages(list);
   }, []);
 
-  /** 远端节点列表加载（挂载 / 添加后共用）：失败给用户明确提示而非静默空列表
-   *  （Issue1 修复——CXFC 未启用时后端 503 中文 message 直达用户） */
+  /** 远端节点列表加载（挂载 / 添加后共用）：失败给用户中文提示而非静默空列表。
+   *  20261122 收口：CXFC/ACP 未启用（503）时页面已有专门引导卡，不再把后端
+   *  技术错误原文（`后端请求失败: 503 ...`）叠加到 hint；其他错误也只给统一
+   *  中文提示，不暴露后端技术细节。 */
   const reloadRemoteNodes = useCallback(async () => {
     try {
       setRemoteNodes(await listCxfcRemoteNodes());
     } catch (err) {
-      setHint(err instanceof Error ? err.message : '远端插件节点加载失败，请确认已开启插件协议');
+      const raw = err instanceof Error ? err.message : '';
+      if (
+        raw.includes('cxfc_disabled') ||
+        raw.includes('acp_disabled') ||
+        raw.includes('503')
+      ) {
+        setHint('节点互联未开启——请到 设置 → ACP 节点互联 打开开关。');
+      } else {
+        setHint('远端插件节点加载失败，请稍后重试');
+      }
     }
   }, []);
 

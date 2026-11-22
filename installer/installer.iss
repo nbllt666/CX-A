@@ -63,10 +63,11 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 [Files]
 ; 便携载荷：壳 + 后端 + 随包资产（data/pet、data/voices 等）+ 语音桥脚本
 ; （runtime/voice_bridge/bridge.py 由 build.py 在组装便携根时落位）
-; Excludes：用户数据不入安装集——顶层 config.json（含云端 Key / 完成态）与
-; data/memories.db（记忆库）；升级重装不得覆盖既有用户数据，与 zip 口径一致
-; （首启由后端 auto-init 按默认值生成）。
-Source: "{#PayloadDir}\*"; DestDir: "{app}"; Excludes: "config.json,data\memories.db,logs"; Flags: recursesubdirs createallsubdirs ignoreversion
+; Excludes：用户数据不入安装集——**仅载荷顶层** config.json（前导 \ 锚定源根，
+; 否则无分隔符的文件名模式会递归命中 data\voices\cx-open\config.json，安装版音色
+; 缺配置将导致 TTS 权重加载 219 维不匹配）与 data/memories.db（记忆库）；升级重装
+; 不得覆盖既有用户数据，与 zip 口径一致（首启由后端 auto-init 按默认值生成）。
+Source: "{#PayloadDir}\*"; DestDir: "{app}"; Excludes: "\config.json,data\memories.db,logs"; Flags: recursesubdirs createallsubdirs ignoreversion
 ; 随包运行时源：安装期装配（内置 conda / MeloTTS 源码 / nltk 数据）读取此落点
 ; （conda_runtime.find_bundled_source 的第 2 候选：<root>/runtime/_bundled/<name>）
 Source: "{#BundledDir}\miniconda_installer.exe"; DestDir: "{app}\runtime\_bundled"; Flags: ignoreversion

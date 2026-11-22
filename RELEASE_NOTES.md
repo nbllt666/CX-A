@@ -1,6 +1,6 @@
 # CX-A v0.1.0 发布说明
 
-> 发布日期：2026-11-21 ｜ 版本：0.1.0 ｜ 适用平台：Windows x64
+> 发布日期：2026-11-22（最终安装包构建于 13:22） ｜ 版本：0.1.0 ｜ 适用平台：Windows x64
 
 **CX-A 是一款开箱即用、本地优先的桌面 AI**——聊天、语音、记忆与桌宠都在你自己的电脑上完成，重活再交给云端。
 
@@ -96,7 +96,7 @@
 ## 安装与首次启动
 
 1. **下载并安装**：运行 `CX-A-Setup-0.1.0.exe`，默认安装到用户目录，**无需管理员权限**；卸载走系统「应用和功能」。
-   - 安装阶段需要联网装配语音环境（Miniconda / conda / pip），耗时随网络状况变化；此为安装期依赖，装完后运行不再需要。
+   - 安装阶段需要联网装配语音环境（Miniconda / conda / pip），耗时随网络状况变化；此为安装期依赖，装完后运行不再需要。若 `download.pytorch.org` 不可达，安装器会自动回退到镜像安装 CPU 版 torch/torchaudio（功能可用，推理较慢）。
 2. **首次启动向导**：
    1. **硬件体检**：读取内存、显卡与磁盘，给出「跑得动本地模型」或「更适合云端」的推荐配置；
    2. **云端或本地**：选择把「思考」交给云端（填入服务商密钥），或后续使用本地模型；
@@ -109,24 +109,24 @@
 
 ## 验证结论
 
-以下为发布前功能验收矩阵。状态列将在 **Task 6 验收完成后逐项回填**（通过 / 失败 / 当前不可判定 + 证据路径）；**尚未验收的项目不视为通过**。
+以下为 2026-11-22 发布前功能验收结果（通过 / 当前不可判定 + 证据路径）。**未列证据的项目不视为通过**。
 
 | 编号 | 验收项 | 验收重点 | 状态 |
 |------|--------|---------|------|
-| F01 | 安装与首启向导 | 全新载荷启动出现向导；走完进入主界面；`config.setup.completed=true` | 待 Task 6 验收回填 |
-| F02 | 文字聊天与持久化 | 流式增量与完整回复；重启后 `GET /api/chat/history` 可见 | 待 Task 6 验收回填 |
-| F03 | 本地模式 | 响应 `offline: true` 且非固定兜底提示；有本地承接证据 | 待 Task 6 验收回填 |
-| F04 | TTS | `/api/voice/synthesize` 返回 200 且波形非静音 | 待 Task 6 验收回填 |
-| F05 | ASR | 中文 wav 经 `/api/voice/transcribe` 识别与原文一致 | 待 Task 6 验收回填 |
-| F06 | 语音交互模式 | vad/duplex 切换持久化；`turn_check` 返回 `decision` 五枚举 | 待 Task 6 验收回填 |
-| F07 | 记忆全链路 | 增删改查/衰减/3D 检索/日记；聊天自动注入检索结果 | 待 Task 6 验收回填 |
-| F08 | 桌宠 VRM | 悬浮窗出现、`data-vrm-state=ready`、菜单与滑块完整 | 待 Task 6 验收回填 |
-| F09 | 屏幕共享与视觉 | 截图尺寸达标、`visual_prefill` 生效、关闭主动视觉后无采样 | 待 Task 6 验收回填 |
-| F10 | 电脑控制 | 默认 403；授权后只读工具成功；危险操作需确认 | 待 Task 6 验收回填 |
-| F11 | 设置页 | 密钥脱敏、下载线路、模型档位、语音加速、人设、桌宠模型 | 待 Task 6 验收回填 |
-| F12 | 管理面 | 连点 5 次进入 FleetPage；台账/登记/探测/治理 API 与鉴权 | 待 Task 6 验收回填 |
-| F13 | ACP/CXFC | 默认关闭零网络行为；开启后 stats/plugins 可用 | 待 Task 6 验收回填 |
-| F14 | 安装程序 | 可安装、关键文件落位、可卸载 | 待 Task 6 验收回填 |
+| F01 | 安装与首启向导 | 全新载荷启动出现向导；走完进入主界面；`config.setup.completed=true` | 通过（最终构建 packaged E2E 2 passed，`logs/e2e_packaged_release_prep_2.log`） |
+| F02 | 文字聊天与持久化 | 流式增量与完整回复；重启后 `GET /api/chat/history` 可见 | 通过（`logs/api_acceptance_basic_final.json`） |
+| F03 | 本地模式 | 响应 `offline: true` 且非固定兜底提示；有本地承接证据 | 通过（`logs/api_acceptance_local_final.json`） |
+| F04 | TTS | `/api/voice/synthesize` 返回 200 且波形非静音 | 通过（peak 0.6729 / rms 0.1206 / 1.88s） |
+| F05 | ASR | 中文 wav 经 `/api/voice/transcribe` 识别与原文一致 | 通过（逐字一致「你好呀，今天心情怎么样？」） |
+| F06 | 语音交互模式 | vad/duplex 切换持久化；`turn_check` 返回 `decision` 五枚举 | 通过（5 条真实判定，3 条非 CONTINUE；重启保持 duplex） |
+| F07 | 记忆全链路 | 增删改查/衰减/3D 检索/日记；聊天自动注入检索结果 | 通过（CRUD/检索/衰减/3D/日记通过；聊天注入实测回复 `CXA-MEMO-2026`，`logs/f07_memory_injection.log`） |
+| F08 | 桌宠 VRM | 悬浮窗出现、`data-vrm-state=ready`、菜单与滑块完整 | 通过（packaged VRM ready + source E2E 六菜单/滑块 + UI 截图） |
+| F09 | 屏幕共享与视觉 | 截图尺寸达标、`visual_prefill` 生效、关闭主动视觉后无采样 | 通过（prefilled=true；描述命中 3 个屏幕要素；30s 队列为空；`logs/visual_acceptance.log`） |
+| F10 | 电脑控制 | 默认 403；授权后只读工具成功；危险操作需确认 | 通过（API 点击+输入读回标记；截图 base64；撤销后 403；`logs/api_keyboard_final.log`） |
+| F11 | 设置页 | 密钥脱敏、下载线路、模型档位、语音加速、人设、桌宠模型 | 通过（`.screenshots/release_ui/release_ui_settings*.png`） |
+| F12 | 管理面 | 连点 5 次进入 FleetPage；台账/登记/探测/治理 API 与鉴权 | 通过（`release_ui_fleet.png` + 台账 API 200） |
+| F13 | ACP/CXFC | 默认关闭零网络行为；开启后 stats/plugins 可用 | 通过（默认 503 + 开启 200；跨机调用当前不可判定） |
+| F14 | 安装程序 | 可安装、关键文件落位、可卸载 | 通过（全新安装 exit 0；`data/voices/cx-open` 的 `config.json`+`ckpt.txt` 落位；`dependencies_installed=true`、`tts_warmed=true`、`errors=[]`；安装版 TTS 200（peak 0.6816 / rms 0.1215 / 1.89s）+ ASR 200；卸载 `Removed all? Yes`；`logs/f14_evidence/install_release2.log`、`provision_release2.log`、`install_report_release2.json`、`installed_voice_release2.log`、`uninstall_release2.log`） |
 
 ---
 
@@ -136,7 +136,7 @@
 2. **本地模式语音会话会携带本机截图**：按设计，本地模式下语音会话会向本地模型传入一帧本机截图（视觉语音融合）；该行为不受 `vision.enabled` 控制，`vision.enabled` 控制的是主动视觉采样。
 3. **本地模型需下载**：本地模型为可选组件，默认不随安装包附带，需在向导或设置页按档位下载（主模型约 2.9～6.6GB + 看图组件约 0.92GB）。
 4. **跨机 CXFC 需第二台机器**：跨机节点互联需要另一台机器运行对端实例，单机无法验证。
-5. **安装期需网络**：语音环境（conda / pip 依赖）在安装阶段联网装配，离线环境无法完成该步骤。
+5. **安装期需网络**：语音环境（conda / pip 依赖）在安装阶段联网装配，离线环境无法完成该步骤。`torch/torchaudio` 默认从 `download.pytorch.org` 拉取；若该域名被网络策略拦截，安装器会自动回退到清华镜像安装 CPU 版（功能可用、推理较慢）。若镜像也不可达，安装器主体仍可用，但语音合成/识别会在依赖补齐前不可用（详见安装目录 `data/install_report.json`）。
 6. **仅支持 Windows x64**：本版本不提供其他平台安装包。
 
 ---

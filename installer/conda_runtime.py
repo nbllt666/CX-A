@@ -302,6 +302,12 @@ VOICE_MELOTTS_PACKAGES = (
     "g2pkk>=0.1.1",
     "gruut[de,es,fr]==2.2.3",
     "six",
+    # —— 20261122 实装修复：setuptools>=81 移除 ``pkg_resources``，而 librosa 0.9.1
+    #    （MeloTTS 官方硬约束）仍在 ``librosa/util/files.py`` 顶层
+    #    ``from pkg_resources import resource_filename`` → 导入即
+    #    ``ModuleNotFoundError``，安装期 TTS 预热与首次合成同时失败。
+    #    钉 <81 保证 pkg_resources 存在（本机实测 80.10.2 正常）。
+    "setuptools<81",
     # —— TTS ORT 加速（2026-10-01）：``ml_dtypes==0.5.4`` 钉版兼容 numpy 1.26.4
     #    （0.6.x 要求 numpy>=2，会诱发 resolver 升级 numpy）。
     #    ORT 变体包（onnxruntime / -gpu / -directml）**不再硬编码**于此——改由
@@ -324,6 +330,17 @@ VOICE_SKIPPED_PACKAGES = ("llama-cpp-python",)
 #: MeloTTS 随包源码目录名（``bundled/`` 下）；``--no-deps`` 安装以跳过其
 #: requirements 里的日语/多语言重链（Windows 上部分包无轮子且中文链路用不到）。
 MELOTTS_SRC_DIR_NAME = "melotts_src"
+
+
+def _is_official_torch_command(command_line):
+    """是否为 pytorch 官方轮子源的 torch/torchaudio 安装命令。"""
+    lower = command_line.lower()
+    return (
+        command_line.startswith("pip install ")
+        and "torch" in lower
+        and "llama" not in lower
+        and "download.pytorch.org" in lower
+    )
 
 
 def rewrite_pip_command(command_line, env_python):
@@ -432,10 +449,15 @@ def install_voice_dependencies(root, recommend, cuda_version=None, channel=None,
         )
 
     exec_runner = runner or default_runner
-    executed, errors = [], []
+    executed, errors, fallbacks = [], [], []
+    torch_fallback_done = False
     for command_line in commands:
         if command_line.startswith("#"):
             _log_info(f"[语音依赖] {command_line.lstrip('# ')}")
+            continue
+        # 官方源 torch 已回退镜像：跳过后续同源命令，避免重复失败/覆盖
+        if torch_fallback_done and _is_official_torch_command(command_line):
+            _log_info(f"[语音依赖] 已使用镜像回退，跳过官方源命令：{command_line}")
             continue
         argv = rewrite_pip_command(command_line, python)
         if argv is None:
@@ -443,6 +465,37 @@ def install_voice_dependencies(root, recommend, cuda_version=None, channel=None,
         _log_info(f"[语音依赖] 正在执行：{command_line}")
         returncode, output = exec_runner(argv)
         executed.append(command_line)
+        if returncode != 0 and _is_official_torch_command(command_line):
+            if not torch_fallback_done:
+                torch_fallback_done = True
+                fallback_index = bootstrap.pip_index_url("mirror") or ""
+                fallback_ok = True
+                for pkg in ("torch", "torchaudio"):
+                    fallback_cmd = (
+                        f"pip install {pkg} -i {fallback_index}"
+                        if fallback_index
+                        else f"pip install {pkg}"
+                    )
+                    argv_fb = rewrite_pip_command(fallback_cmd, python)
+                    if argv_fb is None:
+                        continue
+                    _log_warn(f"[语音依赖] 官方源失败，尝试镜像回退：{fallback_cmd}")
+                    rc, out = exec_runner(argv_fb)
+                    executed.append(fallback_cmd)
+                    fallbacks.append(fallback_cmd)
+                    if rc != 0:
+                        fallback_ok = False
+                        errors.append(
+                            {"command": fallback_cmd, "returncode": rc, "output": (out or "")[-500:]}
+                        )
+                if fallback_ok:
+                    _log_info("[语音依赖] 镜像回退成功（CPU 版 torch/torchaudio）")
+                    continue
+            _log_warn(f"[语音依赖] 命令执行失败（不阻断主安装）：{command_line}")
+            errors.append(
+                {"command": command_line, "returncode": returncode, "output": (output or "")[-500:]}
+            )
+            continue
         if returncode != 0:
             _log_warn(f"[语音依赖] 命令执行失败（不阻断主安装）：{command_line}")
             errors.append(
@@ -454,7 +507,7 @@ def install_voice_dependencies(root, recommend, cuda_version=None, channel=None,
     return {
         "installed": installed, "skipped": False,
         "reason": "" if installed else ("partial-failure" if executed else "no-commands"),
-        "commands": executed, "errors": errors,
+        "commands": executed, "errors": errors, "fallbacks": fallbacks,
         "ort_package": bootstrap.resolve_ort_package(ort_profile),
     }
 

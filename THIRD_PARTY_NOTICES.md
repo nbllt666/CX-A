@@ -41,7 +41,7 @@
 | llama.cpp（Vulkan 构建） | b11391（与 CUDA 构建同版本）；`bundled/llama_cpp_vulkan` → `runtime/llama_vulkan` | MIT | 随包（安装期落位） | 使用用户系统的 Vulkan 驱动/加载器，未随包分发显卡驱动 |
 | Qwen3-Embedding-0.6B（GGUF Q8_0） | `Qwen3-Embedding-0.6B-Q8_0.gguf`（639,150,592 字节）；https://huggingface.co/Qwen/Qwen3-Embedding-0.6B | Apache-2.0 | 随包（安装期落位 `data/local_llm/qwen3-embedding-0.6b`） | 1024 维；由 `runtime/llama/llama-server.exe` 的 `/v1/embeddings` 提供；以模型卡为准 |
 | MeloTTS（源码） | MyShell.ai；https://github.com/myshell-ai/MeloTTS | MIT | 随包（`bundled/melotts_src`，安装期 `pip install --no-deps` 装入 voice env） | 声明基于 Coqui TTS / VITS / Bert-VITS2 改写，衍生权利以 MeloTTS 仓库声明为准 |
-| 默认音色 auto_DS-008（cx-open） | 项目训练产物：`bundled/melotts/ckpt.txt`（622,848,775 字节）+ `config.json`（DS-008/1 speaker）；另含 `bundled/tts_onnx/*.onnx` 导出 | 项目训练/提供，**不宣称 MIT** | 随包（组装期拷入载荷 `data/voices/cx-open`） | 版权、训练数据（DS-008）与权重再分发权利由项目方确认；ONNX 导出资产权利与权重同源 |
+| 默认音色 auto_DS-008（cx-open） | 项目训练产物：`bundled/melotts/ckpt.txt`（622,848,775 字节）+ `config.json`（DS-008/1 speaker）；另含 `bundled/tts_onnx/*.onnx` 导出 | 项目训练/提供，**不宣称 MIT**；项目方已确认有权随 CX-A 项目（含安装包）再分发（2026-11-22） | 随包（组装期拷入载荷 `data/voices/cx-open`） | ONNX 导出资产权利与权重同源；本项不再列为待确认风险 |
 | SenseVoiceSmall | FunASR / 通义实验室；本地模型卡 `data/SenseVoiceSmall/README.md`；https://huggingface.co/FunAudioLLM/SenseVoiceSmall | Apache-2.0 | 随包（安装期落位 `data/SenseVoiceSmall`，约 896 MB） | 含 `model.pt`、`config.yaml`、BPE 词表等；以模型卡为准 |
 | NLTK 数据（cmudict、averaged_perceptron_tagger、averaged_perceptron_tagger_eng） | NLTK data；`bundled/nltk_data` | 各自许可：cmudict 为 CMUdict（BSD 风格）；两个 tagger 为 Apache-2.0 | 随包（安装期拷入 `data/nltk_data`） | 各包许可见 https://www.nltk.org/nltk_data/ 与包内 README |
 | Miniconda 安装器 | `miniconda_installer.exe`（132,526,808 字节） | BSD-3-Clause（conda/安装器）；Anaconda 默认源另受 Anaconda 服务条款约束 | 随包（安装期静默安装至 `runtime/conda`） | 语音环境经 `--override-channels -c 清华 anaconda 镜像` 创建，镜像内容属 Anaconda 默认源，受 Anaconda ToS 约束 |
@@ -55,7 +55,7 @@
 | 组件 | 版本 / 来源 | 许可类型 | 分发形态 | 备注 |
 |------|------------|---------|---------|------|
 | conda 基础包（`python=3.10` 及依赖） | 清华 anaconda 镜像（`--override-channels`，不读用户 `.condarc`）；落 `runtime/voice` | 各包各自许可；Anaconda 默认源另受 Anaconda ToS 约束 | 安装期装配 | 版本随镜像上游变化，不锁清单 |
-| pip 依赖包（GPU 自动分叉） | `torch`/`torchaudio`（pytorch 官方 cu128 或 cpu 轮子）、`onnxruntime`/`onnxruntime-gpu`/`onnxruntime-directml`、`llama-cpp-python`、`funasr`、`modelscope`、`transformers`、`tokenizers`、`jieba` 等 | 各自许可（常见：torch/torchaudio 为 BSD 系；onnxruntime、llama-cpp-python、funasr 等以各自仓库 LICENSE 为准；transformers/tokenizers 为 Apache-2.0） | 安装期装配 | 以 PyPI 包元数据与上游仓库为准；不在此逐项固定版本 |
+| pip 依赖包（GPU 自动分叉） | `torch`/`torchaudio`（pytorch 官方 cu128；官方源不可达时回退清华镜像安装 CPU 版）、`onnxruntime`/`onnxruntime-gpu`/`onnxruntime-directml`、`funasr`、`modelscope`、`transformers`、`tokenizers`、`jieba` 等 | 各自许可（常见：torch/torchaudio 为 BSD 系；onnxruntime、funasr 等以各自仓库 LICENSE 为准；transformers/tokenizers 为 Apache-2.0） | 安装期装配 | 以 PyPI 包元数据与上游仓库为准；不在此逐项固定版本。`llama-cpp-python` **不安装**（Windows 长路径限制），运行期改用随包 llama.cpp 预编译二进制 |
 | MeloTTS 官方中文权重 | HuggingFace `myshell-ai/MeloTTS-Chinese` | 以 HF 模型卡为准（不在此断言为 MIT） | 安装期装配（预热缓存 `data/hf_cache`，约 1.5 GB 含 BERT） | 仅当本地音色权重不可用时的官方权重；本项目默认音色为项目训练产物 |
 | BERT 中文权重 | HuggingFace `hfl/chinese-roberta-wwm-ext-large` | Apache-2.0（以 HF 模型卡为准） | 安装期装配 | MeloTTS 中文链路依赖 |
 | MeloTTS 其他语种官方权重 | `myshell-ai/MeloTTS-*`（首次按语种合成时下载） | 以 HF 模型卡为准 | 安装期/运行期下载 | 不随包 |
@@ -103,7 +103,7 @@
 | 事项 | 现状 | 处理方式 |
 |------|------|---------|
 | 默认 VRM 素材再分发 | 原元数据为 `Redistribution_Prohibited`，与随包公开发布冲突 | **已处理（2026-11-21）**：项目方（author=nbllt666）裁决“授权给使用本项目的所有人，禁止除此以外的用途”；VRM meta 已改为 `allowedUserName=Everyone` / `licenseName=Other`，并新增根 `PET_MODEL_LICENSE.md` 与载荷随装副本；发布前确认该 URL 在公开仓库可达 |
-| 默认音色 auto_DS-008 权利 | 项目训练产物，训练数据 DS-008 来源与权重再分发权利未在仓库内声明 | 本文件不宣称 MIT；由项目方确认并补充书面说明 |
+| 默认音色 auto_DS-008 权利 | 项目训练产物 | **已确认（2026-11-22）**：项目方确认有权随 CX-A 项目（含安装包）再分发；本文件不宣称 MIT，具体权利以项目方确认为准 |
 | MeloTTS 官方权重许可 | 仓库未附模型卡许可声明 | 标注“以 HF 模型卡为准”，未断言具体许可 |
 | NVIDIA CUDA 运行时再分发 | 具体条款随 CUDA EULA 版本变化 | 附官方 EULA 链接，未转述条款细节 |
 | Gemma 4 版本与条款 | 上游仓库与 Gemma Terms 可能更新 | 标注 Gemma Terms of Use 并附链接；未写 MIT/Apache |

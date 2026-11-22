@@ -1,5 +1,8 @@
 # current-note — fix-local-mode-and-pet-ux
 
+> 当前活跃变更：**prepare-public-release（20261121）**，交接与状态见文末「发布前准备」段。
+> 以下为历史变更归档，仅供追溯。
+
 ## 做到哪了
 
 Task 0 完成（变更文档 + 本 note 已创建）；Task 1-6 未开始。
@@ -210,9 +213,19 @@ Task 0 完成（变更文档 + 本 note 已创建）；Task 1-6 未开始。
 
 **GN-004 审查记录**：首轮 f36603a0（警示放行/含 SOFT_BLOCK，已按人类裁决全部修正）；第二轮 5d560b47（警示放行）；第三轮 abbe3e4f（警示放行，F06 `decision`/兜底假通过口/F03 口径/F09 证据路径已修正）。三轮均无阻断。
 
-**未闭合项**：
-- Task 6 进行中：F02/F07/F12/F13 基础 API 已过（`logs/api_acceptance_basic.json` 25/25）；F03 本地承接、F04 TTS、F05 ASR、F06 turn_check 五枚举/重启保持待跑；F01/F08/F09/F11/F12 UI 截图待补；F14 安装/卸载待跑；跨机 CXFC/主观听感待标「当前不可判定」。
-- **Task 6.5 电脑控制屏幕/键鼠后端**：验收发现打包版 `ComputerControl` 未注入 `screen_backend`/`keyboard_backend`，`computer_screen_control`/`computer_keyboard_control` 恒 500，只有命令执行可用；用户 2026-11-21 裁决「实现」，详见 `.trae/documents/20261121_模块0_电脑控制屏幕键鼠后端.md`，明天继续。
-- 当前 `release/portable` 保留验收 junction（embedding/SenseVoice/voice/llama/nltk）与验收 config；**任何重建前必须先移除 junction**，否则会把开发资产卷入载荷。
+**未闭合项（2026-11-22 14:00 更新）**：
+- **F01-F13 已全部通过**：F02/F07/F12/F13 + F03/F04/F05/F06 的 API 证据；F01 最终构建 packaged E2E 2 passed；F08/F09/F10/F11/F12 UI/视觉/键鼠截图与实测；F10 电脑控制屏幕/键鼠后端已实现并通过打包态 API 验收（`logs/api_keyboard_final.log`）。
+- **F14 已通过**（最终产物 2,946,528,675 B @ 2026-11-22 13:22:07）：全新安装到 `release/installed_release2`，`data/voices/cx-open` 的 `config.json`+`ckpt.txt` 落位；`dependencies_installed=true`、`tts_warmed=true`、`errors=[]`；安装版 TTS 200（peak 0.6816/rms 0.1215/1.89s）+ ASR 200 逐字一致；卸载 `Removed all? Yes`。证据 `logs/f14_evidence/`。
+- 人类「要求修正」已落地：torch 官方源失败 → 清华镜像 CPU 回退（两次全新安装均实际触发并成功）；节点页 503 技术错误条收口；不可判定项保持不动。
+- 复验另暴露并修复两处安装链缺陷：Inno `Excludes` 递归误伤音色 `config.json`；`setuptools>=81` 移除 `pkg_resources` 导致 librosa 导入失败（已钉 `<81`）。
+- `release/portable` 验收 junction 与验收 config 已清理，重建后无 junction；安装包 SHA256 `5341F0F8...94CE`。
+- 跨机 CXFC、真实麦克风手感、主观听感、中文 IME 直输仍为「当前不可判定」，移交人类日常使用。
 
-**接续入口**：明天从 Task 6.5 开始（实现 win_backends + 注入 + 单测 + 重建 + F10 实机），随后跑 F03-F06、UI 验收、F14 安装/卸载，最后 Task 7 收口（GN-004 + 人类 [V]）。执行顺序与台账见 `tasks.md`，验收口径见 `spec.md`。
+**F14 结论（2026-11-22 14:00，最终复验）**：安装/核心文件落位/安装版启动/运行期依赖装配/TTS/ASR/卸载全部通过；`dependencies_installed=true`、`tts_warmed=true`、`errors=[]`；原始证据 `logs/f14_evidence/`。F01-F14 全部通过，Task 6 闭合。
+
+**GN-004 交付审查记录**：
+- 第一轮 c573c017：警示放行，含 SOFT_BLOCK SB-B（F14 证据随临时目录删除、卸载无独立日志）。已按人类裁决「重跑并留原始证据」重装/卸载，证据落 `logs/f14_evidence/`。
+- 第二轮 bfabfa5e：**警示放行，无阻断、无 SOFT_BLOCK**。O1 状态滞后与 O3/O4/O5 证据簿记已修正；O7 portable junction 已移除；O2 文档未提交待人类决定；O6 运行期装配网络限制须人类知情接受。
+- 第三轮（修正后复审）d8402d35-1a1f-4ec4-b6dd-2da7217ab56b：**警示放行，无阻断、无 SOFT_BLOCK**。W1 spec 交接段、W2 checklist 产物数字、W3 变更文档 status、W4 全量回归日志（1655 passed / 1 skipped，`logs/pytest_release_final.log`）均已修正；O1/O2/O5/O7/O8 已处理；复审新增 R1（`.prev.exe` 哈希/后端构建时点）与 R2（交接措辞）亦已修正；O3/O4/O6/O9 登记为观察项。待人类 [V] 最终裁决。
+
+**接续入口**：待 GN-004 交付前复审 + 人类 [V] 裁决（批准发布 / 要求修正 / 暂停）；文档改动按人类此前选择「提交不推送」执行。执行顺序与台账见 `tasks.md`。
