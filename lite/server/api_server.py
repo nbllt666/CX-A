@@ -107,6 +107,19 @@ CXFC relay 前端转接（Task H1，对齐 C:\\CX-O\\docs\\CXFC开发文档.md �
     POST   /api/setup/model/cancel      取消下载（保留 .tmp 供断点续传）
     以上端点沿用既有 Host / 令牌校验，**不新增豁免端点**。
 
+梦话双 LLM 梦境（20261127 迁移自 CX-O dreamtalk，spec: migrate-dreamtalk-dreams）：
+    GET    /api/dreamtalk/health                服务状态（未装配/禁用也 200，返回 disabled 口径）
+    POST   /api/dreamtalk/sessions              入睡（body 仅 {mode}；素材只能来自本机记忆）
+    GET    /api/dreamtalk/sessions              最近会话（?limit=；不含回合）
+    GET    /api/dreamtalk/sessions/{id}         梦境档案（含全部回合）
+    POST   /api/dreamtalk/sessions/{id}/message 醒者插话 / 继续做梦（body {content?}）
+    POST   /api/dreamtalk/sessions/{id}/wake    醒来并生成摘要（重复醒来 409）
+    GET    /api/dreamtalk/sessions/{id}/recall  单场清醒摘要（不含回合）
+    GET    /api/dreamtalk/recall                最近清醒摘要列表（不含回合）
+    GET    /api/dreamtalk/config                读取 dreamtalk 配置段（16 键）
+    PUT    /api/dreamtalk/config                深度合并更新并落盘（非法 422）
+    全部端点走独立 _dream_lock（不落 _state_lock），并沿用既有 Host / 令牌闸。
+
 > 管理面已收敛为纯 API：前端不再路由 Agents/Remote/Status，管理能力以上述端点
 > + /api/agents、/api/remote/* 外露，供另一 Agent 或管理工具调用。
 
@@ -281,6 +294,9 @@ def _serialize_request(method):
             lock = self._tts_lock
         elif self.command == "POST" and path == "/api/voice/transcribe":
             lock = self._asr_lock
+        elif path.startswith("/api/dreamtalk/"):
+            # 梦境独立锁（20261127）：梦境生成耗时长，不得落默认 _state_lock 饿死状态端点
+            lock = self._dream_lock
         else:
             lock = self._state_lock
         # Model replacement must not close a runtime serving an active stream.
@@ -1511,6 +1527,7 @@ def make_handler(
     computer=None, authorizer=None, bridge=None, config=None,
     registry=None, distiller=None, voice=None, cxfc=None, chat_cloud=None,
     chat_fallback=None, download_manager=None, vision_pipeline=None,
+    dreamtalk=None,
 ):
     """基于指定依赖构建处理器类（闭包绑定 store / pipeline / manager / remote / computer，便于测试隔离）。
 
@@ -1552,6 +1569,11 @@ def make_handler(
             **注入实例同样由本函数启动 tick 线程**（测试注入 mock 后端管线
             验证 capture 计数 / 线程存活）；装配失败仅告警置 None（视觉不阻断
             服务启动），线程对象经 handler 类属性 ``_vision_thread`` 透出。
+        dreamtalk: 可选梦境运行态（``lite.dreamtalk.wiring.DreamTalkRuntime``，20261127
+            迁移自 CX-O dreamtalk）。缺省按 config / store / chat_cloud 构造默认运行态；
+            运行态**按需建库**（首次梦境请求才落 ``<data_dir>/dreamtalk.db``），装配失败
+            仅告警并置 None——``/api/dreamtalk/*`` 除 health 外回 503，不影响其他端点。
+            测试可注入替身（如 ``llm_client=MockLLMClient()`` 的运行态）。
     """
     if manager is None:
         manager = AgentManager()
@@ -1631,6 +1653,8 @@ def make_handler(
     chat_lock = threading.RLock()
     tts_lock = threading.RLock()
     asr_lock = threading.RLock()
+    #: 梦境独立锁（20261127）：梦境生成可能耗时数十秒，绝不能落默认 _state_lock
+    dream_lock = threading.RLock()
     _resolved_chat_fallback = chat_fallback
     if _resolved_chat_fallback is None:
         try:
@@ -1647,6 +1671,28 @@ def make_handler(
                 "离线兜底管理器装配失败（%s）：%s", exc.__class__.__name__, exc
             )
             _resolved_chat_fallback = None
+    # 20261127 梦话梦境（N8 语义延续）：仅对显式为 None 的梦境运行态回落默认装配。
+    # 运行态首次请求才建库；装配失败只告警置 None（/api/dreamtalk/* 除 health 外 503）。
+    _resolved_dreamtalk = dreamtalk
+    if _resolved_dreamtalk is None:
+        try:
+            from lite.dreamtalk.wiring import build_dreamtalk_runtime
+
+            _resolved_dreamtalk = build_dreamtalk_runtime(
+                config,
+                store,
+                getattr(pipeline, "manager", None),
+                cloud=chat_cloud,
+                local_llm=_local_holder.get,
+                data_dir=default_data_dir,
+                # 配置落盘复用模块级写锁（与 /api/settings 等调用点串行化）
+                write_lock=_CONFIG_WRITE_LOCK,
+            )
+        except Exception as exc:  # noqa: BLE001 - 梦境装配失败不得拖垮服务启动
+            LOGGER.warning(
+                "梦境运行态装配失败（/api/dreamtalk/* 将回 503）：%s", exc
+            )
+            _resolved_dreamtalk = None
     # Task 6（N8 语义延续）：仅对显式为 None 的下载管理器回落默认构建。写锁显式传入
     # 本模块的 _CONFIG_WRITE_LOCK——请求线程与下载线程共用同一把，串行化 config.save()。
     if download_manager is None:
@@ -1795,6 +1841,8 @@ def make_handler(
         _chat_lock = chat_lock
         _tts_lock = tts_lock
         _asr_lock = asr_lock
+        _dreamtalk = _resolved_dreamtalk
+        _dream_lock = dream_lock
 
         # ------------------------------------------------------------ 底层工具
         def log_message(self, fmt, *args):
@@ -1867,6 +1915,25 @@ def make_handler(
         def _deny_bad_host(self):
             """Host 校验失败的统一 403 响应。"""
             self._send_json({"ok": False, "error": "forbidden", "message": "Host 校验失败：拒绝访问"}, 403)
+
+        def _handle_dreamtalk(self, method, path, query=None):
+            """``/api/dreamtalk/*`` 统一分发（20261127 迁移自 CX-O dreamtalk）。
+
+            薄适配层：路径剥前缀 + 读体 + 调 ``lite.dreamtalk.http_api.handle``；
+            请求校验、领域异常到状态码映射、响应序列化全部在 http_api 内完成，
+            本方法不读取 config（配置只经 wiring 产出）。
+            """
+            from lite.dreamtalk import http_api
+
+            subpath = path[len("/api/dreamtalk"):]
+            body = {} if method == "GET" else self._read_body_json()
+            if body is None:
+                self._reject_bad_json()
+                return
+            status, payload = http_api.handle(
+                self._dreamtalk, method, subpath, query or {}, body
+            )
+            self._send_json(payload, status)
 
         def _guard_internal_error(self, exc):
             """全局异常兜底：回结构化 500，确保畸形输入不致连接中断。
@@ -3475,6 +3542,11 @@ def make_handler(
             try:
                 query = self._parse_query()
 
+                # 梦话梦境（20261127）：/api/dreamtalk/* 走独立分发与独立锁
+                if path.startswith("/api/dreamtalk/"):
+                    self._handle_dreamtalk("GET", path, query)
+                    return
+
                 if path == "/api/health":
                     self._send_json({"status": "ok"})
                     return
@@ -3612,6 +3684,10 @@ def make_handler(
                 if path != "/api/admin/register" and not self._check_token():
                     return
             try:
+                # 梦话梦境（20261127）：/api/dreamtalk/* 走独立分发与独立锁
+                if path.startswith("/api/dreamtalk/"):
+                    self._handle_dreamtalk("POST", path)
+                    return
                 if path == "/api/chat/messages":
                     self._handle_chat_send_guard()
                     return
@@ -3774,6 +3850,10 @@ def make_handler(
                     return
                 if path == "/api/settings":
                     self._handle_settings_update()
+                    return
+                # 梦话梦境配置（20261127）：PUT /api/dreamtalk/config
+                if path.startswith("/api/dreamtalk/"):
+                    self._handle_dreamtalk("PUT", path)
                     return
                 # 记忆编辑（20261005）：PUT /api/memories/{id}
                 if path.startswith("/api/memories/"):

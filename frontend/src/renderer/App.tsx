@@ -9,6 +9,7 @@ import ChatPage from './pages/ChatPage';
 import PetPage from './pages/PetPage';
 import MemoriesPage from './pages/MemoriesPage';
 import SettingsPage from './pages/SettingsPage';
+import DreamPage from './pages/DreamPage';
 import SetupWizard from './pages/SetupWizard';
 import FleetPage from './pages/FleetPage';
 import AcpNodePage from './pages/AcpNodePage';
@@ -24,9 +25,17 @@ import { usePetEnabled } from './hooks/usePetEnabled';
  *
  * `setup` = 首启向导（首次启动覆盖主界面，或从设置页 / `#/setup` 深链重入）。
  */
-export type View = 'chat' | 'pet' | 'memories' | 'settings' | 'setup' | 'fleet' | 'nodes';
+export type View =
+  | 'chat'
+  | 'dream'
+  | 'pet'
+  | 'memories'
+  | 'settings'
+  | 'setup'
+  | 'fleet'
+  | 'nodes';
 
-const VIEWS: View[] = ['chat', 'pet', 'memories', 'settings', 'setup', 'fleet', 'nodes'];
+const VIEWS: View[] = ['chat', 'dream', 'pet', 'memories', 'settings', 'setup', 'fleet', 'nodes'];
 
 /**
  * 首启门控状态：
@@ -114,16 +123,19 @@ export default function App() {
     if (gate !== 'checking') return;
     let alive = true;
     (async () => {
-      for (let attempt = 0; attempt < 20; attempt += 1) {
+      // 用「截止时间」而不是固定次数：连接拒绝在部分机器上单次耗时可达 2s（封顶值），
+      // 固定 20 次会把「最多 10 秒」拖成 40s+。单次探活 2s 封顶 + 总预算 10s。
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
         try {
-          const st = await fetchSetupStatus();
+          const st = await fetchSetupStatus(2000);
           if (!alive) return;
           setSetupStatus(st ?? null);
           setGate(st?.wizard_required ? 'wizard' : 'main');
           return;
         } catch {
           if (!alive) return;
-          // 后端尚未监听：等待 500ms 后重试（最多 10 秒），期间保持 loading
+          // 后端尚未监听：等待 500ms 后重试，期间保持 loading
           await new Promise((resolve) => setTimeout(resolve, 500));
         }
       }
@@ -240,6 +252,9 @@ function ViewRenderer({ view, onSetupDone }: { view: View; onSetupDone: () => vo
   switch (view) {
     case 'chat':
       return <ChatPage />;
+    case 'dream':
+      // 梦话双 LLM 梦境（20261127 迁移自 CX-O dreamtalk）
+      return <DreamPage />;
     case 'pet':
       return <PetPage />;
     case 'memories':

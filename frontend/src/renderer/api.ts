@@ -110,6 +110,29 @@ export const API_ENDPOINTS = {
     /** 取消进行中的下载（保留临时文件供续传） */
     modelCancel: `${API_BASE}/setup/model/cancel`,
   },
+  /**
+   * 梦话双 LLM 梦境（20261127 迁移自 CX-O dreamtalk）。
+   * 素材只能来自本机记忆：入睡请求只接受 `mode`，禁止手填素材字段。
+   */
+  dreamtalk: {
+    /** 服务状态（未装配/禁用也 200，返回 disabled 口径） */
+    health: `${API_BASE}/dreamtalk/health`,
+    /** 入睡（POST {mode}）/ 最近会话列表（GET ?limit=） */
+    sessions: `${API_BASE}/dreamtalk/sessions`,
+    /** 梦境档案（含全部回合） */
+    sessionDetail: (id: string) => `${API_BASE}/dreamtalk/sessions/${encodeURIComponent(id)}`,
+    /** 醒者插话 / 继续做梦（POST {content?}） */
+    message: (id: string) =>
+      `${API_BASE}/dreamtalk/sessions/${encodeURIComponent(id)}/message`,
+    /** 醒来并生成摘要（POST；重复醒来 409） */
+    wake: (id: string) => `${API_BASE}/dreamtalk/sessions/${encodeURIComponent(id)}/wake`,
+    /** 单场清醒摘要（不含回合） */
+    recall: (id: string) => `${API_BASE}/dreamtalk/sessions/${encodeURIComponent(id)}/recall`,
+    /** 最近清醒摘要列表 */
+    recalls: `${API_BASE}/dreamtalk/recall`,
+    /** 读取 / 深度合并更新配置（GET / PUT） */
+    config: `${API_BASE}/dreamtalk/config`,
+  },
 };
 
 /** 一条记忆的后端原始记录（对应 lite/memory SQLite memories 表字段） */
@@ -1634,8 +1657,10 @@ export interface ModelDownloadPayload {
 }
 
 /** 查询首启状态（GET /api/setup/status）：App 首帧门控的唯一依据。 */
-export async function fetchSetupStatus(): Promise<SetupStatusView> {
-  return requestJson<SetupStatusView>(API_ENDPOINTS.setup.status);
+export async function fetchSetupStatus(timeoutMs?: number): Promise<SetupStatusView> {
+  // timeoutMs 供首启门控的「探活式」调用使用：后端未监听时连接拒绝延迟在部分机器上
+  // 可达秒级，沿用 300s 默认超时会让门控重试链远超预期的 10 秒。
+  return requestJson<SetupStatusView>(API_ENDPOINTS.setup.status, undefined, timeoutMs);
 }
 
 /** 拉取硬件体检结论与推荐（GET /api/setup/recommend）。 */
@@ -1805,4 +1830,179 @@ export async function sendFleetControl(
   payload: { target: string; action: string; request_id?: string; params?: Record<string, unknown> },
 ): Promise<Record<string, unknown>> {
   return fleetRequest('POST', `/instances/${encodeURIComponent(id)}/control`, payload);
+}
+
+/* ==================================================================== *
+ * 梦话双 LLM 梦境（20261127 迁移自 CX-O dreamtalk，/api/dreamtalk/*）
+ * ==================================================================== */
+
+/** 梦境模式：记忆梦 / 天马行空 / 一夜无梦 */
+export type DreamtalkMode = 'memory' | 'wild' | 'dreamless';
+
+/** 回合说话人：潜意识导演 / 梦者 / 醒者 */
+export type DreamtalkSpeaker = 'director' | 'dreamer' | 'awakened';
+
+/** 会话状态：进行中 / 已结束 */
+export type DreamtalkStatus = 'active' | 'ended';
+
+/** 情绪残留：效价（-1~1）与唤醒度（0~1） */
+export interface DreamtalkEmotionResidue {
+  valence: number;
+  arousal: number;
+}
+
+/** 一个梦境回合（后端 dreamtalk_turn 实体） */
+export interface DreamtalkTurn {
+  id: string;
+  session_id: string;
+  seq: number;
+  speaker: DreamtalkSpeaker;
+  content: string;
+  flagged: boolean;
+  created_at: string;
+}
+
+/** 一场梦境会话（不含素材快照——素材只在服务端） */
+export interface DreamtalkSession {
+  id: string;
+  agent_id: string;
+  created_at: string;
+  mode: DreamtalkMode;
+  mode_reason: string;
+  status: DreamtalkStatus;
+  title: string;
+  summary: string;
+  emotion_residue: DreamtalkEmotionResidue;
+  ended_at: string | null;
+  turn_count: number;
+}
+
+/** 清醒侧唯一可见的醒来摘要（不含原始回合） */
+export interface DreamtalkRecall {
+  session_id: string;
+  created_at: string;
+  mode: DreamtalkMode;
+  title: string;
+  summary: string;
+  emotion_residue: DreamtalkEmotionResidue;
+}
+
+/** 会话视图：会话 + 回合（已结束时带摘要） */
+export interface DreamtalkView {
+  ok: true;
+  session: DreamtalkSession;
+  turns: DreamtalkTurn[];
+  recall: DreamtalkRecall | null;
+}
+
+/** 服务状态（未装配/禁用时 status=disabled） */
+export interface DreamtalkHealth {
+  ok: true;
+  status: 'idle' | 'disabled';
+  enabled: boolean;
+  contract_version: string;
+  sessions: number;
+  mode_weights: string;
+  memory_writeback: boolean;
+}
+
+/** dreamtalk 配置段（16 键） */
+export interface DreamtalkConfig {
+  enabled: boolean;
+  max_rounds: number;
+  context_turns: number;
+  material_window_days: number;
+  material_max_items: number;
+  mode_weights: string;
+  director_temperature: number;
+  dreamer_temperature: number;
+  wild_director_temperature: number;
+  wild_dreamer_temperature: number;
+  db_dir: string;
+  db_filename: string;
+  recall_limit: number;
+  summary_title_max_chars: number;
+  summary_max_chars: number;
+  memory_writeback: boolean;
+}
+
+/** 列表响应信封 */
+export interface DreamtalkList<T> {
+  ok: true;
+  items: T[];
+  total: number;
+}
+
+/** 读取梦境服务状态 */
+export async function fetchDreamtalkHealth(): Promise<DreamtalkHealth> {
+  return requestJson<DreamtalkHealth>(API_ENDPOINTS.dreamtalk.health);
+}
+
+/** 入睡并返回会话视图（mode=auto 时由服务端按素材与情绪判定） */
+export async function startDreamtalkSession(
+  mode: DreamtalkMode | 'auto' = 'auto',
+): Promise<DreamtalkView> {
+  return requestJson<DreamtalkView>(API_ENDPOINTS.dreamtalk.sessions, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode }),
+  });
+}
+
+/** 最近梦境会话列表（不含回合） */
+export async function listDreamtalkSessions(limit?: number): Promise<DreamtalkList<DreamtalkSession>> {
+  const query = limit ? `?limit=${encodeURIComponent(String(limit))}` : '';
+  return requestJson<DreamtalkList<DreamtalkSession>>(`${API_ENDPOINTS.dreamtalk.sessions}${query}`);
+}
+
+/** 梦境档案（会话 + 全部回合） */
+export async function fetchDreamtalkSession(id: string): Promise<DreamtalkView> {
+  return requestJson<DreamtalkView>(API_ENDPOINTS.dreamtalk.sessionDetail(id));
+}
+
+/** 醒者插话并推进一轮；空 content 等价「继续做梦」 */
+export async function postDreamtalkMessage(id: string, content = ''): Promise<DreamtalkView> {
+  return requestJson<DreamtalkView>(API_ENDPOINTS.dreamtalk.message(id), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  });
+}
+
+/** 醒来并生成摘要（重复醒来后端返回 409） */
+export async function wakeDreamtalkSession(id: string): Promise<DreamtalkView> {
+  return requestJson<DreamtalkView>(API_ENDPOINTS.dreamtalk.wake(id), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+}
+
+/** 单场清醒摘要（不含回合；会话未结束时后端返回 409） */
+export async function fetchDreamtalkRecall(
+  id: string,
+): Promise<{ ok: true; recall: DreamtalkRecall }> {
+  return requestJson<{ ok: true; recall: DreamtalkRecall }>(API_ENDPOINTS.dreamtalk.recall(id));
+}
+
+/** 最近清醒摘要列表（不含回合） */
+export async function fetchDreamtalkRecalls(limit?: number): Promise<DreamtalkList<DreamtalkRecall>> {
+  const query = limit ? `?limit=${encodeURIComponent(String(limit))}` : '';
+  return requestJson<DreamtalkList<DreamtalkRecall>>(`${API_ENDPOINTS.dreamtalk.recalls}${query}`);
+}
+
+/** 读取梦境配置段 */
+export async function fetchDreamtalkConfig(): Promise<{ ok: true; config: DreamtalkConfig }> {
+  return requestJson<{ ok: true; config: DreamtalkConfig }>(API_ENDPOINTS.dreamtalk.config);
+}
+
+/** 深度合并更新梦境配置（非法字段后端返回 422） */
+export async function updateDreamtalkConfig(
+  patch: Partial<DreamtalkConfig>,
+): Promise<{ ok: true; config: DreamtalkConfig }> {
+  return requestJson<{ ok: true; config: DreamtalkConfig }>(API_ENDPOINTS.dreamtalk.config, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
 }

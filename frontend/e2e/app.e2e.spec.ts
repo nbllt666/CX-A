@@ -38,7 +38,7 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
     // title 匹配 index.html <title>
     await expect(win).toHaveTitle('CX-A');
     // 标志性文案：ChatPage 首屏 heading「聊天」与空态引导
-    await expect(win.getByRole('heading', { name: '聊天' })).toBeVisible({ timeout: 20_000 });
+    await expect(win.getByRole('heading', { name: '聊天' })).toBeVisible({ timeout: 45_000 });
     await expect(win.getByText(/还没有聊天记录/)).toBeVisible();
 
     await app.close();
@@ -48,7 +48,7 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
     const { app, win } = await launchApp();
 
     const input = win.getByPlaceholder('跟你的AI说点什么吧…');
-    await input.waitFor({ state: 'visible', timeout: 20_000 });
+    await input.waitFor({ state: 'visible', timeout: 45_000 });
     await input.fill('E2E 测试消息');
 
     // 本地优先语义（20261002_模块0_聊天提示条）：未发过消息不显示"送不到"提示
@@ -84,14 +84,14 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
     // 经侧栏进入桌宠页，点击真实 UI 开关（aria-label=启用桌宠）
     await win.getByRole('button', { name: /桌宠/ }).first().click();
     const petSwitch = win.getByRole('switch', { name: '启用桌宠' });
-    await petSwitch.waitFor({ state: 'visible', timeout: 20_000 });
+    await petSwitch.waitFor({ state: 'visible', timeout: 45_000 });
 
     // 默认开启：开关初始即为 on（无持久化记录）
     await expect(petSwitch).toHaveAttribute('aria-checked', 'true');
 
     // 挂载恢复：进入桌宠页即自动拉起悬浮窗 → 主进程窗口列表增长为 2
     await expect
-      .poll(windowCount(app), { timeout: 20_000, intervals: [250, 500, 1_000] })
+      .poll(windowCount(app), { timeout: 45_000, intervals: [250, 500, 1_000] })
       .toBe(2);
 
     // 第二窗口具备悬浮窗特征：置顶 + 跳过任务栏
@@ -108,7 +108,7 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
     await petSwitch.click();
     await expect(petSwitch).toHaveAttribute('aria-checked', 'false');
     await expect
-      .poll(windowCount(app), { timeout: 20_000, intervals: [250, 500, 1_000] })
+      .poll(windowCount(app), { timeout: 45_000, intervals: [250, 500, 1_000] })
       .toBe(1);
 
     // localStorage 持久化回落 '0'（关闭后干净退出，不污染其他用例）
@@ -125,7 +125,7 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
     const { app, win } = await launchApp();
 
     await win.getByRole('button', { name: /设置/ }).first().click();
-    await expect(win.getByRole('heading', { name: '设置' })).toBeVisible({ timeout: 20_000 });
+    await expect(win.getByRole('heading', { name: '设置' })).toBeVisible({ timeout: 45_000 });
 
     // 后端未起 → 首帧加载失败降级提示条（非空白、非崩溃）
     await expect(win.getByText(/设置加载失败啦/)).toBeVisible({ timeout: 30_000 });
@@ -155,7 +155,7 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
       .toBe('#/chat');
 
     // 视图落在聊天页而非空白崩溃
-    await expect(win.getByRole('heading', { name: '聊天' })).toBeVisible({ timeout: 20_000 });
+    await expect(win.getByRole('heading', { name: '聊天' })).toBeVisible({ timeout: 45_000 });
 
     await app.close();
   });
@@ -165,7 +165,7 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
 
     // 朗读开关（页头右侧，默认关闭）：点击可双向切换
     const speakSwitch = win.getByRole('switch', { name: '朗读回复' });
-    await expect(speakSwitch).toBeVisible({ timeout: 20_000 });
+    await expect(speakSwitch).toBeVisible({ timeout: 45_000 });
     await expect(speakSwitch).toHaveAttribute('aria-checked', 'false');
     await speakSwitch.click();
     await expect(speakSwitch).toHaveAttribute('aria-checked', 'true');
@@ -191,6 +191,7 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
 
     // 隐藏入口（spec add-fleet-frontend-hidden）：3 秒窗口内连点品牌区 5 次
     const brand = win.getByTestId('sidebar-brand');
+    await brand.waitFor({ state: 'visible', timeout: 45_000 });
     for (let i = 0; i < 5; i += 1) {
       await brand.click();
     }
@@ -204,6 +205,28 @@ test.describe.serial('CX-A Electron 主窗口 E2E', () => {
     await expect(win.getByText(/实例台账暂时读不出来/)).toBeVisible({ timeout: 30_000 });
     await expect(win.getByRole('button', { name: /刷新/ })).toBeVisible();
     await expect(win.getByText(/登记实例/)).toBeVisible();
+
+    await app.close();
+  });
+
+  test('场景8：深链 #/dream → 梦境入睡面板可见，后端不可达给降级提示条且不白屏', async () => {
+    const { app, win } = await launchApp();
+
+    // 首启门控依赖 /api/setup/status：后端未起时按 20 次重试降级放行
+    // （每次失败含连接拒绝延迟 + 500ms，实测约 20~30 秒，故放宽到 45 秒）
+    await expect(win.getByRole('heading', { name: '聊天' })).toBeVisible({ timeout: 45_000 });
+
+    // 深链直达（不经过侧栏点击）
+    await win.evaluate(() => {
+      window.location.hash = '#/dream';
+    });
+
+    await expect(win.getByRole('heading', { name: '梦境' })).toBeVisible({ timeout: 45_000 });
+    await expect(win.getByTestId('dream-page')).toBeVisible();
+    await expect(win.getByTestId('dream-start')).toBeVisible();
+
+    // 后端不可达 → 中文降级提示条（不白屏、不崩溃）
+    await expect(win.getByText(/暂时读不到本机记忆/)).toBeVisible({ timeout: 30_000 });
 
     await app.close();
   });

@@ -183,6 +183,35 @@ DEFAULTS = {
         # 分离：采样开着但不想被打扰时可单独关闭主动搭话。
         "proactive_enabled": True,
     },
+    #: 梦话双 LLM 梦境（20261127 迁移自 CX-O dreamtalk，16 键）。
+    #: enabled=False 时 /api/dreamtalk/* 除 health 外一律 503（应用仍可启动）；
+    #: max_rounds=单场最大轮数（每轮固定导演+梦者两回合）；
+    #: context_turns=发送给 LLM 的最近回合上限（仅本会话，不含梦外历史）；
+    #: mode_weights=自动模式基础权重（"memory=,wild=,dreamless=" 逗号分隔，使用前归一化）；
+    #: *_temperature=各角色/模式的采样温度（领域层真实消费；当前适配器未接线，
+    #: 云端仍按 cloud.temperature 采样——已知边界，见 spec「未闭合 / 已知边界」）；
+    #: db_dir="" 表示跟随 CX-A 数据目录（相对路径按数据目录解析），db_filename 为库文件名；
+    #: recall_limit=会话/摘要列表默认上限；summary_*_chars=醒来摘要标题与余韵上限；
+    #: memory_writeback=醒来摘要是否回写 CX-A 记忆库（source="dreamtalk"，幂等）。
+    "dreamtalk": {
+        "enabled": True,
+        "max_rounds": 8,
+        "context_turns": 16,
+        # material_*：入睡素材采集口径（时间窗天数 / 条数上限），0 表示不采集
+        "material_window_days": 7,
+        "material_max_items": 20,
+        "mode_weights": "memory=0.5,wild=0.3,dreamless=0.2",
+        "director_temperature": 0.85,
+        "dreamer_temperature": 0.9,
+        "wild_director_temperature": 1.0,
+        "wild_dreamer_temperature": 1.1,
+        "db_dir": "",
+        "db_filename": "dreamtalk.db",
+        "recall_limit": 20,
+        "summary_title_max_chars": 12,
+        "summary_max_chars": 120,
+        "memory_writeback": True,
+    },
 }
 
 #: 热更新段：切换后即时生效，无需重启（工程文档 §13.3）
@@ -212,6 +241,8 @@ HOT_RELOAD_SECTIONS = (
     "cxfc",
     "tools",
     "vision",
+    #: dreamtalk 段（梦话梦境）纳入热更新——配置 GET/PUT 落盘后下一次请求即按新值装配。
+    "dreamtalk",
 )
 
 #: 需重启段：变更后必须重启进程（工程文档 §13.3，向量库路径 / 运行时配置）

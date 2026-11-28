@@ -70,3 +70,20 @@ describe('Sidebar：连点 logo 解锁管理面', () => {
     expect(appMocks.navigate).toHaveBeenCalledWith('fleet');
   });
 });
+
+describe('Sidebar：主导航五项（20261127 新增梦境）', () => {
+  it('聊天 / 梦境 / 桌宠 / 记忆 / 设置 五项按序渲染', () => {
+    render(<Sidebar />);
+    const labels = screen
+      .getAllByRole('button')
+      .map((node) => node.textContent?.trim())
+      .filter((text): text is string => Boolean(text) && text !== 'CX-A');
+    expect(labels).toEqual(['聊天', '梦境', '桌宠', '记忆', '设置']);
+  });
+
+  it('点击「梦境」导航到 dream 视图', () => {
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole('button', { name: /梦境/ }));
+    expect(appMocks.navigate).toHaveBeenCalledWith('dream');
+  });
+});

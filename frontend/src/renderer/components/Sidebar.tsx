@@ -1,5 +1,5 @@
 import React from 'react';
-import { Brain, Cat, MessageSquareText, Settings, type LucideIcon } from 'lucide-react';
+import { Brain, Cat, MessageSquareText, Moon, Settings, type LucideIcon } from 'lucide-react';
 import { useRouter } from '../App';
 import type { View } from '../App';
 import BrandMark from './BrandMark';
@@ -28,6 +28,7 @@ export default function Sidebar() {
 
   const companionItems: { view: View; label: string; icon: LucideIcon }[] = [
     { view: 'chat', label: '聊天', icon: MessageSquareText },
+    { view: 'dream', label: '梦境', icon: Moon },
     { view: 'pet', label: '桌宠', icon: Cat },
     { view: 'memories', label: '记忆', icon: Brain },
     { view: 'settings', label: '设置', icon: Settings },

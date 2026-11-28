@@ -1,6 +1,7 @@
-# current-note — fix-local-mode-and-pet-ux
+# current-note — 跨变更交接锚点（当前活跃：migrate-dreamtalk-dreams）
 
-> 当前活跃变更：**prepare-public-release（20261121）**，交接与状态见文末「发布前准备」段。
+> 当前活跃变更：**migrate-dreamtalk-dreams（20261127）**，交接与状态见文末「迁移梦话双LLM梦境」段；
+> 上一变更 prepare-public-release（20261121）已收口，保留为历史归档。
 > 以下为历史变更归档，仅供追溯。
 
 ## 做到哪了
@@ -229,3 +230,68 @@ Task 0 完成（变更文档 + 本 note 已创建）；Task 1-6 未开始。
 - 第三轮（修正后复审）d8402d35-1a1f-4ec4-b6dd-2da7217ab56b：**警示放行，无阻断、无 SOFT_BLOCK**。W1 spec 交接段、W2 checklist 产物数字、W3 变更文档 status、W4 全量回归日志（1655 passed / 1 skipped，`logs/pytest_release_final.log`）均已修正；O1/O2/O5/O7/O8 已处理；复审新增 R1（`.prev.exe` 哈希/后端构建时点）与 R2（交接措辞）亦已修正；O3/O4/O6/O9 登记为观察项。待人类 [V] 最终裁决。
 
 **接续入口**：发布前准备已收口——最终产物 `release\CX-A-Setup-0.1.0.exe`（2,946,528,675 B @13:22:07，SHA256 `5341F0F8...94CE`），代码/测试/发布文档已提交 **4271489（未推送）**。对外发布动作由人类执行；如需继续修正，开新 change-id，不得回溯修改本冻结 spec。
+
+---
+
+## 新变更：迁移梦话双 LLM 梦境（migrate-dreamtalk-dreams，20261127）
+
+**做到哪了**：Task 0-7 已闭合——CX-O 包迁移 + CX-A 适配、配置 16 键、`wiring.py`、`http_api.py`、
+`api_server` 路由与 `_dream_lock`；后端 4 个测试文件 **65 passed**、全量 **1720 passed / 1 skipped**；
+前端 `api.ts` 梦境段 + `DreamPage.tsx` + 侧栏「梦境」+ 单测 **334 passed**、tsc 0、build 成功、
+E2E **8 passed**（含 #/dream 深链降级场景）、源码态冒烟 **PASS**（`logs/dream_smoke.log`）。
+Task 8 进行中：8.1 README / RELEASE_NOTES 已更新，8.2 变更文档已回填，待 8.4 GN-004 T3 与 8.5 人类 [V]。
+GN-004 T1 两轮均阻断（B/S/O 与 N-1…N-9 已逐项修正）。
+
+**为什么**：用户要求把 `C:\CX-D` 的梦话功能迁进 CX-A，随后修正「不是无关啊（参考 C:\CX-O）」→ 以 CX-O 为迁移源；
+最新裁决「注意记忆从 CX-A 的记忆系统取」——即代码/契约以
+`C:\CX-O\CX-O-SERVER\server\autonomy\dreamtalk\` 为准，但素材采集器必须读 CX-A `lite/memory`，
+不得依赖 CX-O 的 `MemoryManager` / 图谱仓库。
+
+**工程过程**：
+1. 探索 CX-A / CX-D / CX-O 三处实现，确认 CX-A 无 FastAPI、LLM 通道为 `OfflineFallbackManager`、
+   记忆为 `lite/memory`、前端为 `App.tsx` View 联合类型 + Sidebar 四项 + `api.ts`。
+2. 基于 CX-D 写过一版 spec 三件套并经 GN-004 三轮（阻断→警示放行→警示放行，首轮 ID
+   `d18f6534-c6b0-47cc-b3b2-9517af85384a`，二三轮 `resume_used=true`）。
+3. 用户裁决改为 CX-O 基准后，spec / tasks / checklist 整篇改写：契约 `/api/dreamtalk/*`（10 方法 / 8 条唯一路径）、
+   配置 16 键（删 3 个模型槽位键、加 `material_window_days`/`material_max_items`/`memory_writeback`、`db_dir` 默认空）、禁止手填素材、`enabled` 与 503 语义、
+   配置 GET/PUT 深度合并 + 422、`CXAMemorySource` 采集口径（近 7 天 / 基线 <0.5 / permanent 与 ≥0.95 红线 /
+   不足 3 条补齐 / tags 意象 / 日记情绪 / 排除回写记录）。
+4. Task 0.1 变更文档落盘（含 GN-004 历史轮次台账与基线变更说明）。
+
+**交接状态（三值口径）**：
+| Task | 状态 | 说明 |
+| --- | --- | --- |
+| 0 | 已闭合 | 变更文档 + 本段七字段 |
+| 1 | 已闭合 | CX-O 包复制 + CX-A 适配（store/llm/memory/events）；`tests/test_dreamtalk_core.py` 22 passed |
+| 2 | 已闭合 | 配置 16 键 + `add_memory(source=)` + `wiring.py`（含 `write_lock` 注入） |
+| 3 | 已闭合 | `http_api.py` + `api_server` 路由/`_dream_lock`/503；tmp 冒烟跑通主链路 |
+| 4 | 已闭合 | 4 个测试文件 65 passed；全量 1720 passed / 1 skipped（`logs/pytest_dream.log`） |
+| 5 | 已闭合 | `api.ts` 梦境端点/类型/封装 + 单测；tsc 0 |
+| 6 | 已闭合 | `DreamPage.tsx` 五态 + 侧栏「梦境」；build 成功 |
+| 7 | 已闭合 | 单测 334 passed → E2E 8 passed → tsc 0 + build；冒烟 PASS |
+| 8 | 已闭合 | 8.1-8.3 文档收口；8.4 GN-004 T3 警示放行（两轮，无阻断）；8.5 人类裁决「批准交付」（2026-11-27）；8.6 接续项已登记 |
+| GN-004 T1 | 已闭合（结论=阻断×2） | Agent `56430745-44e2-4cbc-8b2d-1687bbea4195`；首轮 B/S/O、复审 N-1…N-9 已逐项修正 |
+
+> 诚实口径（B-1）：GN-004 T1 是在 Task 1-3 实现之后拉起的，属**事后审查**，
+> 不回溯性宣称「先审后做」；修正后须完整复审（不得只审修正点）方可继续 Task 4+。
+
+**未闭合项**：
+- 交付闸门已闭合（GN-004 T3 警示放行 + 人类「批准交付」）；无阻塞性未闭合项。
+- **已知边界（人类需知悉，非缺陷）**：①`lite/graph/graph_store.py` 未接入写入链路 → 孤立实体口径
+  以 tags 意象替代；②温度键由领域层消费但适配器未接线（云端按全局 `cloud.temperature` 采样）；
+  ③梦境与聊天共用同一本地小 LLM 运行时，长回合会竞争。
+- **当前不可判定**：真实云端 / 本地模型的梦境长文本质量（自动化用例全部走 Mock 文本），
+  以及梦境与语音同时使用时的体感，留人类日常使用反馈。
+- 前端产物已变更：如需分发须 `python installer/build.py` 重新打包（接续项，不在本变更内执行）；
+  打包链路 E2E（packaged-install）未随本次改动复跑，登记为分发前必做项。
+- **GN-004 O4（交付后收尾）**：checklist 中「闸门重写一次 / `flagged`」「`DREAM_BROKEN_TEXT` 占位」
+  「去重命中视同已写」「非法存量值回退默认」「改配置后素材行为随之变化」「`_build_chat_messages` 含摘要」
+  六项目前由 T3 审查者的独立探针代验（行为正确），**尚缺随附用例**，登记为交付后补测项。
+
+**接续入口**：**不得再复制 CX-O 包**（`lite/dreamtalk/` 已含 CX-A 适配：`memory_written` 列、
+`CXAChatLLMClient`、`CXAMemorySource`、`cxa_memory` 字面量）。剩余工作只走 Task 8 收口：
+8.4 拉起 GN-004 T3（提供 spec 三件套 + 本 note + `.trae/documents/` + 产出路径）→ 8.5 人类 [V] 裁决
+→ 回填裁决与终态；spec 见 `.trae/specs/migrate-dreamtalk-dreams/`。
+
+**终态处理**：**吸收完毕（2026-11-27）**——Task 0-8 全部闭合，GN-004 T3 警示放行且收尾项已处理，
+人类裁决「批准交付」。交接信息由 spec 三件套、变更文档与本节完整承载；本段可在下一个变更启动时归档。

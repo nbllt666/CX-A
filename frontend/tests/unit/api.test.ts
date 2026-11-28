@@ -421,3 +421,79 @@ describe('视觉语音融合接口：开口预填充 + 主动消息轮询（2026
     await expect(fetchProactiveMessages()).resolves.toEqual([]);
   });
 });
+
+/**
+ * 梦话梦境 API 封装（20261127 迁移自 CX-O dreamtalk）。
+ *
+ * 校验 URL / 方法 / 请求体与错误透传：入睡只发 `mode`（禁止手填素材），
+ * 插话只发 `content`，醒来发空对象。
+ */
+describe('api：梦境封装（/api/dreamtalk/*）', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubOk(payload: unknown = { ok: true }) {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({ url, init });
+        return new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }),
+    );
+    return calls;
+  }
+
+  it('startDreamtalkSession 只发送 mode', async () => {
+    const calls = stubOk({ ok: true, session: {}, turns: [], recall: null });
+    const { startDreamtalkSession } = await import('../../src/renderer/api');
+    await startDreamtalkSession('memory');
+    expect(calls[0].url).toBe('http://127.0.0.1:8600/api/dreamtalk/sessions');
+    expect(calls[0].init?.method).toBe('POST');
+    expect(JSON.parse(String(calls[0].init?.body))).toEqual({ mode: 'memory' });
+  });
+
+  it('postDreamtalkMessage 只发送 content，空串等价继续', async () => {
+    const calls = stubOk({ ok: true, session: {}, turns: [], recall: null });
+    const { postDreamtalkMessage } = await import('../../src/renderer/api');
+    await postDreamtalkMessage('abc', '');
+    expect(calls[0].url).toBe('http://127.0.0.1:8600/api/dreamtalk/sessions/abc/message');
+    expect(JSON.parse(String(calls[0].init?.body))).toEqual({ content: '' });
+  });
+
+  it('wakeDreamtalkSession 向 wake 路径发送空对象', async () => {
+    const calls = stubOk({ ok: true, session: {}, turns: [], recall: null });
+    const { wakeDreamtalkSession } = await import('../../src/renderer/api');
+    await wakeDreamtalkSession('abc');
+    expect(calls[0].url).toBe('http://127.0.0.1:8600/api/dreamtalk/sessions/abc/wake');
+    expect(calls[0].init?.method).toBe('POST');
+    expect(JSON.parse(String(calls[0].init?.body))).toEqual({});
+  });
+
+  it('listDreamtalkSessions 透传 limit 查询参数', async () => {
+    const calls = stubOk({ ok: true, items: [], total: 0 });
+    const { listDreamtalkSessions } = await import('../../src/renderer/api');
+    await listDreamtalkSessions(8);
+    expect(calls[0].url).toBe('http://127.0.0.1:8600/api/dreamtalk/sessions?limit=8');
+  });
+
+  it('梦境错误码透传到 Error.message', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(JSON.stringify({ ok: false, error: 'session_ended' }), {
+          status: 409,
+          statusText: 'Conflict',
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    );
+    const { wakeDreamtalkSession } = await import('../../src/renderer/api');
+    await expect(wakeDreamtalkSession('abc')).rejects.toThrow(/409/);
+    await expect(wakeDreamtalkSession('abc')).rejects.toThrow(/session_ended/);
+  });
+});

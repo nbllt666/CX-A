@@ -184,6 +184,7 @@ class MemoryManager:
         tags=None,
         metadata=None,
         embed_fn=None,
+        source=None,
     ):
         """新增一条记忆；与已有记忆内容相似度达阈值时跳过写入（去重）。
 
@@ -195,6 +196,8 @@ class MemoryManager:
             decay_type: 衰减类型（ebbinghaus_opt / two_stage 等）。
             embed_fn: 可选的嵌入函数（content -> 向量）；提供则同步向量化写入向量库
                 （缺省用构造注入的缺省嵌入，二者皆无则不写向量）。
+            source: 可选的来源标记（如 ``"dreamtalk"``）；None 时沿用列默认 ``"user"``，
+                不得传 None 之外的假值来「清空」来源。
         Returns:
             int|None: 新记忆 id；因去重跳过返回 None。
         Raises:
@@ -205,23 +208,25 @@ class MemoryManager:
             return None
 
         score = importance_score if importance_score is not None else max(0.0, min(1.0, int(importance) / 5.0))
-        memory_id = self.store.add(
-            {
-                "content": content,
-                "type": type,
-                "importance": importance,
-                "importance_score": score,
-                "decay_type": decay_type,
-                "decay_params": decay_params,
-                "reactivation_count": reactivation_count,
-                "emotion_score": emotion_score,
-                "permanent": permanent,
-                "tags": tags,
-                "metadata": metadata,
-                "agent_id": agent_id,
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
-            }
-        )
+        record = {
+            "content": content,
+            "type": type,
+            "importance": importance,
+            "importance_score": score,
+            "decay_type": decay_type,
+            "decay_params": decay_params,
+            "reactivation_count": reactivation_count,
+            "emotion_score": emotion_score,
+            "permanent": permanent,
+            "tags": tags,
+            "metadata": metadata,
+            "agent_id": agent_id,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+        }
+        if source is not None:
+            # 来源标记仅在显式传入时写入，避免覆盖列默认值 "user"（既有调用零影响）
+            record["source"] = source
+        memory_id = self.store.add(record)
         # 写向量（20260926_模块0_真实嵌入与向量持久化）：显式 embed_fn 优先，否则用
         # 构造时注入的缺省嵌入——工具 / 蒸馏等未显式传 embed_fn 的写入口由此统一
         # 获得向量化。向量写入失败不影响记忆落库（检索侧相应降级为关键词）。
